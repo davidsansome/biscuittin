@@ -45,8 +45,8 @@ struct RotatorRegistry: Sendable {
         self.rotators = map
     }
 
-    /// v1: images only. M9 adds `VideoRotator()` and `LivePhotoRotator()` here.
-    static let v1 = RotatorRegistry(rotators: [ImageRotator()])
+    /// All media kinds are rotatable as of M9.
+    static let v1 = RotatorRegistry(rotators: [ImageRotator(), VideoRotator(), LivePhotoRotator()])
 
     func rotator(for kind: MediaKind) -> (any AssetRotator)? { rotators[kind] }
     func canRotate(_ kind: MediaKind) -> Bool { rotators[kind] != nil }

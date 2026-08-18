@@ -1066,6 +1066,33 @@ Not verified interactively: the settings **Toggle** did not respond to synthetic
 defaults and observing the full pipeline run. The toggle's wiring (`setSyncEnabled` → scope
 prompt → `chooseScope`) still needs a human tap, or a UI test, to confirm.
 
+### M7, M8, M9 — complete (2026-08-19)
+
+**M7 — remote rotate and hardening.** `RemoteLibraryService.rotateRemote` downloads the
+original, rotates it with the same strategy used locally, and replaces the asset, so server-side
+thumbnails do not keep showing the old orientation. The local edit runs first because it is what
+the user sees immediately; if the server copy then fails, `PartialRotationError` reports exactly
+that rather than rolling back a correct local edit. The weekly hard-delete reconciliation sweep
+(D9) is now driven from `StartupSequencer` via `needsDeletionSweep()`.
+
+**M8 — Free Up Space.** `freeUpSpacePlan()` gates candidates on all three of: a checksum link
+carrying both facets, `backup_state = uploaded`, and a matching non-trashed remote row. Anything
+weaker and the local copy might be the only one. Execution deletes local copies in one batched
+PhotoKit call; the assets stay in the timeline as remote-only. Reachable only from Settings,
+never from the delete button (D11/D18).
+
+**M9 — video and Live Photo rotation.** `VideoRotator` composes the quarter turn onto the track's
+existing `preferredTransform` and exports with `AVAssetExportPresetPassthrough`, so streams are
+copied rather than re-encoded — a large video rotates in roughly file-copy time with no
+generational loss. `LivePhotoRotator` goes through `PHLivePhotoEditingContext` so the still and
+its paired video stay in step; `LocalAssetEditor` routes it separately for that reason. Both are
+registered in `RotatorRegistry`, which is the *only* change callers needed — the viewer and the
+multi-select toolbar picked up video rotation from `canRotate(kind)` with no branching, which was
+the point of designing rotation as a strategy in M3.
+
+Verified: the viewer's rotate controls report `enabled: true` on a video page, where they were
+deliberately dimmed through M3–M8.
+
 ### Notes for later milestones
 
 * `GridLayoutProvider` sizes tiles by giving the item `fractionalWidth(1/columns)` and

@@ -24,6 +24,7 @@ final class SettingsViewModel: ObservableObject {
     private let timelineStore: TimelineStore
     private let imageCache: RemoteImageFetcher
     private let syncEngine: SyncEngine
+    private let photoActions: PhotoActionService
     private let settings: AppSettings
     let backupStatus: BackupStatusStore
     private var signInTask: Task<Void, Never>?
@@ -35,18 +36,25 @@ final class SettingsViewModel: ObservableObject {
     @Published private(set) var syncScope: SyncScope = .all
     @Published private(set) var outOfScopeCount = 0
 
+    // MARK: - Free up space (D18, M8)
+
+    @Published private(set) var freeUpSpacePlan = FreeUpSpacePlan()
+    @Published var showsFreeUpSpaceConfirmation = false
+
     init(session: ImmichAuthSession,
          remoteLibrary: RemoteLibraryService,
          timelineStore: TimelineStore,
          imageCache: RemoteImageFetcher,
          syncEngine: SyncEngine,
          settings: AppSettings,
-         backupStatus: BackupStatusStore) {
+         backupStatus: BackupStatusStore,
+         photoActions: PhotoActionService) {
         self.session = session
         self.remoteLibrary = remoteLibrary
         self.timelineStore = timelineStore
         self.imageCache = imageCache
         self.syncEngine = syncEngine
+        self.photoActions = photoActions
         self.settings = settings
         self.backupStatus = backupStatus
         self.syncEnabled = settings.syncEnabled
@@ -213,6 +221,25 @@ final class SettingsViewModel: ObservableObject {
             guard let self else { return }
             self.outOfScopeCount = await self.syncEngine.outOfScopeCount()
             await self.syncEngine.publishStatus(uploading: false)
+            self.freeUpSpacePlan = await self.photoActions.freeUpSpacePlan()
+        }
+    }
+
+    /// Deletes local copies of assets verified to exist on the server (D18).
+    func performFreeUpSpace() {
+        let plan = freeUpSpacePlan
+        showsFreeUpSpaceConfirmation = false
+        guard !plan.isEmpty else { return }
+
+        Task { [weak self] in
+            guard let self else { return }
+            self.isWorking = true
+            let outcome = await self.photoActions.freeUpSpace(plan)
+            if let error = outcome.firstError {
+                self.errorMessage = error.localizedDescription
+            }
+            self.freeUpSpacePlan = await self.photoActions.freeUpSpacePlan()
+            self.isWorking = false
         }
     }
 

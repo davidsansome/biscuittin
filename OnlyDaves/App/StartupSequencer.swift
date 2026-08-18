@@ -82,6 +82,11 @@ final class StartupSequencer: ObservableObject {
         guard session.isConfigured else { return }
         do {
             try await remoteLibrary.deltaSync()
+            // Hard deletes on the server simply stop appearing, so a periodic full sweep is
+            // what removes their rows (D9).
+            if await remoteLibrary.needsDeletionSweep() {
+                try await remoteLibrary.reconcileDeletions()
+            }
         } catch is CancellationError {
             return
         } catch {

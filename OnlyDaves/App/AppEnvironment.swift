@@ -93,6 +93,7 @@ final class AppEnvironment: ObservableObject {
                           imageCache: remoteImages,
                           syncEngine: syncEngine,
                           settings: settings,
-                          backupStatus: backupStatus)
+                          backupStatus: backupStatus,
+                          photoActions: photoActions)
     }
 }

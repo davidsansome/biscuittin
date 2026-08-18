@@ -1,6 +1,19 @@
 import Foundation
 import Photos
 
+/// Raised when one facet succeeded and another did not, so the UI can say what actually
+/// happened rather than reporting a blanket failure (§11).
+enum PartialRotationError: LocalizedError {
+    case serverCopyNotRotated(underlying: Error)
+
+    var errorDescription: String? {
+        switch self {
+        case .serverCopyNotRotated:
+            return "Rotated on this iPhone, but the copy on Immich couldn’t be updated."
+        }
+    }
+}
+
 /// Result of a batch action, reported per asset so partial failures stay visible (§11).
 struct ActionOutcome {
     var succeeded: [AssetID] = []
@@ -22,6 +35,19 @@ struct DeletePlan {
     /// Purely local deletions rely on the system's own confirmation sheet; anything touching
     /// the server gets an in-app confirmation first.
     var needsInAppConfirmation: Bool { !remoteOnly.isEmpty || !both.isEmpty }
+}
+
+/// What "Free Up Space" would remove (D18).
+struct FreeUpSpacePlan {
+    var localIdentifiers: [String] = []
+    var reclaimableBytes: Int64 = 0
+
+    var count: Int { localIdentifiers.count }
+    var isEmpty: Bool { localIdentifiers.isEmpty }
+
+    var formattedBytes: String {
+        AssetMetadata.formattedFileSize(reclaimableBytes)
+    }
 }
 
 /// Single entry point for rotate and delete, used by both the viewer toolbar and the grid's
@@ -136,14 +162,35 @@ actor PhotoActionService {
         return outcome
     }
 
+    /// Rotates every facet the asset has (D10).
+    ///
+    /// The local edit runs first because it is the one the user sees immediately. If the server
+    /// copy then fails, the local rotation still stands and the failure is reported — reporting
+    /// a partial success is more honest than rolling back a correct local edit.
     private func rotateOne(asset: Asset, rotator: any AssetRotator, clockwise: Bool) async throws {
-        guard let localIdentifier = asset.localIdentifier,
-              let phAsset = resolver.resolve(localIdentifier) else {
-            throw RotationError.assetUnavailable
+        var rotatedSomething = false
+
+        if let localIdentifier = asset.localIdentifier,
+           let phAsset = resolver.resolve(localIdentifier) {
+            try await editor.applyRotation(asset: phAsset, clockwise: clockwise, rotator: rotator)
+            rotatedSomething = true
         }
-        try await editor.applyRotation(asset: phAsset, clockwise: clockwise, rotator: rotator)
-        // M7: the remote facet is rotated here too — download original,
-        // rotator.rotateRemoteOriginal, then PUT /api/assets/{id}/original.
+
+        if let immichID = asset.immichID, let remoteLibrary {
+            do {
+                try await remoteLibrary.rotateRemote(immichID: immichID,
+                                                     clockwise: clockwise,
+                                                     rotator: rotator)
+                rotatedSomething = true
+            } catch {
+                if rotatedSomething {
+                    throw PartialRotationError.serverCopyNotRotated(underlying: error)
+                }
+                throw error
+            }
+        }
+
+        guard rotatedSomething else { throw RotationError.assetUnavailable }
     }
 
     // MARK: - Delete (requirement 10)
@@ -221,6 +268,58 @@ actor PhotoActionService {
         // grid in step on the same runloop turn.
         await timelineStore.applyChange(.remove(attempted))
         invalidateCaches(for: attempted)
+        return outcome
+    }
+
+    // MARK: - Free up space (D18, M8)
+
+    /// Candidates for reclaiming device storage: assets that verifiably exist on the server.
+    ///
+    /// The gate is deliberately strict — checksum-linked *and* recorded as uploaded. "Looks
+    /// similar" is never sufficient justification for deleting someone's only copy.
+    func freeUpSpacePlan() async -> FreeUpSpacePlan {
+        guard let remoteLibrary else { return FreeUpSpacePlan() }
+
+        let verified: [String]
+        do {
+            verified = try await remoteLibrary.locallyDeletableIdentifiers()
+        } catch {
+            return FreeUpSpacePlan()
+        }
+        guard !verified.isEmpty else { return FreeUpSpacePlan() }
+
+        let assets = resolver.resolve(verified)
+        var plan = FreeUpSpacePlan()
+        for (identifier, asset) in assets {
+            plan.localIdentifiers.append(identifier)
+            plan.reclaimableBytes += LocalAssetExporter.estimatedByteCount(for: asset)
+        }
+        return plan
+    }
+
+    /// Deletes only the local copies. The server copies and their `remote_assets` rows are
+    /// untouched; affected timeline stubs simply lose `hasLocal`.
+    func freeUpSpace(_ plan: FreeUpSpacePlan) async -> ActionOutcome {
+        var outcome = ActionOutcome()
+        guard !plan.localIdentifiers.isEmpty else { return outcome }
+
+        let assets = Array(resolver.resolve(plan.localIdentifiers).values)
+        guard !assets.isEmpty else { return outcome }
+
+        do {
+            try await editor.delete(assets: assets)
+            let ids = plan.localIdentifiers.map { AssetID.local($0) }
+            outcome.succeeded = ids
+            // The assets remain in the timeline, now as remote-only.
+            await timelineStore.refresh()
+            invalidateCaches(for: ids)
+        } catch let error as NSError
+            where error.domain == PHPhotosErrorDomain
+            && error.code == PHPhotosError.userCancelled.rawValue {
+            // Declined; nothing removed.
+        } catch {
+            outcome.failures.append((AssetID(raw: "free-up-space"), error))
+        }
         return outcome
     }
 

@@ -38,6 +38,18 @@ struct SettingsScreen: View {
                 Text("“New items only” backs up things captured from now on. "
                      + "You can switch to backing up everything later.")
             }
+            .confirmationDialog("Free up space?",
+                                isPresented: $viewModel.showsFreeUpSpaceConfirmation,
+                                titleVisibility: .visible) {
+                Button("Remove \(viewModel.freeUpSpacePlan.count) Items From iPhone",
+                       role: .destructive) {
+                    viewModel.performFreeUpSpace()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Frees \(viewModel.freeUpSpacePlan.formattedBytes). These items stay on "
+                     + "your Immich server.")
+            }
             .task { viewModel.refreshSyncStatus() }
             .alert("Connection isn’t private", isPresented: $viewModel.showsInsecureWarning) {
                 Button("Cancel", role: .cancel) {}
@@ -141,6 +153,7 @@ struct SettingsScreen: View {
         return "New items only, since \(anchor.formatted(date: .abbreviated, time: .omitted))"
     }
 
+    @ViewBuilder
     private var connectedSection: some View {
         Section("Library") {
             if let version = viewModel.serverVersion {
@@ -155,6 +168,26 @@ struct SettingsScreen: View {
 
             Button("Remove Server Data", role: .destructive) { viewModel.removeServerData() }
                 .disabled(viewModel.isWorking)
+        }
+
+        // D18: distinct from delete — removes only local copies that the server verifiably has.
+        Section {
+            if viewModel.freeUpSpacePlan.isEmpty {
+                Text("Nothing to free up yet.")
+                    .foregroundStyle(.secondary)
+            } else {
+                Button("Free Up Space") { viewModel.showsFreeUpSpaceConfirmation = true }
+                    .disabled(viewModel.isWorking)
+                Text("\(viewModel.freeUpSpacePlan.formattedBytes) in "
+                     + "\(viewModel.freeUpSpacePlan.count) items backed up to Immich")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        } header: {
+            Text("Storage")
+        } footer: {
+            Text("Removes these items from this iPhone only. They stay on your Immich server "
+                 + "and remain browsable here.")
         }
     }
 

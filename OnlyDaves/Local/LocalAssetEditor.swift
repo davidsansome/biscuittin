@@ -11,17 +11,24 @@ final class LocalAssetEditor: @unchecked Sendable {
 
     func applyRotation(asset: PHAsset, clockwise: Bool, rotator: any AssetRotator) async throws {
         let input = try await contentEditingInput(for: asset)
-        let renderedURL = try await rotator.rotateLocal(input: input, clockwise: clockwise)
-        defer { try? FileManager.default.removeItem(at: renderedURL) }
-
         let output = PHContentEditingOutput(contentEditingInput: input)
         output.adjustmentData = PHAdjustmentData(
             formatIdentifier: Self.adjustmentFormatIdentifier,
             formatVersion: Self.adjustmentFormatVersion,
             data: Data([clockwise ? 1 : 0]))
 
-        let data = try Data(contentsOf: renderedURL)
-        try data.write(to: output.renderedContentURL, options: .atomic)
+        if let livePhotoRotator = rotator as? LivePhotoRotator {
+            // Live Photos are written through PhotoKit's own editing context, which keeps the
+            // still and its paired video in step (D10).
+            try await livePhotoRotator.applyLivePhotoRotation(input: input,
+                                                              output: output,
+                                                              clockwise: clockwise)
+        } else {
+            let renderedURL = try await rotator.rotateLocal(input: input, clockwise: clockwise)
+            defer { try? FileManager.default.removeItem(at: renderedURL) }
+            let data = try Data(contentsOf: renderedURL)
+            try data.write(to: output.renderedContentURL, options: .atomic)
+        }
 
         try await PHPhotoLibrary.shared().performChanges {
             let request = PHAssetChangeRequest(for: asset)

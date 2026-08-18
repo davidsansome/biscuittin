@@ -222,6 +222,33 @@ actor RemoteLibraryService {
         }
     }
 
+    /// Local identifiers whose server copy is verified present (D18).
+    ///
+    /// Requires all three: a checksum link carrying both sides, a `backup_state` of `uploaded`,
+    /// and a matching remote row that is not trashed. Anything less and the local copy might be
+    /// the only one.
+    func locallyDeletableIdentifiers() throws -> [String] {
+        try database.writer().read { db in
+            try String.fetchAll(db, sql: """
+                SELECT l.local_identifier
+                FROM facet_links l
+                JOIN backup_state b ON b.local_identifier = l.local_identifier
+                JOIN remote_assets r ON r.immich_id = l.immich_id
+                WHERE l.local_identifier IS NOT NULL
+                  AND l.immich_id IS NOT NULL
+                  AND b.state = 'uploaded'
+                  AND r.is_trashed = 0
+                """)
+        }
+    }
+
+    /// True when the periodic hard-delete sweep is due (D9).
+    func needsDeletionSweep(interval: TimeInterval = 7 * 24 * 3600) -> Bool {
+        guard let raw = try? getCursor(Cursor.lastFullSweep),
+              let last = Immich.parseDate(raw) else { return true }
+        return Date().timeIntervalSince(last) > interval
+    }
+
     /// The Immich id paired with a local asset, when one is known.
     func immichID(forLocalIdentifier localIdentifier: String) throws -> String? {
         try database.writer().read { db in
@@ -233,6 +260,42 @@ actor RemoteLibraryService {
     }
 
     // MARK: - Remote mutations
+
+    /// Rotates the server's copy (M7, D10).
+    ///
+    /// Immich has no rotate endpoint, so this downloads the original, rotates it with the same
+    /// strategy used locally, and replaces the asset. That keeps server-side thumbnails correct
+    /// rather than leaving them showing the old orientation.
+    func rotateRemote(immichID: String, clockwise: Bool, rotator: any AssetRotator) async throws {
+        let client = try makeClient()
+        let record = try record(for: immichID)
+        let filename = record?.fileName ?? "\(immichID).jpg"
+
+        let data = try await client.originalData(id: immichID)
+        let downloaded = FileManager.default.temporaryDirectory
+            .appendingPathComponent("remote-rotate-\(UUID().uuidString)-\(filename)")
+        try data.write(to: downloaded, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: downloaded) }
+
+        let rotated = try await rotator.rotateRemoteOriginal(fileURL: downloaded, clockwise: clockwise)
+        defer { try? FileManager.default.removeItem(at: rotated) }
+
+        try await client.replaceOriginal(id: immichID, fileURL: rotated, filename: filename)
+
+        // Dimensions swapped and the checksum changed; the next sync brings the row up to date.
+        try await writeSwappedDimensions(immichID: immichID)
+        changesContinuation.yield()
+    }
+
+    private func writeSwappedDimensions(immichID: String) async throws {
+        let writer = try database.writer()
+        try await writer.write { db in
+            try db.execute(sql: """
+                UPDATE remote_assets SET width = height, height = width, updated_at = ?
+                WHERE immich_id = ?
+                """, arguments: [Date().timeIntervalSince1970, immichID])
+        }
+    }
 
     func deleteRemote(ids: [String]) async throws {
         guard !ids.isEmpty else { return }

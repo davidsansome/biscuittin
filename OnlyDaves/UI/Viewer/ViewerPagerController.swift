@@ -214,7 +214,7 @@ final class ViewerPagerController: UIViewController {
     private func activateCurrentPage() {
         guard items.indices.contains(currentIndex) else { return }
         let stub = items[currentIndex]
-        toolbar.setRotationAvailable(stub.kind.isRotatableInV1)
+        toolbar.setRotationAvailable(env.photoActions.canRotate(stub.kind))
         currentCell()?.setChromeVisible(isChromeVisible, animated: false)
 
         guard stub.kind == .video, let cell = currentCell() else { return }

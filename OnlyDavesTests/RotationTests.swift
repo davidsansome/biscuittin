@@ -10,20 +10,30 @@ final class RotationTests: XCTestCase {
 
     // MARK: - Registry dispatch
 
-    func testV1RegistryRotatesImagesOnly() {
+    /// As of M9 every media kind has a rotator, and each dispatches to the right strategy.
+    func testRegistryCoversEveryMediaKind() {
         let registry = RotatorRegistry.v1
+        for kind in [MediaKind.image, .video, .livePhoto] {
+            XCTAssertTrue(registry.canRotate(kind), "\(kind) should be rotatable")
+            XCTAssertEqual(registry.rotator(for: kind)?.supportedKind, kind,
+                           "\(kind) must dispatch to its own strategy")
+        }
+        XCTAssertTrue(registry.rotator(for: .image) is ImageRotator)
+        XCTAssertTrue(registry.rotator(for: .video) is VideoRotator)
+        XCTAssertTrue(registry.rotator(for: .livePhoto) is LivePhotoRotator)
+    }
+
+    /// A registry built without a kind must report it unrotatable rather than failing later —
+    /// this is what let v1 ship images-only without special cases in callers.
+    func testRegistryReportsMissingKindsAsUnrotatable() {
+        let registry = RotatorRegistry(rotators: [ImageRotator()])
         XCTAssertTrue(registry.canRotate(.image))
-        XCTAssertFalse(registry.canRotate(.video), "video rotation ships in M9")
-        XCTAssertFalse(registry.canRotate(.livePhoto), "Live Photo rotation ships in M9")
-        XCTAssertEqual(registry.rotator(for: .image)?.supportedKind, .image)
+        XCTAssertFalse(registry.canRotate(.video))
         XCTAssertNil(registry.rotator(for: .video))
     }
 
     func testRegistryDispatchesByKind() {
-        // Stands in for the M9 registry: adding a rotator must make that kind rotatable with
-        // no change to callers.
         let registry = RotatorRegistry(rotators: [ImageRotator(), StubVideoRotator()])
-        XCTAssertTrue(registry.canRotate(.image))
         XCTAssertTrue(registry.canRotate(.video))
         XCTAssertEqual(registry.rotator(for: .video)?.supportedKind, .video)
     }
