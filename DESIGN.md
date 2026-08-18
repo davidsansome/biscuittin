@@ -995,6 +995,22 @@ in user space (y-up from bottom-left) while indexing a bitmap's backing memory i
 the top. A flip added to the test's pixel reader silently inverted every assertion and made a
 correct rotator look broken. See the note in `RotationTests.readPixels`.
 
+### M4 — complete (2026-08-18)
+
+Delivered: grid multi-select (requirement 11). `SelectionController` owns membership only;
+`SelectionToolbar` mirrors the viewer's action set on a material background, since it sits over
+the light grid rather than a photo.
+
+Long press enters the mode with the pressed tile selected and fires haptic feedback; tapping any
+other tile toggles it; the nav bar swaps the grouping menu for a live count and Cancel; the grid
+gains a bottom inset so the last row stays reachable. Rotate and delete route to the same
+`PhotoActionService` the viewer uses, so batch behaviour, skip reporting and confirmations are
+identical by construction. Selections are pruned against each incoming snapshot, so assets
+deleted here or on another device cannot linger in a live selection.
+
+Verified on the simulator: long press selected one tile, taps grew it to three with check
+overlays and a live count, batch rotate applied to all three and exited the mode cleanly.
+
 ### Notes for later milestones
 
 * `GridLayoutProvider` sizes tiles by giving the item `fractionalWidth(1/columns)` and

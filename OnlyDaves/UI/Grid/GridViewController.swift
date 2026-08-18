@@ -23,6 +23,11 @@ final class GridViewController: UIViewController {
     private var cancellables = Set<AnyCancellable>()
     private var hasSignalledFirstFrame = false
 
+    private let selection = SelectionController()
+    private let selectionToolbar = SelectionToolbar()
+    private var selectionToolbarBottom: NSLayoutConstraint?
+    private var defaultRightBarButtonItem: UIBarButtonItem?
+
     private lazy var statusLabel: UILabel = {
         let label = UILabel()
         label.textAlignment = .center
@@ -70,6 +75,7 @@ final class GridViewController: UIViewController {
         configureDataSource()
         configureNavigationItem()
         configureStatusViews()
+        configureSelection()
         observeStartupPhase()
 
         // Subscribe before kicking the boot cache so the very first snapshot is not missed.
@@ -125,7 +131,7 @@ final class GridViewController: UIViewController {
             cell.configure(stub: stub,
                            loader: self.env.imageLoader,
                            tileSize: self.currentTileSize(),
-                           isSelected: false)
+                           isSelected: self.selection.isActive && self.selection.contains(stub.id))
             return cell
         }
 
@@ -143,9 +149,142 @@ final class GridViewController: UIViewController {
     }
 
     private func configureNavigationItem() {
-        navigationItem.rightBarButtonItem = UIBarButtonItem(
-            image: UIImage(systemName: "square.grid.2x2"),
-            menu: makeGroupingMenu())
+        let item = UIBarButtonItem(image: UIImage(systemName: "square.grid.2x2"),
+                                   menu: makeGroupingMenu())
+        defaultRightBarButtonItem = item
+        navigationItem.rightBarButtonItem = item
+    }
+
+    // MARK: - Multi-select (requirement 11)
+
+    private func configureSelection() {
+        let longPress = UILongPressGestureRecognizer(target: self,
+                                                     action: #selector(handleLongPress(_:)))
+        longPress.minimumPressDuration = 0.4
+        collectionView.addGestureRecognizer(longPress)
+
+        selectionToolbar.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(selectionToolbar)
+        let bottom = selectionToolbar.topAnchor.constraint(equalTo: view.bottomAnchor)
+        selectionToolbarBottom = bottom
+        NSLayoutConstraint.activate([
+            selectionToolbar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            selectionToolbar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            selectionToolbar.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            bottom
+        ])
+
+        selectionToolbar.onCancel = { [weak self] in self?.selection.end() }
+        selectionToolbar.onRotateLeft = { [weak self] in self?.rotateSelection(clockwise: false) }
+        selectionToolbar.onRotateRight = { [weak self] in self?.rotateSelection(clockwise: true) }
+        selectionToolbar.onDelete = { [weak self] in self?.deleteSelection() }
+
+        selection.onChange = { [weak self] in self?.selectionDidChange() }
+        selectionDidChange()
+    }
+
+    @objc private func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
+        guard gesture.state == .began else { return }
+        let point = gesture.location(in: collectionView)
+        guard let indexPath = collectionView.indexPathForItem(at: point),
+              let stub = timeline.stub(at: indexPath) else { return }
+
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        selection.begin(with: stub.id)
+    }
+
+    private func selectionDidChange() {
+        let active = selection.isActive
+
+        // Nav bar reflects the mode: count and Cancel while selecting, grouping menu otherwise.
+        navigationItem.rightBarButtonItem = active
+            ? UIBarButtonItem(title: "Cancel", style: .done, target: self,
+                              action: #selector(cancelSelection))
+            : defaultRightBarButtonItem
+        title = active
+            ? (selection.isEmpty ? "Select Items" : "\(selection.count) Selected")
+            : "Photos"
+
+        selectionToolbar.update(selectionCount: selection.count,
+                                canRotateAny: selectionContainsRotatable())
+
+        let height = SelectionToolbar.contentHeight + view.safeAreaInsets.bottom
+        selectionToolbarBottom?.constant = active ? -height : 0
+        collectionView.contentInset.bottom = active ? height : 0
+        collectionView.verticalScrollIndicatorInsets.bottom = active ? height : 0
+
+        UIView.animate(withDuration: 0.22) { self.view.layoutIfNeeded() }
+        refreshSelectionAppearance()
+    }
+
+    @objc private func cancelSelection() {
+        selection.end()
+    }
+
+    private func selectionContainsRotatable() -> Bool {
+        for bucket in timeline.buckets {
+            for stub in bucket.items where selection.contains(stub.id) {
+                if env.photoActions.canRotate(stub.kind) { return true }
+            }
+        }
+        return false
+    }
+
+    /// Updates check overlays in place rather than reloading, so toggling never re-requests a
+    /// thumbnail or animates the tile (§14 P4).
+    private func refreshSelectionAppearance() {
+        for case let cell as AssetCell in collectionView.visibleCells {
+            guard let id = cell.representedID else { continue }
+            cell.setSelected(selection.isActive && selection.contains(id), animated: false)
+        }
+    }
+
+    private func rotateSelection(clockwise: Bool) {
+        let ids = selection.orderedIDs
+        guard !ids.isEmpty else { return }
+
+        Task { [weak self] in
+            guard let self else { return }
+            let outcome = await self.env.photoActions.rotate(ids: ids, clockwise: clockwise)
+            if let message = Toast.message(for: outcome, verb: "rotated") {
+                Toast.show(message, in: self.view)
+            }
+            self.selection.end()
+        }
+    }
+
+    private func deleteSelection() {
+        let ids = selection.orderedIDs
+        guard !ids.isEmpty else { return }
+
+        Task { [weak self] in
+            guard let self else { return }
+            let plan = await self.env.photoActions.deletePlan(ids: ids)
+            if plan.needsInAppConfirmation, await !self.confirmDelete(plan: plan) { return }
+
+            let outcome = await self.env.photoActions.delete(ids: ids)
+            if let message = Toast.message(for: outcome, verb: "deleted") {
+                Toast.show(message, in: self.view)
+            }
+            self.selection.end()
+        }
+    }
+
+    private func confirmDelete(plan: DeletePlan) async -> Bool {
+        await withCheckedContinuation { continuation in
+            let noun = plan.total == 1 ? "item" : "\(plan.total) items"
+            let alert = UIAlertController(
+                title: "Delete \(noun)?",
+                message: "This deletes from this iPhone and moves the copy on Immich to its trash.",
+                preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in
+                continuation.resume(returning: false)
+            })
+            alert.addAction(UIAlertAction(title: "Delete", style: .destructive) { _ in
+                continuation.resume(returning: true)
+            })
+            present(alert, animated: true)
+        }
     }
 
     private func configureStatusViews() {
@@ -205,7 +344,9 @@ final class GridViewController: UIViewController {
             dataSource.apply(snapshot, animatingDifferences: true)
         }
 
-        navigationItem.rightBarButtonItem?.menu = makeGroupingMenu()
+        defaultRightBarButtonItem?.menu = makeGroupingMenu()
+        // Assets can disappear underneath a live selection (deleted here or on another device).
+        selection.retain(only: Set(new.buckets.flatMap { $0.items.map(\.id) }))
         updateStatusViews()
     }
 
@@ -316,7 +457,15 @@ extension GridViewController: UICollectionViewDataSourcePrefetching {
 extension GridViewController: UICollectionViewDelegate {
     func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
         collectionView.deselectItem(at: indexPath, animated: false)
-        openViewer(at: indexPath)
+        guard let stub = timeline.stub(at: indexPath) else { return }
+
+        // In selection mode a tap adds to or removes from the selection instead of opening the
+        // viewer (requirement 11).
+        if selection.isActive {
+            selection.toggle(stub.id)
+        } else {
+            openViewer(at: indexPath)
+        }
     }
 }
 
