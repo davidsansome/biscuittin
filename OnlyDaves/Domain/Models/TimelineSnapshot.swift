@@ -60,6 +60,18 @@ struct TimelineSnapshot {
         return out
     }
 
+    /// Position of a section/item position in the flattened order. O(sections) — used on the
+    /// tap path, so it must not scan every asset.
+    func flatIndex(of indexPath: IndexPath) -> Int? {
+        guard indexPath.section >= 0, indexPath.section < buckets.count else { return nil }
+        guard indexPath.item >= 0, indexPath.item < buckets[indexPath.section].items.count else {
+            return nil
+        }
+        var offset = 0
+        for section in 0..<indexPath.section { offset += buckets[section].items.count }
+        return offset + indexPath.item
+    }
+
     /// Position of an asset in the flattened order, or nil when absent.
     func flatIndex(of id: AssetID) -> Int? {
         var offset = 0

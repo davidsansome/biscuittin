@@ -316,6 +316,59 @@ extension GridViewController: UICollectionViewDataSourcePrefetching {
 extension GridViewController: UICollectionViewDelegate {
     func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
         collectionView.deselectItem(at: indexPath, animated: false)
-        // M2 opens the full-screen viewer from here.
+        openViewer(at: indexPath)
+    }
+}
+
+// MARK: - Viewer presentation (requirement 5)
+
+extension GridViewController {
+    /// Presents the viewer synchronously off the tap — no `await` before the animation starts
+    /// (§14 P4). The flattened item list and start index both come from the snapshot already
+    /// in hand.
+    private func openViewer(at indexPath: IndexPath) {
+        guard let startIndex = timeline.flatIndex(of: indexPath) else { return }
+        let items = timeline.flattened()
+        guard !items.isEmpty else { return }
+
+        let viewer = ViewerPagerController(env: env,
+                                           items: items,
+                                           startIndex: startIndex,
+                                           source: self)
+        present(viewer, animated: true)
+    }
+}
+
+// MARK: - Zoom transition source
+
+extension GridViewController: ViewerTransitionSource {
+    func viewerTransitionSourceFrame(for id: AssetID) -> CGRect? {
+        guard let indexPath = timeline.indexPath(of: id),
+              let attributes = collectionView.layoutAttributesForItem(at: indexPath) else { return nil }
+        let frameInCollectionView = attributes.frame
+        // Only offer a frame when the tile is actually on screen; otherwise the animation
+        // would fly in from somewhere the user cannot see.
+        guard collectionView.bounds.intersects(frameInCollectionView) else { return nil }
+        return collectionView.convert(frameInCollectionView, to: nil)
+    }
+
+    func viewerTransitionSourceImage(for id: AssetID) -> UIImage? {
+        guard let indexPath = timeline.indexPath(of: id),
+              let cell = collectionView.cellForItem(at: indexPath) as? AssetCell else { return nil }
+        return cell.thumbnailImage
+    }
+
+    func viewerTransitionPrepareForDismissal(to id: AssetID) {
+        guard let indexPath = timeline.indexPath(of: id), isValid(indexPath) else { return }
+        // Scroll the destination tile into view so the viewer has somewhere to land.
+        guard !collectionView.indexPathsForVisibleItems.contains(indexPath) else { return }
+        collectionView.scrollToItem(at: indexPath, at: .centeredVertically, animated: false)
+        collectionView.layoutIfNeeded()
+    }
+
+    func viewerTransitionSetSourceHidden(_ hidden: Bool, for id: AssetID) {
+        guard let indexPath = timeline.indexPath(of: id),
+              let cell = collectionView.cellForItem(at: indexPath) as? AssetCell else { return }
+        cell.contentView.alpha = hidden ? 0 : 1
     }
 }

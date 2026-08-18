@@ -19,6 +19,10 @@ final class AssetCell: UICollectionViewCell {
     private weak var loader: ImageLoader?
     private(set) var representedID: AssetID?
 
+    /// The decoded thumbnail, handed to the zoom transition as its placeholder so the
+    /// animation can start immediately on tap (§14 P4).
+    var thumbnailImage: UIImage? { imageView.image }
+
     override init(frame: CGRect) {
         super.init(frame: frame)
         contentView.clipsToBounds = true

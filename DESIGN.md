@@ -942,6 +942,36 @@ with grouping and column count persisted, and — the D20 path — 68 assets add
 | `TimelineStore` | index logic inline in the actor | ordering logic extracted to a pure `TimelineIndex` value type | Makes the D20 invariant directly testable — `testIncrementalMutationsMatchFullRebuild` asserts an incremental sequence equals a full rebuild. |
 | — | (not specified) | new `PHAssetResolver` | Stubs hold no `PHAsset`, and resolving one identifier per cell is a photo-DB query per tile. Batches lookups behind a bounded LRU. |
 
+### M2 — complete (2026-08-18)
+
+Delivered: the full-screen viewer (requirements 5–9). Horizontally-paging `UICollectionView`
+(not `UIPageViewController`) with `ViewerPageCell` hosting either a `ZoomablePhotoView` or a
+`VideoPlayerPageView`; `ViewerZoomAnimator` flying from the tapped tile using the already-decoded
+grid thumbnail; direct-manipulation swipe-down dismissal; the gradient `ViewerToolbar`; and the
+SwiftUI `InfoSheet` backed by `MetadataService`.
+
+Verified on the simulator: tap opens the viewer, horizontal swipe pages between assets with
+correct aspect-fit for both landscape and portrait, single tap toggles toolbar *and* status bar,
+swipe-down returns to the grid, videos autoplay with a working scrubber and elapsed/remaining
+times, rotate controls are correctly disabled on video pages (D10), and the info sheet renders
+filename, capture date, dimensions with megapixels, file size, camera/lens/exposure/focal length,
+a map with reverse-geocoded place name, and the availability badge.
+
+Two real bugs found and fixed during verification:
+
+* `ZoomablePhotoView` computed its zoom scales only on bounds changes, so an image arriving
+  after the last layout pass left the image view at zero size and the page rendered black.
+  `setImage` now reconfigures explicitly, and the scale limits are relaxed before resetting to
+  1× because `UIScrollView` clamps `zoomScale` to the *existing* range — a stale range from the
+  previous image would otherwise distort the new one.
+* The video scrubber overlapped the toolbar buttons: the toolbar's controls were pinned to the
+  top of its gradient area rather than its bottom safe area, and the video inset was computed in
+  `cellForItemAt` when `safeAreaInsets` were still zero. Controls are now bottom-pinned and the
+  inset is applied at layout time.
+
+Rotate and delete remain wired to no-ops pending M3's `PhotoActionService`; the controls are
+present and correctly enabled/disabled by media kind so the layout is final.
+
 ### Notes for later milestones
 
 * `GridLayoutProvider` sizes tiles by giving the item `fractionalWidth(1/columns)` and
@@ -952,6 +982,9 @@ with grouping and column count persisted, and — the D20 path — 68 assets add
   loose 1 s ceiling for a 200k-stub decode. Tighten it against a real device measurement
   during the M7 Instruments pass (P7); a 200k index is ~14 MB on disk and decode is on
   the critical path to first frame.
+* Verifying UI changes from screenshots alone has already produced one phantom bug and one
+  mis-aimed tap in this repo. See [AGENTS.md](AGENTS.md) — get a non-visual reading (accessibility
+  tree, runtime frame log, `Tools/pixelprobe.swift`) before changing layout code.
 * `TimelineStore.rebuildIndex()` has the M5 merge point marked: remote stubs join the
   array there, before `index.replaceAll`.
 * `StartupSequencer.runStartupSequence()` has the M5 (`deltaSync`) and M6 (`SyncEngine.kick`)
