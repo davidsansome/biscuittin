@@ -40,6 +40,16 @@ final class GridViewController: UIViewController {
         return label
     }()
 
+    private lazy var backupIndicatorButton = UIButton(type: .system)
+    private lazy var backupIndicatorItem: UIBarButtonItem = {
+        let item = UIBarButtonItem(customView: backupIndicatorButton)
+        item.isHidden = true
+        backupIndicatorButton.addAction(UIAction { [weak self] _ in
+            self?.presentSettings()
+        }, for: .touchUpInside)
+        return item
+    }()
+
     private lazy var settingsButton: UIButton = {
         var config = UIButton.Configuration.borderedProminent()
         config.title = "Open Settings"
@@ -154,11 +164,45 @@ final class GridViewController: UIViewController {
                                    menu: makeGroupingMenu())
         defaultRightBarButtonItem = item
         navigationItem.rightBarButtonItem = item
-        navigationItem.leftBarButtonItem = UIBarButtonItem(
-            image: UIImage(systemName: "gearshape"),
-            style: .plain,
-            target: self,
-            action: #selector(presentSettings))
+        navigationItem.leftBarButtonItems = [
+            UIBarButtonItem(image: UIImage(systemName: "gearshape"),
+                            style: .plain,
+                            target: self,
+                            action: #selector(presentSettings)),
+            backupIndicatorItem
+        ]
+        observeBackupStatus()
+    }
+
+    /// Requirement 14: cloud glyph plus the outstanding count, hidden when sync is off.
+    private func observeBackupStatus() {
+        env.backupStatus.objectWillChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.updateBackupIndicator() }
+            .store(in: &cancellables)
+        updateBackupIndicator()
+    }
+
+    private func updateBackupIndicator() {
+        let status = env.backupStatus
+        guard status.isEnabled else {
+            backupIndicatorItem.isHidden = true
+            return
+        }
+        backupIndicatorItem.isHidden = false
+
+        var config = UIButton.Configuration.plain()
+        config.image = UIImage(systemName: status.indicatorSymbol,
+                               withConfiguration: UIImage.SymbolConfiguration(pointSize: 15,
+                                                                              weight: .medium))
+        config.title = status.indicatorText
+        config.imagePadding = 4
+        config.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 6, bottom: 4, trailing: 6)
+        config.baseForegroundColor = status.remainingCount > 0 ? .secondaryLabel : .systemGreen
+        backupIndicatorButton.configuration = config
+        backupIndicatorButton.accessibilityLabel = status.remainingCount > 0
+            ? "\(status.remainingCount) items waiting to back up"
+            : "All items backed up"
     }
 
     @objc private func presentSettings() {

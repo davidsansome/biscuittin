@@ -23,16 +23,34 @@ final class SettingsViewModel: ObservableObject {
     private let remoteLibrary: RemoteLibraryService
     private let timelineStore: TimelineStore
     private let imageCache: RemoteImageFetcher
+    private let syncEngine: SyncEngine
+    private let settings: AppSettings
+    let backupStatus: BackupStatusStore
     private var signInTask: Task<Void, Never>?
+
+    // MARK: - Sync (requirement 14, D17)
+
+    @Published var showsScopePrompt = false
+    @Published private(set) var syncEnabled = false
+    @Published private(set) var syncScope: SyncScope = .all
+    @Published private(set) var outOfScopeCount = 0
 
     init(session: ImmichAuthSession,
          remoteLibrary: RemoteLibraryService,
          timelineStore: TimelineStore,
-         imageCache: RemoteImageFetcher) {
+         imageCache: RemoteImageFetcher,
+         syncEngine: SyncEngine,
+         settings: AppSettings,
+         backupStatus: BackupStatusStore) {
         self.session = session
         self.remoteLibrary = remoteLibrary
         self.timelineStore = timelineStore
         self.imageCache = imageCache
+        self.syncEngine = syncEngine
+        self.settings = settings
+        self.backupStatus = backupStatus
+        self.syncEnabled = settings.syncEnabled
+        self.syncScope = settings.syncScope
         self.serverURLText = session.baseURL?.absoluteString ?? ""
         self.email = session.email ?? ""
         self.state = session.state
@@ -146,6 +164,55 @@ final class SettingsViewModel: ObservableObject {
             self.syncedCount = nil
             self.lastSyncDate = nil
             self.isWorking = false
+        }
+    }
+
+    /// Toggling on asks for a scope first, unless one was chosen previously (D17).
+    func setSyncEnabled(_ enabled: Bool) {
+        guard enabled else {
+            syncEnabled = false
+            Task { await syncEngine.setEnabled(false, scope: nil) }
+            return
+        }
+        guard settings.hasChosenSyncScope else {
+            showsScopePrompt = true
+            return
+        }
+        syncEnabled = true
+        Task { await syncEngine.setEnabled(true, scope: nil) }
+    }
+
+    func chooseScope(_ scope: SyncScope) {
+        showsScopePrompt = false
+        syncScope = scope
+        syncEnabled = true
+        Task { [weak self] in
+            guard let self else { return }
+            await self.syncEngine.setEnabled(true, scope: scope)
+            self.outOfScopeCount = await self.syncEngine.outOfScopeCount()
+        }
+    }
+
+    func cancelScopePrompt() {
+        showsScopePrompt = false
+        syncEnabled = false
+    }
+
+    /// One-way upgrade to backing up everything (D17).
+    func upgradeScopeToAll() {
+        Task { [weak self] in
+            guard let self else { return }
+            await self.syncEngine.upgradeScopeToAll()
+            self.syncScope = .all
+            self.outOfScopeCount = 0
+        }
+    }
+
+    func refreshSyncStatus() {
+        Task { [weak self] in
+            guard let self else { return }
+            self.outOfScopeCount = await self.syncEngine.outOfScopeCount()
+            await self.syncEngine.publishStatus(uploading: false)
         }
     }
 

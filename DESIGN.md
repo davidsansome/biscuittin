@@ -1037,6 +1037,35 @@ Two real bugs surfaced only because the mock server was driven for real:
 Live verification against a real Immich v3.1.0 server is still outstanding; the endpoint shapes
 in §7.1 remain the contract to validate against its `/api/docs` (D8).
 
+### M6 — complete (2026-08-18)
+
+Delivered: upload sync (requirement 14). `LocalAssetExporter` streams originals while hashing
+them (SHA-1, chunked, so multi-gigabyte videos never sit in memory), `SyncEngine` runs the
+enumerate/checksum/dedupe/upload pipeline with scope filtering and retry/backoff,
+`BackupStatusStore` publishes the badge, and the settings screen gained the toggle, the scope
+choice and the one-way upgrade.
+
+Verified against the mock server: 73 assets enumerated and checksummed, `bulk-upload-check`
+called, then real multipart uploads carrying the right `x-immich-checksum`. The queue drained in
+rounds (65 → 57 → 49 → 41 → 33 outstanding). Then, with the local database deleted to simulate a
+fresh install against an already-populated server, the run reported **73 duplicates and uploaded
+nothing** — the D12 claim, demonstrated rather than assumed.
+
+One crash-level bug surfaced, which unit tests could not have caught: `BGTaskScheduler.submit`
+for an identifier that was never registered raises an **Objective-C** exception, which Swift's
+`try`/`catch` cannot intercept, so the app aborted on every launch. Registration must happen
+before launch completes, which is earlier than `AppEnvironment` exists — hence
+`BackgroundTaskRegistrar`, registered from a `UIApplicationDelegate` and guarding every submit
+behind `canSubmit`.
+
+Deviation: the sync toggle and scope live in `UserDefaults` rather than the `kv` table of §7.3,
+so they are readable without opening SQLite on the launch path (D19).
+
+Not verified interactively: the settings **Toggle** did not respond to synthetic taps, although a
+`Button` at a comparable position did. The underlying path was verified by enabling sync through
+defaults and observing the full pipeline run. The toggle's wiring (`setSyncEnabled` → scope
+prompt → `chooseScope`) still needs a human tap, or a UI test, to confirm.
+
 ### Notes for later milestones
 
 * `GridLayoutProvider` sizes tiles by giving the item `fractionalWidth(1/columns)` and

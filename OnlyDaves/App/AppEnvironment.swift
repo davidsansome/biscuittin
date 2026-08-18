@@ -21,6 +21,9 @@ final class AppEnvironment: ObservableObject {
     let immichSession: ImmichAuthSession
     let remoteLibrary: RemoteLibraryService
     let remoteImages: RemoteImageFetcher
+    let exporter: LocalAssetExporter
+    let syncEngine: SyncEngine
+    let backupStatus: BackupStatusStore
 
     init() {
         let settings = AppSettings()
@@ -38,6 +41,16 @@ final class AppEnvironment: ObservableObject {
         let remoteLibrary = RemoteLibraryService(database: database, session: immichSession)
         let remoteImages = RemoteImageFetcher(session: immichSession,
                                               cache: RemoteThumbnailCache())
+        let exporter = LocalAssetExporter()
+        let backupStatus = BackupStatusStore()
+        let syncEngine = SyncEngine(database: database,
+                                    session: immichSession,
+                                    localLibrary: localLibrary,
+                                    resolver: resolver,
+                                    exporter: exporter,
+                                    remoteLibrary: remoteLibrary,
+                                    settings: settings,
+                                    status: backupStatus)
 
         self.settings = settings
         self.localLibrary = localLibrary
@@ -51,6 +64,9 @@ final class AppEnvironment: ObservableObject {
         self.immichSession = immichSession
         self.remoteLibrary = remoteLibrary
         self.remoteImages = remoteImages
+        self.exporter = exporter
+        self.syncEngine = syncEngine
+        self.backupStatus = backupStatus
         self.photoActions = PhotoActionService(timelineStore: timelineStore,
                                                resolver: resolver,
                                                editor: editor,
@@ -60,10 +76,12 @@ final class AppEnvironment: ObservableObject {
         self.startup = StartupSequencer(localLibrary: localLibrary,
                                         timelineStore: timelineStore,
                                         remoteLibrary: remoteLibrary,
-                                        session: immichSession)
+                                        session: immichSession,
+                                        syncEngine: syncEngine)
 
         // Wiring that would otherwise be an initialisation cycle. Still zero I/O (D19).
         imageLoader.attachRemoteFetcher(remoteImages)
+        syncEngine.connectBackgroundHandler()
         Task { await timelineStore.attach(remoteLibrary: remoteLibrary) }
     }
 
@@ -72,6 +90,9 @@ final class AppEnvironment: ObservableObject {
         SettingsViewModel(session: immichSession,
                           remoteLibrary: remoteLibrary,
                           timelineStore: timelineStore,
-                          imageCache: remoteImages)
+                          imageCache: remoteImages,
+                          syncEngine: syncEngine,
+                          settings: settings,
+                          backupStatus: backupStatus)
     }
 }

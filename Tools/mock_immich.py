@@ -90,6 +90,9 @@ def build_assets():
 
 ASSETS = build_assets()
 REQUEST_LOG = []
+# checksum -> server asset id, so bulk-upload-check can report duplicates
+UPLOADED_CHECKSUMS = {}
+UPLOAD_COUNT = []
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -137,6 +140,8 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b"{}"
+        if path == "/api/assets":
+            pass  # raw holds the multipart body; only its size matters here
         REQUEST_LOG.append(("POST", path))
         print(f"POST {path}  body={raw[:120]!r}", flush=True)
 
@@ -147,6 +152,34 @@ class Handler(BaseHTTPRequestHandler):
                 "userEmail": "dave@example.com",
                 "name": "Dave",
             })
+
+        if path == "/api/assets/bulk-upload-check":
+            if not self._authorized():
+                return self._send(401, {"message": "unauthorized"})
+            body = json.loads(raw or b"{}")
+            results = []
+            for item in body.get("assets", []):
+                known = item["checksum"] in UPLOADED_CHECKSUMS
+                results.append({
+                    "id": item["id"],
+                    "action": "reject" if known else "accept",
+                    "reason": "duplicate" if known else None,
+                    "assetId": UPLOADED_CHECKSUMS.get(item["checksum"]),
+                })
+            print(f"  bulk-upload-check: {len(results)} items, "
+                  f"{sum(1 for r in results if r['action'] == 'reject')} duplicates", flush=True)
+            return self._send(200, {"results": results})
+
+        if path == "/api/assets":
+            if not self._authorized():
+                return self._send(401, {"message": "unauthorized"})
+            checksum = self.headers.get("x-immich-checksum", "")
+            new_id = f"uploaded-{len(UPLOADED_CHECKSUMS):04d}"
+            UPLOADED_CHECKSUMS[checksum] = new_id
+            UPLOAD_COUNT.append(new_id)
+            print(f"  UPLOAD #{len(UPLOAD_COUNT)} checksum={checksum[:16]}... "
+                  f"bytes={len(raw)}", flush=True)
+            return self._send(201, {"id": new_id, "status": "created"})
 
         if path == "/api/search/metadata":
             if not self._authorized():

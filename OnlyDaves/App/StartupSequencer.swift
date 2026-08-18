@@ -24,16 +24,19 @@ final class StartupSequencer: ObservableObject {
     private let timelineStore: TimelineStore
     private let remoteLibrary: RemoteLibraryService
     private let session: ImmichAuthSession
+    private let syncEngine: SyncEngine
     private var hasStarted = false
 
     init(localLibrary: LocalLibraryService,
          timelineStore: TimelineStore,
          remoteLibrary: RemoteLibraryService,
-         session: ImmichAuthSession) {
+         session: ImmichAuthSession,
+         syncEngine: SyncEngine) {
         self.localLibrary = localLibrary
         self.timelineStore = timelineStore
         self.remoteLibrary = remoteLibrary
         self.session = session
+        self.syncEngine = syncEngine
         self.authorizationStatus = localLibrary.authorizationStatus
     }
 
@@ -65,7 +68,12 @@ final class StartupSequencer: ObservableObject {
         phase = .ready
 
         await runRemoteDeltaSync()
-        // M6 hooks in here: SyncEngine.kick()
+
+        // Upload sync runs last: it is the lowest-priority work and must never delay the
+        // grid or the metadata refresh (§14 P6).
+        await syncEngine.publishStatus(uploading: false)
+        syncEngine.scheduleBackgroundTask()
+        await syncEngine.kick()
     }
 
     /// Catches up with the server after the first frame. Failures are logged, never surfaced
@@ -84,7 +92,10 @@ final class StartupSequencer: ObservableObject {
     /// Foreground refresh, so returning to the app picks up server-side changes.
     func sceneDidBecomeActive() {
         guard hasStarted else { return }
-        Task { await runRemoteDeltaSync() }
+        Task {
+            await runRemoteDeltaSync()
+            await syncEngine.kick()
+        }
     }
 
     /// Re-checks authorization after the user returns from the Settings app.

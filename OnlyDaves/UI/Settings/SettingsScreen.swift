@@ -3,12 +3,20 @@ import SwiftUI
 /// Immich server settings (requirement 13, DESIGN.md §13.4).
 struct SettingsScreen: View {
     @ObservedObject var viewModel: SettingsViewModel
+    @ObservedObject private var backupStatus: BackupStatusStore
+
+    init(viewModel: SettingsViewModel) {
+        self.viewModel = viewModel
+        self.backupStatus = viewModel.backupStatus
+    }
+
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
             Form {
                 serverSection
+                if viewModel.isSignedIn { syncSection }
                 if viewModel.isSignedIn { connectedSection }
                 if let error = viewModel.errorMessage { errorSection(error) }
                 aboutSection
@@ -20,6 +28,17 @@ struct SettingsScreen: View {
                     Button("Done") { dismiss() }
                 }
             }
+            .confirmationDialog("What should be backed up?",
+                                isPresented: $viewModel.showsScopePrompt,
+                                titleVisibility: .visible) {
+                Button("Back Up All Photos & Videos") { viewModel.chooseScope(.all) }
+                Button("Back Up New Items Only") { viewModel.chooseScope(.newOnly(anchor: Date())) }
+                Button("Not Now", role: .cancel) { viewModel.cancelScopePrompt() }
+            } message: {
+                Text("“New items only” backs up things captured from now on. "
+                     + "You can switch to backing up everything later.")
+            }
+            .task { viewModel.refreshSyncStatus() }
             .alert("Connection isn’t private", isPresented: $viewModel.showsInsecureWarning) {
                 Button("Cancel", role: .cancel) {}
                 Button("Connect anyway") { viewModel.confirmInsecureAndSignIn() }
@@ -82,6 +101,44 @@ struct SettingsScreen: View {
                     .disabled(!viewModel.canSignIn)
             }
         }
+    }
+
+    /// Requirement 14: the backup toggle, its scope, and progress.
+    @ViewBuilder
+    private var syncSection: some View {
+        Section {
+            Toggle("Back Up This iPhone", isOn: Binding(
+                get: { viewModel.syncEnabled },
+                set: { viewModel.setSyncEnabled($0) }))
+
+            if viewModel.syncEnabled {
+                LabeledContent("Scope") {
+                    Text(scopeDescription).foregroundStyle(.secondary)
+                }
+                if viewModel.syncScope.isNewOnly {
+                    Button("Back Up Older Items Too") { viewModel.upgradeScopeToAll() }
+                    if viewModel.outOfScopeCount > 0 {
+                        Text("\(viewModel.outOfScopeCount) older items are currently excluded.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                LabeledContent("Waiting to upload") {
+                    Text("\(backupStatus.remainingCount)")
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+            }
+        } header: {
+            Text("Backup")
+        } footer: {
+            Text("Uploads photos and videos from this iPhone to your Immich server.")
+        }
+    }
+
+    private var scopeDescription: String {
+        guard let anchor = viewModel.syncScope.anchor else { return "All items" }
+        return "New items only, since \(anchor.formatted(date: .abbreviated, time: .omitted))"
     }
 
     private var connectedSection: some View {
