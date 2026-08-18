@@ -972,6 +972,29 @@ Two real bugs found and fixed during verification:
 Rotate and delete remain wired to no-ops pending M3's `PhotoActionService`; the controls are
 present and correctly enabled/disabled by media kind so the layout is final.
 
+### M3 — complete (2026-08-18)
+
+Delivered: the rotation architecture and local actions (requirement 10). `AssetRotator` +
+`RotatorRegistry` dispatch by `MediaKind` with only `ImageRotator` registered in v1;
+`LocalAssetEditor` commits through PhotoKit's content-editing flow so originals stay revertable
+and successive rotations stack; `PhotoActionService` orchestrates batches with bounded
+concurrency and per-asset outcomes; `Toast` reports partial failures and skips.
+
+Rotation direction was wrong on first implementation — a clockwise tap rotated
+counter-clockwise. `RotationTests` now pins the property that was broken: a marker in the
+visual top-left must land top-right after a clockwise turn, bottom-left after a
+counter-clockwise one, and four clockwise turns must restore the original geometry.
+
+Verified on the simulator: rotate-right turns the image clockwise and persists to the photo
+library (dimensions swap, grid tile and viewer re-fit), four turns return to the original,
+delete shows the system confirmation with no redundant app dialog for local-only assets (D11),
+and the viewer advances to the next asset afterwards.
+
+A second coordinate-convention trap cost time here and is worth knowing: `CGContext.fill` draws
+in user space (y-up from bottom-left) while indexing a bitmap's backing memory is y-down from
+the top. A flip added to the test's pixel reader silently inverted every assertion and made a
+correct rotator look broken. See the note in `RotationTests.readPixels`.
+
 ### Notes for later milestones
 
 * `GridLayoutProvider` sizes tiles by giving the item `fractionalWidth(1/columns)` and

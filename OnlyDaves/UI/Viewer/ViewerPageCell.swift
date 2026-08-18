@@ -11,6 +11,7 @@ final class ViewerPageCell: UICollectionViewCell {
     private(set) var stub: AssetStub?
     private var token: ImageRequestToken?
     private weak var loader: ImageLoader?
+    private var previewRotationAngle: CGFloat = 0
 
     var onSingleTap: (() -> Void)?
     /// Raised when the user zooms in past the fit scale, so a full-resolution image is fetched.
@@ -44,6 +45,8 @@ final class ViewerPageCell: UICollectionViewCell {
         loader?.cancel(token)
         token = nil
         stub = nil
+        previewRotationAngle = 0
+        photoView.imageView.transform = .identity
         photoView.setImage(nil, resetZoom: true)
         videoView.detachPlayer()
         videoView.setPoster(nil)
@@ -85,6 +88,24 @@ final class ViewerPageCell: UICollectionViewCell {
 
     func resetZoom(animated: Bool) {
         photoView.resetZoom(animated: animated)
+    }
+
+    /// Turns the displayed image immediately so the tap has a visible effect before the real
+    /// edit completes (§14 P4). `revertPreviewRotation` undoes it if the edit fails.
+    func previewRotation(clockwise: Bool) {
+        guard stub?.kind != .video else { return }
+        let delta: CGFloat = clockwise ? .pi / 2 : -.pi / 2
+        previewRotationAngle += delta
+        UIView.animate(withDuration: 0.2, delay: 0, options: [.curveEaseInOut]) {
+            self.photoView.imageView.transform = CGAffineTransform(rotationAngle: self.previewRotationAngle)
+        }
+    }
+
+    func revertPreviewRotation() {
+        previewRotationAngle = 0
+        UIView.animate(withDuration: 0.2) {
+            self.photoView.imageView.transform = .identity
+        }
     }
 
     var isAtMinimumZoom: Bool {

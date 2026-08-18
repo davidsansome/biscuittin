@@ -160,11 +160,9 @@ final class ViewerPagerController: UIViewController {
 
         toolbar.onBack = { [weak self] in self?.dismissViewer() }
         toolbar.onInfo = { [weak self] in self?.presentInfoSheet() }
-        // Rotate and delete are wired in M3 (PhotoActionService); the controls are present
-        // and correctly enabled/disabled by media kind so the layout is final.
-        toolbar.onRotateLeft = { Log.ui.info("Rotate left tapped — implemented in M3") }
-        toolbar.onRotateRight = { Log.ui.info("Rotate right tapped — implemented in M3") }
-        toolbar.onDelete = { Log.ui.info("Delete tapped — implemented in M3") }
+        toolbar.onRotateLeft = { [weak self] in self?.rotateCurrent(clockwise: false) }
+        toolbar.onRotateRight = { [weak self] in self?.rotateCurrent(clockwise: true) }
+        toolbar.onDelete = { [weak self] in self?.deleteCurrent() }
     }
 
     private func configureDismissGesture() {
@@ -295,6 +293,102 @@ final class ViewerPagerController: UIViewController {
         default:
             break
         }
+    }
+
+    // MARK: - Rotate and delete (requirement 10)
+
+    /// Optimistic: the on-screen image turns immediately and the real edit runs behind it,
+    /// reverting with a toast on failure (§14 P4). No `await` precedes the visible effect.
+    private func rotateCurrent(clockwise: Bool) {
+        guard items.indices.contains(currentIndex) else { return }
+        let stub = items[currentIndex]
+        guard env.photoActions.canRotate(stub.kind) else {
+            Toast.show("This item can’t be rotated yet.", in: view)
+            return
+        }
+        guard let cell = currentCell() else { return }
+
+        cell.previewRotation(clockwise: clockwise)
+
+        Task { [weak self] in
+            guard let self else { return }
+            let outcome = await self.env.photoActions.rotate(ids: [stub.id], clockwise: clockwise)
+            guard !outcome.succeeded.isEmpty else {
+                self.currentCell()?.revertPreviewRotation()
+                let message = Toast.message(for: outcome, verb: "rotated")
+                    ?? outcome.firstError?.localizedDescription
+                    ?? "Rotation failed."
+                Toast.show(message, in: self.view)
+                return
+            }
+            // The real rendition has different dimensions; reload the page so it re-fits.
+            self.reloadCurrentPageAfterEdit()
+        }
+    }
+
+    private func deleteCurrent() {
+        guard items.indices.contains(currentIndex) else { return }
+        let stub = items[currentIndex]
+
+        Task { [weak self] in
+            guard let self else { return }
+            let plan = await self.env.photoActions.deletePlan(ids: [stub.id])
+            if plan.needsInAppConfirmation {
+                guard await self.confirmDelete(plan: plan) else { return }
+            }
+            let outcome = await self.env.photoActions.delete(ids: [stub.id])
+            guard !outcome.succeeded.isEmpty else {
+                if let error = outcome.firstError {
+                    Toast.show(error.localizedDescription, in: self.view)
+                }
+                return
+            }
+            self.advanceAfterDeleting(stub.id)
+        }
+    }
+
+    /// Confirms deletions that reach the server (D11). Purely local deletions rely on the
+    /// system's own confirmation and never reach here.
+    private func confirmDelete(plan: DeletePlan) async -> Bool {
+        await withCheckedContinuation { continuation in
+            let count = plan.total
+            let noun = count == 1 ? "item" : "\(count) items"
+            let alert = UIAlertController(
+                title: "Delete \(noun)?",
+                message: "This deletes from this iPhone and moves the copy on Immich to its trash.",
+                preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in
+                continuation.resume(returning: false)
+            })
+            alert.addAction(UIAlertAction(title: "Delete", style: .destructive) { _ in
+                continuation.resume(returning: true)
+            })
+            present(alert, animated: true)
+        }
+    }
+
+    /// Moves to the next asset after a delete, or leaves if that was the last one.
+    private func advanceAfterDeleting(_ id: AssetID) {
+        guard let removed = items.firstIndex(where: { $0.id == id }) else { return }
+        items.remove(at: removed)
+
+        guard !items.isEmpty else {
+            dismiss(animated: true)
+            return
+        }
+        currentIndex = min(removed, items.count - 1)
+        collectionView.reloadData()
+        collectionView.layoutIfNeeded()
+        collectionView.setContentOffset(
+            CGPoint(x: CGFloat(currentIndex) * collectionView.bounds.width, y: 0), animated: false)
+        activateCurrentPage()
+    }
+
+    private func reloadCurrentPageAfterEdit() {
+        let indexPath = IndexPath(item: currentIndex, section: 0)
+        guard indexPath.item < items.count else { return }
+        collectionView.reloadItems(at: [indexPath])
+        activateCurrentPage()
     }
 
     // MARK: - Info sheet (requirement 9)

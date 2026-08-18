@@ -15,22 +15,36 @@ final class AppEnvironment: ObservableObject {
     let database: AppDatabase
     let timelineStore: TimelineStore
     let startup: StartupSequencer
+    let assetEditor: LocalAssetEditor
+    let photoActions: PhotoActionService
+    let rotators: RotatorRegistry
 
     init() {
         let settings = AppSettings()
         let localLibrary = LocalLibraryService()
         let bootCache = BootCache()
         let resolver = PHAssetResolver()
+        let imageLoader = ImageLoader(resolver: resolver)
+        let timelineStore = TimelineStore(localLibrary: localLibrary,
+                                          bootCache: bootCache,
+                                          settings: settings)
+        let editor = LocalAssetEditor()
+        let rotators = RotatorRegistry.v1
 
         self.settings = settings
         self.localLibrary = localLibrary
         self.bootCache = bootCache
         self.assetResolver = resolver
-        self.imageLoader = ImageLoader(resolver: resolver)
+        self.imageLoader = imageLoader
         self.database = AppDatabase()
-        self.timelineStore = TimelineStore(localLibrary: localLibrary,
-                                           bootCache: bootCache,
-                                           settings: settings)
+        self.timelineStore = timelineStore
+        self.assetEditor = editor
+        self.rotators = rotators
+        self.photoActions = PhotoActionService(timelineStore: timelineStore,
+                                               resolver: resolver,
+                                               editor: editor,
+                                               registry: rotators,
+                                               imageLoader: imageLoader)
         self.startup = StartupSequencer(localLibrary: localLibrary,
                                         timelineStore: timelineStore)
     }
