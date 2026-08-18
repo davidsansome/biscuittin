@@ -22,11 +22,18 @@ final class StartupSequencer: ObservableObject {
 
     private let localLibrary: LocalLibraryService
     private let timelineStore: TimelineStore
+    private let remoteLibrary: RemoteLibraryService
+    private let session: ImmichAuthSession
     private var hasStarted = false
 
-    init(localLibrary: LocalLibraryService, timelineStore: TimelineStore) {
+    init(localLibrary: LocalLibraryService,
+         timelineStore: TimelineStore,
+         remoteLibrary: RemoteLibraryService,
+         session: ImmichAuthSession) {
         self.localLibrary = localLibrary
         self.timelineStore = timelineStore
+        self.remoteLibrary = remoteLibrary
+        self.session = session
         self.authorizationStatus = localLibrary.authorizationStatus
     }
 
@@ -46,9 +53,10 @@ final class StartupSequencer: ObservableObject {
 
         guard status == .authorized || status == .limited else {
             phase = .accessDenied
-            // Publish an authoritative empty index so a stale boot cache stops showing
-            // photos the app can no longer read.
+            // Publish an authoritative index anyway: a configured server may still have photos
+            // to show, and a stale boot cache must stop showing local ones we can't read.
             await timelineStore.startLive()
+            await runRemoteDeltaSync()
             return
         }
 
@@ -56,8 +64,27 @@ final class StartupSequencer: ObservableObject {
         await timelineStore.startLive()
         phase = .ready
 
-        // M5 hooks in here: RemoteLibraryService.deltaSync()
+        await runRemoteDeltaSync()
         // M6 hooks in here: SyncEngine.kick()
+    }
+
+    /// Catches up with the server after the first frame. Failures are logged, never surfaced
+    /// as a blocking error — the grid is already usable from cached metadata (§15 offline).
+    private func runRemoteDeltaSync() async {
+        guard session.isConfigured else { return }
+        do {
+            try await remoteLibrary.deltaSync()
+        } catch is CancellationError {
+            return
+        } catch {
+            Log.immich.error("Delta sync failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// Foreground refresh, so returning to the app picks up server-side changes.
+    func sceneDidBecomeActive() {
+        guard hasStarted else { return }
+        Task { await runRemoteDeltaSync() }
     }
 
     /// Re-checks authorization after the user returns from the Settings app.

@@ -16,6 +16,7 @@ struct OnlyDavesApp: App {
                 env.startup.sceneDidEnterBackground()
             case .active:
                 env.startup.refreshAuthorization()
+                env.startup.sceneDidBecomeActive()
             default:
                 break
             }

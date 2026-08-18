@@ -1011,6 +1011,32 @@ deleted here or on another device cannot linger in a live selection.
 Verified on the simulator: long press selected one tile, taps grew it to three with check
 overlays and a live count, batch rotate applied to all three and exited the mode cleanly.
 
+### M5 — complete (2026-08-18)
+
+Delivered: the Immich read path (requirements 12–13). `ImmichClient` (storage-free, typed,
+timeout-bounded), `ImmichAuthSession` (Keychain token, version gate, URL normalisation),
+`RemoteLibraryService` (paged full sync, `updatedAfter` delta sync, deletion reconciliation),
+`RemoteThumbnailCache` + `DiskCache`, `RemoteImageFetcher`, and the SwiftUI settings form.
+`TimelineStore` now merges remote stubs with local ones, collapsing checksum-linked pairs into
+a single two-facet asset, and `PhotoActionService.delete` removes both copies (D11).
+
+Verified end-to-end against `Tools/mock_immich.py`, a stand-in server that speaks the subset of
+the API this milestone uses: sign-in, version gate, metadata paging, and thumbnails. The grid
+showed remote assets interleaved with local ones by date, each carrying the cloud badge, with a
+remote video's duration badge; relaunch restored the session from the Keychain and ran a delta
+sync carrying the stored cursor.
+
+Two real bugs surfaced only because the mock server was driven for real:
+
+* The version gate parsed `"v3.1.0"` with `Int("v3")`, which is nil, so **every** real server
+  would have been rejected as too old. Now parses the leading integer wherever it starts.
+* `DiskCache` keyed files by `hashValue`, which Swift seeds randomly per process — the disk
+  cache never survived a relaunch and every thumbnail was re-downloaded. Replaced with a
+  deterministic FNV-1a hash; verified by relaunching and observing zero thumbnail requests.
+
+Live verification against a real Immich v3.1.0 server is still outstanding; the endpoint shapes
+in §7.1 remain the contract to validate against its `/api/docs` (D8).
+
 ### Notes for later milestones
 
 * `GridLayoutProvider` sizes tiles by giving the item `fractionalWidth(1/columns)` and

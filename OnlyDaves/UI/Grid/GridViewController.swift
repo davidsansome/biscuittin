@@ -1,4 +1,5 @@
 import UIKit
+import SwiftUI
 import Combine
 import Photos
 
@@ -153,6 +154,16 @@ final class GridViewController: UIViewController {
                                    menu: makeGroupingMenu())
         defaultRightBarButtonItem = item
         navigationItem.rightBarButtonItem = item
+        navigationItem.leftBarButtonItem = UIBarButtonItem(
+            image: UIImage(systemName: "gearshape"),
+            style: .plain,
+            target: self,
+            action: #selector(presentSettings))
+    }
+
+    @objc private func presentSettings() {
+        let host = UIHostingController(rootView: SettingsScreen(viewModel: env.makeSettingsViewModel()))
+        present(host, animated: true)
     }
 
     // MARK: - Multi-select (requirement 11)

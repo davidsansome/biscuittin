@@ -21,6 +21,10 @@ actor TimelineStore {
     private let localLibrary: LocalLibraryService
     private let bootCache: BootCache
     private let settings: AppSettings
+    /// Set after construction to avoid an initialisation cycle; nil until an Immich server is
+    /// configured, which is the offline-only case the app must fully support (D12).
+    private var remoteLibrary: RemoteLibraryService?
+    private var remoteObservationTask: Task<Void, Never>?
 
     // MARK: - Index state
 
@@ -72,22 +76,34 @@ actor TimelineStore {
         emitNow()
     }
 
+    /// Connects the Immich metadata cache. Safe to call before or after `startLive()`.
+    func attach(remoteLibrary: RemoteLibraryService) {
+        guard self.remoteLibrary == nil else { return }
+        self.remoteLibrary = remoteLibrary
+
+        remoteObservationTask = Task { [weak self] in
+            for await _ in remoteLibrary.changes {
+                await self?.refresh()
+            }
+        }
+        if isLive { Task { await refresh() } }
+    }
+
     /// Builds the real index from PhotoKit and starts observing changes. Called by
     /// `StartupSequencer` only after the first frame is on screen.
-    func startLive() {
+    func startLive() async {
         guard !isLive else { return }
         isLive = true
 
         guard localLibrary.hasAnyAccess else {
-            // Without access there is nothing to enumerate; publish an authoritative empty
-            // index so a stale boot cache does not keep showing photos we can no longer read.
-            index.replaceAll([])
-            provenance = .live
-            emitNow()
+            // Without local access the timeline is whatever the server gave us — which may be
+            // nothing. Publish authoritatively so a stale boot cache stops showing photos we
+            // can no longer read.
+            await rebuildIndex()
             return
         }
 
-        rebuildIndex()
+        await rebuildIndex()
         localLibrary.startObserving()
         startObservingChanges()
     }
@@ -106,36 +122,59 @@ actor TimelineStore {
 
     /// Full re-enumeration. Reconciliation fallback only (D20) — the change path uses
     /// `applyChange`.
-    func refresh() {
-        guard localLibrary.hasAnyAccess else {
-            index.replaceAll([])
-            provenance = .live
-            emitNow()
-            return
-        }
-        rebuildIndex()
+    func refresh() async {
+        await rebuildIndex()
     }
 
-    private func rebuildIndex() {
-        Signposts.interval(Signposts.indexBuild) {
-            let result = localLibrary.fetchAllAssets()
-            fetchResult = result
+    private func rebuildIndex() async {
+        // Remote metadata is read first: it is a SQLite query on this actor, and doing it
+        // before the PhotoKit enumeration keeps the merge a single pass.
+        let remote = await loadRemoteMergeData()
 
-            var stubs = [AssetStub]()
-            stubs.reserveCapacity(result.count)
-            result.enumerateObjects { asset, _, _ in
-                stubs.append(AssetStub(asset))
+        Signposts.interval(Signposts.indexBuild) {
+            var localStubs = [AssetStub]()
+
+            if localLibrary.hasAnyAccess {
+                let result = localLibrary.fetchAllAssets()
+                fetchResult = result
+                localStubs.reserveCapacity(result.count)
+                result.enumerateObjects { asset, _, _ in
+                    var stub = AssetStub(asset)
+                    // An asset with a server copy is one asset with two facets, not two rows.
+                    if remote.linkedLocalIdentifiers.contains(asset.localIdentifier) {
+                        stub = stub.withFacets(hasLocal: true, hasRemote: true)
+                    }
+                    localStubs.append(stub)
+                }
+            } else {
+                fetchResult = nil
             }
 
             // PhotoKit sorts by creationDate, but assets with no creation date fall back to
             // `.distantPast` and can land out of order; `replaceAll` sorts only if needed.
-            // M5 merges checksum-linked remote assets into this array before publishing.
-            index.replaceAll(stubs)
+            if remote.stubs.isEmpty {
+                index.replaceAll(localStubs)
+            } else {
+                index.replaceAll(localStubs)
+                index.insert(remote.stubs)
+            }
             provenance = .live
         }
-        Log.timeline.info("Live index built: \(self.index.count) items")
+
+        Log.timeline.info("Live index built: \(self.index.count) items (\(remote.stubs.count) remote-only)")
         emitNow()
         scheduleBootCacheSave()
+    }
+
+    private func loadRemoteMergeData() async -> RemoteMergeData {
+        guard let remoteLibrary else { return RemoteMergeData() }
+        do {
+            return try await remoteLibrary.mergeData()
+        } catch {
+            // A failed metadata read must never take the local timeline down with it.
+            Log.timeline.error("Remote merge data unavailable: \(error.localizedDescription, privacy: .public)")
+            return RemoteMergeData()
+        }
     }
 
     // MARK: - Incremental changes (D20)
@@ -148,7 +187,7 @@ actor TimelineStore {
 
         guard details.hasIncrementalChanges else {
             // PhotoKit could not describe the delta; fall back to a rebuild.
-            rebuildIndex()
+            Task { await rebuildIndex() }
             return
         }
 
@@ -203,8 +242,23 @@ actor TimelineStore {
         if let immichID = id.immichID, stub.hasRemote {
             facets.append(.remote(immichID: immichID))
         }
-        // M5: resolve the second facet through `facet_links` for checksum-linked assets.
         return Asset(id: id, facets: facets, stub: stub)
+    }
+
+    /// Resolves the *other* facet for a linked asset, which requires a database lookup and so
+    /// is kept off the hot path — callers ask only when they need to act on the server copy.
+    func fullyResolvedAsset(for id: AssetID) async -> Asset? {
+        guard let asset = asset(for: id) else { return nil }
+        guard asset.stub.hasLocal, asset.stub.hasRemote, asset.immichID == nil,
+              let localIdentifier = asset.localIdentifier,
+              let remoteLibrary else { return asset }
+
+        guard let immichID = try? await remoteLibrary.immichID(forLocalIdentifier: localIdentifier)
+        else { return asset }
+
+        return Asset(id: asset.id,
+                     facets: asset.facets + [.remote(immichID: immichID)],
+                     stub: asset.stub)
     }
 
     func neighbors(of id: AssetID) -> (prev: AssetID?, next: AssetID?) {

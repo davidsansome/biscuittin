@@ -18,6 +18,9 @@ final class AppEnvironment: ObservableObject {
     let assetEditor: LocalAssetEditor
     let photoActions: PhotoActionService
     let rotators: RotatorRegistry
+    let immichSession: ImmichAuthSession
+    let remoteLibrary: RemoteLibraryService
+    let remoteImages: RemoteImageFetcher
 
     init() {
         let settings = AppSettings()
@@ -30,22 +33,45 @@ final class AppEnvironment: ObservableObject {
                                           settings: settings)
         let editor = LocalAssetEditor()
         let rotators = RotatorRegistry.v1
+        let database = AppDatabase()
+        let immichSession = ImmichAuthSession()
+        let remoteLibrary = RemoteLibraryService(database: database, session: immichSession)
+        let remoteImages = RemoteImageFetcher(session: immichSession,
+                                              cache: RemoteThumbnailCache())
 
         self.settings = settings
         self.localLibrary = localLibrary
         self.bootCache = bootCache
         self.assetResolver = resolver
         self.imageLoader = imageLoader
-        self.database = AppDatabase()
+        self.database = database
         self.timelineStore = timelineStore
         self.assetEditor = editor
         self.rotators = rotators
+        self.immichSession = immichSession
+        self.remoteLibrary = remoteLibrary
+        self.remoteImages = remoteImages
         self.photoActions = PhotoActionService(timelineStore: timelineStore,
                                                resolver: resolver,
                                                editor: editor,
                                                registry: rotators,
-                                               imageLoader: imageLoader)
+                                               imageLoader: imageLoader,
+                                               remoteLibrary: remoteLibrary)
         self.startup = StartupSequencer(localLibrary: localLibrary,
-                                        timelineStore: timelineStore)
+                                        timelineStore: timelineStore,
+                                        remoteLibrary: remoteLibrary,
+                                        session: immichSession)
+
+        // Wiring that would otherwise be an initialisation cycle. Still zero I/O (D19).
+        imageLoader.attachRemoteFetcher(remoteImages)
+        Task { await timelineStore.attach(remoteLibrary: remoteLibrary) }
+    }
+
+    @MainActor
+    func makeSettingsViewModel() -> SettingsViewModel {
+        SettingsViewModel(session: immichSession,
+                          remoteLibrary: remoteLibrary,
+                          timelineStore: timelineStore,
+                          imageCache: remoteImages)
     }
 }

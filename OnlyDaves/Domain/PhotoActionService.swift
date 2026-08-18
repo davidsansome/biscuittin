@@ -40,16 +40,20 @@ actor PhotoActionService {
     /// scrolling (§14 P6).
     private let maxConcurrency = 3
 
+    private let remoteLibrary: RemoteLibraryService?
+
     init(timelineStore: TimelineStore,
          resolver: PHAssetResolver,
          editor: LocalAssetEditor,
          registry: RotatorRegistry = .v1,
-         imageLoader: ImageLoader) {
+         imageLoader: ImageLoader,
+         remoteLibrary: RemoteLibraryService? = nil) {
         self.timelineStore = timelineStore
         self.resolver = resolver
         self.editor = editor
         self.registry = registry
         self.imageLoader = imageLoader
+        self.remoteLibrary = remoteLibrary
     }
 
     nonisolated func canRotate(_ kind: MediaKind) -> Bool { registry.canRotate(kind) }
@@ -164,40 +168,59 @@ actor PhotoActionService {
     func delete(ids: [AssetID]) async -> ActionOutcome {
         var outcome = ActionOutcome()
         var localIdentifiers: [String] = []
+        var immichIDs: [String] = []
 
         for id in ids {
-            guard let asset = await timelineStore.asset(for: id) else {
+            guard let asset = await timelineStore.fullyResolvedAsset(for: id) else {
                 outcome.failures.append((id, RotationError.assetUnavailable))
                 continue
             }
             if let localIdentifier = asset.localIdentifier {
                 localIdentifiers.append(localIdentifier)
             }
-            // M5: collect Immich ids here and issue one DELETE /api/assets for them.
+            if let immichID = asset.immichID {
+                immichIDs.append(immichID)
+            }
         }
-
-        let phAssets = resolver.resolve(localIdentifiers).values.map { $0 }
-        guard !phAssets.isEmpty else { return outcome }
 
         let failedIDs = Set(outcome.failures.map(\.id))
         let attempted = ids.filter { !failedIDs.contains($0) }
+        guard !attempted.isEmpty else { return outcome }
 
-        do {
-            try await editor.delete(assets: Array(phAssets))
-            outcome.succeeded = attempted
-            // PhotoKit's change notification also removes these, but applying directly keeps
-            // the grid in step on the same runloop turn.
-            await timelineStore.applyChange(.remove(attempted))
-            invalidateCaches(for: attempted)
-        } catch let error as NSError
-            where error.domain == PHPhotosErrorDomain
-            && error.code == PHPhotosError.userCancelled.rawValue {
-            // The user declined the system confirmation; nothing changed and nothing failed.
-        } catch is CancellationError {
-            // Same, surfaced as a Swift cancellation.
-        } catch {
-            for id in attempted { outcome.failures.append((id, error)) }
+        // Local first: it is the step the user can still cancel, and cancelling must leave the
+        // server copy untouched too.
+        let phAssets = Array(resolver.resolve(localIdentifiers).values)
+        if !phAssets.isEmpty {
+            do {
+                try await editor.delete(assets: phAssets)
+            } catch let error as NSError
+                where error.domain == PHPhotosErrorDomain
+                && error.code == PHPhotosError.userCancelled.rawValue {
+                return outcome
+            } catch is CancellationError {
+                return outcome
+            } catch {
+                for id in attempted { outcome.failures.append((id, error)) }
+                return outcome
+            }
         }
+
+        // Then the server copy (D11): Immich moves it to its own trash, so this is recoverable.
+        if !immichIDs.isEmpty, let remoteLibrary {
+            do {
+                try await remoteLibrary.deleteRemote(ids: immichIDs)
+            } catch {
+                // The local copy is already gone; report the partial failure rather than
+                // pretending the whole delete succeeded.
+                for id in attempted { outcome.failures.append((id, error)) }
+            }
+        }
+
+        outcome.succeeded = attempted.filter { id in !outcome.failures.contains { $0.id == id } }
+        // PhotoKit's change notification also removes these, but applying directly keeps the
+        // grid in step on the same runloop turn.
+        await timelineStore.applyChange(.remove(attempted))
+        invalidateCaches(for: attempted)
         return outcome
     }
 

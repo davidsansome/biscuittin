@@ -33,6 +33,7 @@ enum ImageVariant {
 final class ImageRequestToken: @unchecked Sendable {
     private let lock = NSLock()
     private var requestID: PHImageRequestID?
+    private var remoteTask: Task<Void, Never>?
     private(set) var isCancelled = false
 
     fileprivate func attach(_ id: PHImageRequestID) -> Bool {
@@ -42,13 +43,24 @@ final class ImageRequestToken: @unchecked Sendable {
         return true
     }
 
+    fileprivate func attach(remote task: Task<Void, Never>) {
+        lock.lock()
+        let cancelled = isCancelled
+        remoteTask = task
+        lock.unlock()
+        if cancelled { task.cancel() }
+    }
+
     fileprivate func cancel(using manager: PHImageManager) {
         lock.lock()
         isCancelled = true
         let id = requestID
+        let task = remoteTask
         requestID = nil
+        remoteTask = nil
         lock.unlock()
         if let id { manager.cancelImageRequest(id) }
+        task?.cancel()
     }
 }
 
@@ -78,6 +90,20 @@ final class ImageLoader: @unchecked Sendable {
         manager.allowsCachingHighQualityImages = false
     }
 
+    /// Connected once an Immich server is configured. Nil means local-only, which is a fully
+    /// supported mode (D12).
+    private var storedRemoteFetcher: RemoteImageFetching?
+
+    private var remoteFetcher: RemoteImageFetching? {
+        metricsLock.lock(); defer { metricsLock.unlock() }
+        return storedRemoteFetcher
+    }
+
+    func attachRemoteFetcher(_ fetcher: RemoteImageFetching) {
+        metricsLock.lock(); defer { metricsLock.unlock() }
+        storedRemoteFetcher = fetcher
+    }
+
     /// Called from the grid/viewer on layout so viewer-sized requests track the real bounds.
     func updateScreenMetrics(scale: CGFloat, size: CGSize) {
         metricsLock.lock(); defer { metricsLock.unlock() }
@@ -93,7 +119,26 @@ final class ImageLoader: @unchecked Sendable {
         let token = ImageRequestToken()
 
         guard let localIdentifier = stub.id.localIdentifier, stub.hasLocal else {
-            // Remote-only assets arrive in M5; until then there is nothing to show.
+            // Remote-only asset: serve from cache synchronously when possible, otherwise fetch.
+            if let immichID = stub.id.immichID, let remote = remoteFetcher {
+                if let cached = remote.cachedImage(immichID: immichID, variant: variant) {
+                    DispatchQueue.main.async { completion(cached, false) }
+                    return token
+                }
+                let task = Task { [weak self] in
+                    guard self != nil else { return }
+                    do {
+                        let image = try await remote.image(immichID: immichID, variant: variant)
+                        guard !Task.isCancelled, !token.isCancelled else { return }
+                        await MainActor.run { completion(image, false) }
+                    } catch {
+                        guard !Task.isCancelled else { return }
+                        await MainActor.run { completion(nil, false) }
+                    }
+                }
+                token.attach(remote: task)
+                return token
+            }
             DispatchQueue.main.async { completion(nil, false) }
             return token
         }
