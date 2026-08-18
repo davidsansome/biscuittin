@@ -74,6 +74,26 @@ It prints one row per 8 native pixels with the point coordinate alongside, so yo
 exactly what is present at a given y-position. Native screenshots are 3× the logical size
 (1206×2622 for a 402×874 iPhone 17) — always convert before comparing against frames.
 
+## Bugs that only a real run finds
+
+Three defects in this repo were invisible to unit tests and would have shipped. All three were
+caught by driving the app against `Tools/mock_immich.py` and watching what actually happened.
+
+1. **`BGTaskScheduler.submit` for an unregistered identifier aborts the process.** It raises an
+   *Objective-C* exception, which Swift's `try`/`catch` cannot intercept — so a `do/catch`
+   around it looks safe and is not. Registration must happen before the app finishes launching,
+   which is earlier than any SwiftUI scene exists, hence `BackgroundTaskRegistrar` +
+   `AppDelegate`. Never submit unless registration succeeded.
+2. **Swift's `hashValue` is seeded per process.** Using it for cache filenames meant the disk
+   cache never survived a relaunch and silently re-downloaded everything. Any hash that persists
+   across launches must be deterministic (`DiskCache.stableHash`).
+3. **`Int("v3")` is nil.** The Immich version gate parsed the leading component of `"v3.1.0"` and
+   rejected *every* real server as too old. Parse leading digits wherever they start.
+
+The pattern: each one produced correct-looking code with no crash in tests, and failed only when
+something outside the process (the OS scheduler, a relaunch, a real server string) was involved.
+When a milestone integrates with something external, drive it for real before believing it.
+
 ## Driving the simulator
 
 Tap by **accessibility element**, not by arithmetic on a screenshot:
@@ -87,6 +107,17 @@ The same downscaling that produced the phantom icons also produced a mis-aimed t
 computing a button's centre from screenshot pixels put the tap ~42pt low, which hit
 "Don't Allow" on the photo-library permission prompt instead of "Allow Full Access", and the
 resulting denied-access screen was briefly mistaken for an authorization bug.
+
+**SwiftUI `Toggle` does not respond to synthetic taps** from these tools, even at coordinates
+where a `Button` in the same form does. Verify toggle-gated behaviour by setting the underlying
+default and relaunching:
+
+```bash
+xcrun simctl spawn <UDID> defaults write dev.onlydaves.app "sync.enabled" -bool YES
+```
+
+Write it through `simctl spawn defaults`, not by editing the plist file — the simulator's
+preference daemon caches and will overwrite a direct file edit on next launch.
 
 Useful non-UI shortcuts:
 
