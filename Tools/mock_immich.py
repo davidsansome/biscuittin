@@ -69,7 +69,8 @@ def build_assets():
             "fileModifiedAt": captured.isoformat(),
             "localDateTime": captured.isoformat(),
             "updatedAt": now.isoformat(),
-            "duration": "0:00:37.000" if is_video else "0:00:00.00000",
+            # Real v3.1.0 sends integer MILLISECONDS for videos and null for images.
+            "duration": 37000 if is_video else None,
             "isTrashed": False,
             "isOffline": False,
             "livePhotoVideoId": None,

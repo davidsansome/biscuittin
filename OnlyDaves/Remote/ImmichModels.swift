@@ -60,6 +60,39 @@ enum Immich {
         let description: String?
     }
 
+    /// An asset's duration, however the server chooses to express it.
+    ///
+    /// v3.1.0 sends **integer milliseconds** for videos (4000 for a four-second clip) and null
+    /// for images, but older builds send a `"H:MM:SS.sss"` string. Accepting only the string
+    /// form made the whole sync page fail to decode, so no remote asset appeared at all — and
+    /// treating the number as seconds would have put "1:06:40" on a four-second video.
+    struct Duration: Decodable, Equatable {
+        let seconds: Double
+
+        init(seconds: Double) { self.seconds = seconds }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.singleValueContainer()
+            if container.decodeNil() {
+                seconds = 0
+            } else if let milliseconds = try? container.decode(Double.self) {
+                seconds = milliseconds / 1000
+            } else if let text = try? container.decode(String.self) {
+                seconds = Immich.parseDuration(text)
+            } else {
+                seconds = 0
+            }
+        }
+    }
+
+    /// Decodes a value, or yields nil instead of failing its whole container.
+    struct Failable<Wrapped: Decodable>: Decodable {
+        let value: Wrapped?
+        init(from decoder: Decoder) throws {
+            value = try? Wrapped(from: decoder)
+        }
+    }
+
     struct Asset: Decodable {
         let id: String
         /// Verified absent from v3.1.0 responses even when supplied at upload, so the
@@ -78,8 +111,7 @@ enum Immich {
         let fileModifiedAt: String?
         let localDateTime: String?
         let updatedAt: String?
-        /// Immich reports duration as "H:MM:SS.sss".
-        let duration: String?
+        let duration: Duration?
         let isTrashed: Bool?
         let isOffline: Bool?
         let livePhotoVideoId: String?
@@ -91,7 +123,7 @@ enum Immich {
         }
 
         var durationSeconds: Double {
-            Immich.parseDuration(duration)
+            duration?.seconds ?? 0
         }
 
         /// Prefers the local capture time so the merged timeline orders remote assets the same
@@ -143,6 +175,25 @@ enum Immich {
             let total: Int?
             let count: Int?
             let nextPage: String?
+            /// Assets on the page that could not be decoded at all.
+            let skippedCount: Int
+
+            private enum CodingKeys: String, CodingKey {
+                case items, total, count, nextPage
+            }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                total = try container.decodeIfPresent(Int.self, forKey: .total)
+                count = try container.decodeIfPresent(Int.self, forKey: .count)
+                nextPage = try container.decodeIfPresent(String.self, forKey: .nextPage)
+
+                // Decode assets individually: a single unexpected field otherwise fails the
+                // entire page, which is how one numeric `duration` hid an entire library.
+                let raw = try container.decodeIfPresent([Failable<Asset>].self, forKey: .items) ?? []
+                items = raw.compactMap(\.value)
+                skippedCount = raw.count - items.count
+            }
         }
         let assets: Bucket
     }

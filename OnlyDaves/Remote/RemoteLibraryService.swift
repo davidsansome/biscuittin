@@ -101,6 +101,9 @@ actor RemoteLibraryService {
             }
 
             let assets = result.assets.items
+            if result.assets.skippedCount > 0 {
+                Log.immich.error("Sync skipped \(result.assets.skippedCount) undecodable assets")
+            }
             guard !assets.isEmpty else { break }
 
             try store(assets)
