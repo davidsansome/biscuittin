@@ -39,8 +39,10 @@ actor ImmichClient {
                        authenticated: false)
     }
 
+    /// Authenticated: a stock Immich deployment returns 401 for this without a token, so it can
+    /// only be called once sign-in has produced one.
     func serverAbout() async throws -> Immich.ServerAbout {
-        try await send(path: "/api/server/about", method: "GET", authenticated: false)
+        try await send(path: "/api/server/about", method: "GET")
     }
 
     func me() async throws -> Immich.UserResponse {

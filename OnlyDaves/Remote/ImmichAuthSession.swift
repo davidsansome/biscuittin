@@ -71,14 +71,29 @@ final class ImmichAuthSession: @unchecked Sendable {
 
     // MARK: - Sign in / out
 
-    /// Validates the server version, exchanges credentials for a token, and stores it.
+    /// Exchanges credentials for a token, then validates the server version with it.
+    ///
+    /// The order matters: `/api/server/about` requires authentication on a stock Immich
+    /// deployment (verified against v3.1.0 — 401 without a token, 200 with one). Checking the
+    /// version first therefore failed before the password was ever sent, and the 401 surfaced
+    /// as "session expired" on a screen where no session existed yet.
     func signIn(baseURL: URL, email: String, password: String) async throws {
-        let probe = ImmichClient(baseURL: baseURL, tokenProvider: { nil })
+        let anonymous = ImmichClient(baseURL: baseURL, tokenProvider: { nil })
 
-        let about = try await probe.serverAbout()
+        let response: Immich.LoginResponse
+        do {
+            response = try await anonymous.login(email: email, password: password)
+        } catch ImmichError.unauthorized {
+            // A 401 from the login endpoint itself means the credentials are wrong, which is a
+            // different thing from an expired token.
+            throw ImmichError.invalidCredentials
+        }
+
+        // Now that a token exists, the version gate can actually run (D8).
+        let token = response.accessToken
+        let authenticated = ImmichClient(baseURL: baseURL, tokenProvider: { token })
+        let about = try await authenticated.serverAbout()
         try Self.validate(version: about.version)
-
-        let response = try await probe.login(email: email, password: password)
 
         Keychain.set(response.accessToken, for: Key.token)
         defaults.set(baseURL.absoluteString, forKey: Key.baseURL)

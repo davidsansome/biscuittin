@@ -251,6 +251,32 @@ final class ImmichTests: XCTestCase {
         XCTAssertEqual(request?.url?.query, "size=preview")
     }
 
+    /// `/api/server/about` requires authentication on a stock Immich deployment (verified: 401
+    /// without a token, 200 with one). Calling it unauthenticated made the version gate fail
+    /// before the password was ever sent, and reported it as an expired session.
+    func testServerAboutSendsBearerToken() async throws {
+        let recorder = RequestRecorder()
+        let client = ImmichClient(baseURL: URL(string: "https://s.example.com")!,
+                                  session: StubURLProtocol.makeSession(recorder),
+                                  tokenProvider: { "tok" })
+
+        await recorder.stub(path: "/api/server/about", json: #"{"version":"v3.1.0"}"#)
+        _ = try await client.serverAbout()
+
+        let request = await recorder.lastRequest
+        XCTAssertEqual(request?.value(forHTTPHeaderField: "Authorization"), "Bearer tok",
+                       "the version gate must authenticate, or it 401s before login")
+    }
+
+    func testInvalidCredentialsIsDistinctFromExpiredSession() {
+        // Same HTTP status, very different meaning to someone signing in for the first time.
+        XCTAssertNotEqual(ImmichError.invalidCredentials, ImmichError.unauthorized)
+        XCTAssertEqual(ImmichError.invalidCredentials.errorDescription,
+                       "Incorrect email or password.")
+        XCTAssertEqual(ImmichError.unauthorized.errorDescription,
+                       "Session expired. Sign in again.")
+    }
+
     func testUnauthorizedResponseMapsToTypedError() async {
         let recorder = RequestRecorder()
         let client = ImmichClient(baseURL: URL(string: "https://s.example.com")!,

@@ -247,7 +247,11 @@ enum Immich {
 /// Errors surfaced to the UI (DESIGN.md §15).
 enum ImmichError: LocalizedError, Equatable {
     case notConfigured
+    /// An existing token was rejected — the session is over.
     case unauthorized
+    /// The credentials just supplied were rejected. Distinct from `unauthorized`, which would
+    /// otherwise tell a user signing in for the first time that their session had expired.
+    case invalidCredentials
     case unreachable
     case serverTooOld(found: String, required: String)
     case http(status: Int)
@@ -258,6 +262,7 @@ enum ImmichError: LocalizedError, Equatable {
         switch self {
         case .notConfigured: return "No Immich server is configured."
         case .unauthorized: return "Session expired. Sign in again."
+        case .invalidCredentials: return "Incorrect email or password."
         case .unreachable: return "Server unreachable."
         case let .serverTooOld(found, required):
             return "This server runs Immich \(found); \(required) or newer is required."
