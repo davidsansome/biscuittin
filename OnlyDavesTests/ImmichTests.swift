@@ -108,6 +108,78 @@ final class ImmichTests: XCTestCase {
         XCTAssertNil(page.assets.items[1].exifInfo)
     }
 
+    // MARK: - Checksum encoding
+    //
+    // Verified against a real Immich v3.1.0 server: the asset DTO reports SHA-1 **base64**
+    // encoded, while every locally-computed checksum in this app is hex and `facet_links` is
+    // keyed on it. Storing the raw base64 meant a local and remote copy of the same photo could
+    // never match, so it appeared twice in the grid instead of once with two facets (D5).
+
+    func testServerBase64ChecksumNormalisesToHex() {
+        // Exact pair observed from the live server for a known file.
+        let base64 = "41ipRRJcK31MhPDdCW6B8j/1JJo="
+        let hex = "e358a945125c2b7d4c84f0dd096e81f23ff5249a"
+        XCTAssertEqual(Immich.normalizedChecksumHex(base64), hex)
+    }
+
+    func testHexChecksumPassesThroughUnchanged() {
+        let hex = "e358a945125c2b7d4c84f0dd096e81f23ff5249a"
+        XCTAssertEqual(Immich.normalizedChecksumHex(hex), hex)
+        XCTAssertEqual(Immich.normalizedChecksumHex(hex.uppercased()), hex,
+                       "case must be normalised so links still match")
+    }
+
+    func testChecksumNormalisationHandlesEmptyAndJunk() {
+        XCTAssertEqual(Immich.normalizedChecksumHex(nil), "")
+        XCTAssertEqual(Immich.normalizedChecksumHex(""), "")
+        // Unrecognised input stays stable rather than collapsing to empty, so two rows carrying
+        // the same odd value still link to each other.
+        let junk = "not-a-checksum"
+        XCTAssertEqual(Immich.normalizedChecksumHex(junk), Immich.normalizedChecksumHex(junk))
+    }
+
+    /// The whole point of the fix: a remote asset and its local twin must produce the same key.
+    func testRemoteAndLocalChecksumsLinkAfterNormalisation() throws {
+        let json = """
+        {"assets":{"items":[{"id":"a1","type":"IMAGE","checksum":"41ipRRJcK31MhPDdCW6B8j/1JJo=",
+          "localDateTime":"2026-08-18T10:00:00.000Z","duration":"0:00:00.00000",
+          "width":240,"height":160}],"total":1,"count":1,"nextPage":null}}
+        """
+        let page = try JSONDecoder().decode(Immich.SearchPage.self, from: Data(json.utf8))
+        let record = RemoteAssetRecord(page.assets.items[0])
+
+        // What LocalAssetExporter would compute for the same bytes.
+        let localChecksum = "e358a945125c2b7d4c84f0dd096e81f23ff5249a"
+        XCTAssertEqual(record.checksumHex, localChecksum,
+                       "remote and local checksums must collide, or the asset shows up twice")
+    }
+
+    /// v3.1.0 reports dimensions at the top level and may omit them from exifInfo.
+    func testTopLevelDimensionsArePreferred() throws {
+        let json = """
+        {"assets":{"items":[{"id":"a1","type":"IMAGE","checksum":"c1","width":240,"height":160,
+          "localDateTime":"2026-08-18T10:00:00.000Z","duration":"0:00:00.00000"}],
+          "total":1,"count":1,"nextPage":null}}
+        """
+        let page = try JSONDecoder().decode(Immich.SearchPage.self, from: Data(json.utf8))
+        let asset = page.assets.items[0]
+        XCTAssertEqual(asset.pixelWidth, 240)
+        XCTAssertEqual(asset.pixelHeight, 160)
+        XCTAssertNil(asset.exifInfo, "dimensions must survive without exifInfo")
+    }
+
+    /// Confirmed absent from v3.1.0 responses, so nothing may depend on them.
+    func testDeviceIdentifiersAreOptional() throws {
+        let json = """
+        {"assets":{"items":[{"id":"a1","type":"IMAGE","checksum":"c1",
+          "localDateTime":"2026-08-18T10:00:00.000Z","duration":"0:00:00.00000"}],
+          "total":1,"count":1,"nextPage":null}}
+        """
+        let page = try JSONDecoder().decode(Immich.SearchPage.self, from: Data(json.utf8))
+        XCTAssertNil(page.assets.items[0].deviceAssetId)
+        XCTAssertNil(page.assets.items[0].deviceId)
+    }
+
     func testRecordRoundTripsExifThroughJSONColumn() throws {
         let json = """
         {"assets":{"items":[{"id":"a1","type":"IMAGE","checksum":"c1",

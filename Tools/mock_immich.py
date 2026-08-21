@@ -6,6 +6,8 @@ search/metadata and asset thumbnails. Assets are synthetic, with solid-colour
 PNG thumbnails so remote tiles are visually distinguishable from local ones.
 """
 
+import base64
+import hashlib
 import json
 import struct
 import zlib
@@ -52,11 +54,17 @@ def build_assets():
         is_video = (i == 5)
         assets.append({
             "id": f"remote-asset-{i:02d}",
-            "deviceAssetId": f"mock-device-asset-{i}",
-            "deviceId": "mock-server-device",
+            # v3.1.0 does not echo these back, so the mock must not either — the client
+            # cannot rely on them for facet linking (D5).
+            "deviceAssetId": None,
+            "deviceId": None,
+            "width": 4000 if not is_video else 1920,
+            "height": 3000 if not is_video else 1080,
             "type": "VIDEO" if is_video else "IMAGE",
             "originalFileName": f"immich-{i:02d}.{'mp4' if is_video else 'jpg'}",
-            "checksum": f"mockchecksum{i:040d}",
+            # Real Immich returns SHA-1 base64-encoded, NOT hex. Mirroring that here is what
+            # exposes checksum-normalisation bugs in the client (verified against v3.1.0).
+            "checksum": base64.b64encode(hashlib.sha1(f"mock-{i}".encode()).digest()).decode(),
             "fileCreatedAt": captured.isoformat(),
             "fileModifiedAt": captured.isoformat(),
             "localDateTime": captured.isoformat(),

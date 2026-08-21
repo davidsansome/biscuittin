@@ -62,11 +62,18 @@ enum Immich {
 
     struct Asset: Decodable {
         let id: String
+        /// Verified absent from v3.1.0 responses even when supplied at upload, so the
+        /// `(deviceId, deviceAssetId)` link of D5 can never fire. Checksum is the only
+        /// identity the server actually gives back.
         let deviceAssetId: String?
         let deviceId: String?
         let type: AssetType
         let originalFileName: String?
+        /// Base64-encoded SHA-1 — see `checksumHex`.
         let checksum: String?
+        /// v3.1.0 reports dimensions at the top level; `exifInfo` may omit them.
+        let width: Int?
+        let height: Int?
         let fileCreatedAt: String?
         let fileModifiedAt: String?
         let localDateTime: String?
@@ -98,12 +105,22 @@ enum Immich {
 
         var updatedDate: Date? { Immich.parseDate(updatedAt) }
 
+        /// SHA-1 as lowercase hex.
+        ///
+        /// The server returns it base64-encoded, but every local checksum in this app is hex
+        /// (`LocalAssetExporter`), and `facet_links` is keyed on it. Storing the raw base64
+        /// would mean a local and remote copy of the same photo never matched, so the asset
+        /// would appear twice in the grid instead of once with two facets (D5).
+        var checksumHex: String {
+            Immich.normalizedChecksumHex(checksum)
+        }
+
         var pixelWidth: Int32 {
-            Int32(clamping: Int(exifInfo?.exifImageWidth ?? 0))
+            Int32(clamping: width ?? Int(exifInfo?.exifImageWidth ?? 0))
         }
 
         var pixelHeight: Int32 {
-            Int32(clamping: Int(exifInfo?.exifImageHeight ?? 0))
+            Int32(clamping: height ?? Int(exifInfo?.exifImageHeight ?? 0))
         }
     }
 
@@ -162,6 +179,26 @@ enum Immich {
     }
 
     // MARK: - Parsing helpers
+
+    /// Canonicalises a checksum to lowercase hex.
+    ///
+    /// Immich returns SHA-1 base64-encoded ("41ipRRJcK31MhPDdCW6B8j/1JJo="); this app keys
+    /// everything on hex ("e358a945…"). `bulk-upload-check` happens to accept either, which is
+    /// why only the *linking* path was affected — and why a mock speaking one convention could
+    /// never have surfaced it.
+    static func normalizedChecksumHex(_ raw: String?) -> String {
+        guard let raw, !raw.isEmpty else { return "" }
+
+        // Already hex (40 chars for SHA-1): just normalise case.
+        if raw.count == 40, raw.allSatisfy(\.isHexDigit) { return raw.lowercased() }
+
+        guard let data = Data(base64Encoded: raw), !data.isEmpty else {
+            // Unrecognised shape: keep it stable rather than dropping the value, so two rows
+            // carrying the same odd checksum still link to each other.
+            return raw.lowercased()
+        }
+        return data.map { String(format: "%02x", $0) }.joined()
+    }
 
     /// Immich emits ISO-8601 with and without fractional seconds depending on the field.
     static func parseDate(_ string: String?) -> Date? {

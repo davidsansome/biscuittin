@@ -1093,6 +1093,45 @@ the point of designing rotation as a strategy in M3.
 Verified: the viewer's rotate controls report `enabled: true` on a video page, where they were
 deliberately dimmed through M3–M8.
 
+### Live validation against a real Immich v3.1.0 server (2026-08-21)
+
+The D8 caveat — that every endpoint shape had to be validated against a real server — was
+finally discharged against a live v3.1.0 instance. Three assumptions were wrong.
+
+**1. There is no endpoint that replaces an existing asset's file.** `PUT`/`POST` on
+`/api/assets/{id}/original`, `/file` and `/replace`, plus `/edit`, `/rotate` and `/transform`,
+all return the route-missing response. (Immich distinguishes *entity missing*,
+`{"message":"Not Found"}`, from *route missing*, `{"message":"Cannot PUT /..."}`, which is how
+this was established; a deliberately invented URL was used as the control.) `PUT /api/assets/{id}`
+exists but is metadata-only.
+
+D10's remote-rotation design was therefore unimplementable. **Revised (confirmed with the user):
+rotate remotely by uploading the rotated file as a new asset, then trashing the old one**, with
+the original's `fileCreatedAt`/`fileModifiedAt` carried onto the replacement. v3.1.0 honours
+them and echoes them back in `localDateTime`, so the photo keeps its timeline position instead
+of resurfacing as if taken now. The whole sequence — download, rotate, upload, trash, verify —
+was executed against the live server: timestamp preserved, dimensions swapped 240×160 → 160×240,
+old asset trashed and recoverable.
+
+*Known cost:* the rotated copy has a new asset id, so server-side album membership, favourites
+and ratings do not carry over. Accepted deliberately; there is no API that avoids it.
+
+**2. Checksums are base64, not hex.** The asset DTO returns SHA-1 base64-encoded
+(`41ipRRJcK31MhPDdCW6B8j/1JJo=`), while every locally-computed checksum here is hex and
+`facet_links` is keyed on it. Storing the raw value meant a local and remote copy of the same
+photo could never match, so it would render **twice** in the grid rather than once with two
+facets — a direct break of D5. Now normalised to hex on ingest via `Immich.normalizedChecksumHex`.
+`bulk-upload-check` happens to accept either encoding, which is why only the linking path broke
+and why the mock — speaking this app's own hex convention — could never have caught it.
+
+**3. `deviceAssetId`/`deviceId` are never returned**, even when supplied at upload. D5's
+secondary linking path is dead; checksum is the only identity the server hands back, which is
+what makes finding 2 critical rather than cosmetic. Dimensions also arrive top-level, not only
+in `exifInfo`.
+
+`Tools/mock_immich.py` now mirrors all three conventions, so it validates against reality rather
+than against this app's assumptions.
+
 ### Notes for later milestones
 
 * `GridLayoutProvider` sizes tiles by giving the item `fractionalWidth(1/columns)` and

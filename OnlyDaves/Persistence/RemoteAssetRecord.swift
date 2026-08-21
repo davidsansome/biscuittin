@@ -54,7 +54,8 @@ struct RemoteAssetRecord: Codable, FetchableRecord, PersistableRecord, Equatable
 
     init(_ asset: Immich.Asset) {
         immichID = asset.id
-        checksumHex = asset.checksum ?? ""
+        // Normalised to hex so it can match a locally-computed checksum in `facet_links` (D5).
+        checksumHex = asset.checksumHex
         deviceAssetID = asset.deviceAssetId
         deviceID = asset.deviceId
         type = asset.type.rawValue
@@ -62,8 +63,8 @@ struct RemoteAssetRecord: Codable, FetchableRecord, PersistableRecord, Equatable
         durationSeconds = asset.durationSeconds
         fileName = asset.originalFileName
         captureAt = asset.captureDate.timeIntervalSince1970
-        width = Int(asset.pixelWidth)
-        height = Int(asset.pixelHeight)
+        width = asset.width ?? Int(asset.pixelWidth)
+        height = asset.height ?? Int(asset.pixelHeight)
         isTrashed = asset.isTrashed ?? false
         exifJSON = asset.exifInfo.flatMap { info in
             (try? JSONEncoder().encode(info)).flatMap { String(data: $0, encoding: .utf8) }

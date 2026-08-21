@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// Typed HTTP client for the Immich API (DESIGN.md §7.1).
 ///
@@ -144,27 +145,67 @@ actor ImmichClient {
         return (request, bodyURL)
     }
 
-    func replaceOriginal(id: String, fileURL: URL, filename: String) async throws {
-        var request = try makeRequest(path: "/api/assets/\(id)/original",
-                                      method: "PUT",
+    /// Uploads a rotated replacement for an existing asset and returns its new id.
+    ///
+    /// There is no replace-in-place endpoint in v3.1.0 (see `RemoteLibraryService.rotateRemote`),
+    /// so this is an ordinary upload that deliberately carries the *original's* timestamps —
+    /// the server honours them, keeping the photo in its original timeline position rather than
+    /// resurfacing it as if it were taken now.
+    func uploadReplacement(fileURL: URL,
+                           filename: String,
+                           deviceID: String,
+                           fileCreatedAt: Date,
+                           fileModifiedAt: Date) async throws -> String {
+        let checksum = try Self.sha1Hex(ofFileAt: fileURL)
+
+        var request = try makeRequest(path: "/api/assets", method: "POST",
                                       timeout: Self.binaryTimeout)
         if let token = await tokenProvider() {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
+        request.setValue(checksum, forHTTPHeaderField: "x-immich-checksum")
+
         let boundary = "OnlyDaves-\(UUID().uuidString)"
         request.setValue("multipart/form-data; boundary=\(boundary)",
                          forHTTPHeaderField: "Content-Type")
 
         let bodyURL = try MultipartBuilder.buildBody(
             boundary: boundary,
-            fields: [:],
+            fields: [
+                "deviceAssetId": "rotated-\(UUID().uuidString)",
+                "deviceId": deviceID,
+                "fileCreatedAt": Immich.iso8601String(from: fileCreatedAt),
+                "fileModifiedAt": Immich.iso8601String(from: fileModifiedAt),
+                "isFavorite": "false",
+                "filename": filename
+            ],
             fileField: "assetData",
             fileURL: fileURL,
             filename: filename)
         defer { try? FileManager.default.removeItem(at: bodyURL) }
 
-        request.httpBody = try Data(contentsOf: bodyURL)
-        _ = try await dataForRequest(request)
+        let (data, response) = try await session.upload(for: request, fromFile: bodyURL)
+        guard let http = response as? HTTPURLResponse else { throw ImmichError.unreachable }
+        switch http.statusCode {
+        case 200..<300:
+            let decoded = try JSONDecoder().decode(Immich.UploadResponse.self, from: data)
+            return decoded.id
+        case 401, 403:
+            throw ImmichError.unauthorized
+        default:
+            throw ImmichError.http(status: http.statusCode)
+        }
+    }
+
+    /// Streaming SHA-1, so a large original never has to sit in memory.
+    static func sha1Hex(ofFileAt url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = Insecure.SHA1()
+        while let chunk = try handle.read(upToCount: 1024 * 1024), !chunk.isEmpty {
+            hasher.update(data: chunk)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     // MARK: - Request plumbing

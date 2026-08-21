@@ -263,13 +263,22 @@ actor RemoteLibraryService {
 
     /// Rotates the server's copy (M7, D10).
     ///
-    /// Immich has no rotate endpoint, so this downloads the original, rotates it with the same
-    /// strategy used locally, and replaces the asset. That keeps server-side thumbnails correct
-    /// rather than leaving them showing the old orientation.
+    /// Immich v3.1.0 has **no endpoint that replaces an existing asset's file** — verified
+    /// against a real server: `PUT/POST /api/assets/{id}/original`, `/file` and `/replace` all
+    /// return the route-missing response, and there is no server-side edit or rotate route
+    /// either. So "rotate the server copy" has to be expressed as upload-the-rotated-file then
+    /// trash the old asset.
+    ///
+    /// The replacement is uploaded with the original's `fileCreatedAt`/`fileModifiedAt`, which
+    /// v3.1.0 honours (it echoes them back, including in `localDateTime`). Without that the new
+    /// asset would take "now" as its capture date and jump to the top of the timeline.
+    ///
+    /// Caveat worth knowing: the rotated copy is a *new* asset id, so server-side album
+    /// membership, favourites and ratings for that photo do not carry over.
     func rotateRemote(immichID: String, clockwise: Bool, rotator: any AssetRotator) async throws {
         let client = try makeClient()
-        let record = try record(for: immichID)
-        let filename = record?.fileName ?? "\(immichID).jpg"
+        guard let record = try record(for: immichID) else { throw ImmichError.notConfigured }
+        let filename = record.fileName ?? "\(immichID).jpg"
 
         let data = try await client.originalData(id: immichID)
         let downloaded = FileManager.default.temporaryDirectory
@@ -280,11 +289,40 @@ actor RemoteLibraryService {
         let rotated = try await rotator.rotateRemoteOriginal(fileURL: downloaded, clockwise: clockwise)
         defer { try? FileManager.default.removeItem(at: rotated) }
 
-        try await client.replaceOriginal(id: immichID, fileURL: rotated, filename: filename)
+        let captured = Date(timeIntervalSince1970: record.captureAt)
+        let newID = try await client.uploadReplacement(fileURL: rotated,
+                                                       filename: filename,
+                                                       deviceID: session.deviceID,
+                                                       fileCreatedAt: captured,
+                                                       fileModifiedAt: captured)
 
-        // Dimensions swapped and the checksum changed; the next sync brings the row up to date.
-        try await writeSwappedDimensions(immichID: immichID)
+        // Only trash the original once the replacement is safely stored.
+        try await client.deleteAssets(ids: [immichID])
+
+        try await repointAfterRotation(oldID: immichID, newID: newID, record: record)
         changesContinuation.yield()
+    }
+
+    /// Swaps the rotated asset in for the old one locally, so the grid updates without waiting
+    /// for the next metadata sync.
+    private func repointAfterRotation(oldID: String,
+                                      newID: String,
+                                      record: RemoteAssetRecord) async throws {
+        let writer = try database.writer()
+        try await writer.write { db in
+            var rotated = record
+            rotated.immichID = newID
+            // Dimensions swap on a quarter turn; the checksum changed, and the next sync will
+            // replace this row with the server's authoritative copy anyway.
+            rotated.width = record.height
+            rotated.height = record.width
+            rotated.updatedAt = Date().timeIntervalSince1970
+            try rotated.save(db)
+
+            try db.execute(sql: "DELETE FROM remote_assets WHERE immich_id = ?", arguments: [oldID])
+            try db.execute(sql: "UPDATE facet_links SET immich_id = ? WHERE immich_id = ?",
+                           arguments: [newID, oldID])
+        }
     }
 
     private func writeSwappedDimensions(immichID: String) async throws {
