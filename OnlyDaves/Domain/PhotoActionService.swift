@@ -91,7 +91,11 @@ actor PhotoActionService {
         var work: [(Asset, any AssetRotator)] = []
 
         for id in ids {
-            guard let asset = await timelineStore.asset(for: id) else {
+            // Must be the *fully resolved* asset: a photo held both on the device and the
+            // server carries a `.local` id, so its Immich id only appears after a facet-link
+            // lookup. Using the unresolved asset here silently rotated the local copy alone and
+            // left the server's copy in the old orientation.
+            guard let asset = await timelineStore.fullyResolvedAsset(for: id) else {
                 outcome.failures.append((id, RotationError.assetUnavailable))
                 continue
             }
