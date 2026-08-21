@@ -90,9 +90,20 @@ caught by driving the app against `Tools/mock_immich.py` and watching what actua
 3. **`Int("v3")` is nil.** The Immich version gate parsed the leading component of `"v3.1.0"` and
    rejected *every* real server as too old. Parse leading digits wherever they start.
 
+A later run against a **real Immich server** found four more, including two that made whole
+features non-functional: sign-in called an authenticated endpoint before obtaining a token, and
+`duration` arrived as integer milliseconds rather than a string, which failed the entire sync
+page and hid a 73-asset library.
+
 The pattern: each one produced correct-looking code with no crash in tests, and failed only when
 something outside the process (the OS scheduler, a relaunch, a real server string) was involved.
 When a milestone integrates with something external, drive it for real before believing it.
+
+**A mock you wrote yourself cannot falsify your own assumptions.** `Tools/mock_immich.py` spoke
+this app's conventions — hex checksums, duration strings, unauthenticated `server/about` — so it
+confirmed the client against itself and stayed green through every one of those bugs. It has
+since been corrected to mirror the real server. When a mock and the real thing disagree, the
+mock is wrong; fix it in the same change, or the next bug hides in the same place.
 
 ## Driving the simulator
 

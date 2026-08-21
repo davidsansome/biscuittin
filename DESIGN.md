@@ -1132,6 +1132,43 @@ in `exifInfo`.
 `Tools/mock_immich.py` now mirrors all three conventions, so it validates against reality rather
 than against this app's assumptions.
 
+### End-to-end run against the real server (2026-08-21)
+
+The app itself — not curl — was pointed at a live Immich v3.1.0 and driven through sign-in,
+metadata sync, upload of 73 assets, the merged timeline, and remote rotation. Four more bugs
+surfaced that neither unit tests nor the mock could have caught.
+
+**1. Sign-in could never succeed.** `/api/server/about` requires authentication on a stock
+deployment, but the version gate called it *before* logging in, so sign-in failed before the
+password was sent — and the resulting 401 was reported as "Session expired" on a screen where no
+session existed. Login now happens first and the gate runs with the resulting token;
+`invalidCredentials` is now distinct from `unauthorized`.
+
+**2. `duration` is integer milliseconds, not a "H:MM:SS.sss" string** (4000 for a four-second
+clip; null for images). Decoding threw, and because it threw mid-page it took the *whole* sync
+down — 73 assets on the server, none in the app. Duration now accepts either form, and assets
+decode individually so one unexpected field skips one asset rather than a page, which is what
+§7 always claimed. Treating the number as seconds would also have labelled that clip "1:06:40".
+
+**3. Rotation only resolved one facet.** `rotate()` used `asset(for:)` rather than
+`fullyResolvedAsset(for:)`, so for a photo held both locally and on the server — which carries a
+`.local` id — the Immich id was always nil and the remote branch never ran. The local copy
+rotated and the server's copy silently kept its old orientation, precisely the divergence the
+D10 discussion set out to avoid.
+
+**4. `total` in a search response is the page count, not the library size.** Querying with
+`size: 1` reports `total: 1` regardless of library size. Nothing depends on it (paging runs until
+a page comes back empty), but it invalidated an early measurement during this run.
+
+Confirmed working end to end: Bearer-token auth and the version gate; upload of 73 assets with
+correct SHA-1 checksums; **73 of 73 linked on both facets with zero unlinked rows**, so the
+checksum-normalisation fix genuinely collapses local and remote copies into single tiles;
+durations read back as 4.0/23.0/75.0 s; and remote rotation trashing the 900×1400 original,
+creating a 1400×900 replacement, preserving `localDateTime`, and repointing the local row.
+
+Also worth noting: Immich's search index lags uploads, so freshly uploaded assets do not appear
+in `search/metadata` immediately. Delta sync picks them up on a later pass.
+
 ### Notes for later milestones
 
 * `GridLayoutProvider` sizes tiles by giving the item `fractionalWidth(1/columns)` and
