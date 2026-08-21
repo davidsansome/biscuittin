@@ -15,6 +15,18 @@ protocol ViewerTransitionSource: AnyObject {
     func viewerTransitionSetSourceHidden(_ hidden: Bool, for id: AssetID)
 }
 
+/// Supplies the viewer-side pieces the zoom transition drives independently.
+/// Implemented by `ViewerPagerController`.
+@MainActor
+protocol ViewerTransitionDestination: AnyObject {
+    /// The black background. Fades in on its own so the viewer reads as black behind the
+    /// flying image.
+    var transitionBackdropView: UIView { get }
+    /// Everything that must stay hidden until the flying image lands — the paged photo and the
+    /// chrome over it.
+    var transitionRevealViews: [UIView] { get }
+}
+
 /// Zoom transition between a grid tile and the full-screen viewer (§13.2).
 ///
 /// Falls back to a crossfade whenever the source tile is off screen or has no thumbnail yet,
@@ -23,19 +35,25 @@ final class ViewerZoomAnimator: NSObject, UIViewControllerAnimatedTransitioning 
 
     private let isPresenting: Bool
     private weak var source: ViewerTransitionSource?
+    private weak var destination: ViewerTransitionDestination?
     /// Supplies the viewer-side geometry: the on-screen frame of the displayed image.
     private let viewerFrameProvider: () -> (frame: CGRect, image: UIImage?, id: AssetID)?
 
     init(isPresenting: Bool,
          source: ViewerTransitionSource?,
+         destination: ViewerTransitionDestination?,
          viewerFrameProvider: @escaping () -> (frame: CGRect, image: UIImage?, id: AssetID)?) {
         self.isPresenting = isPresenting
         self.source = source
+        self.destination = destination
         self.viewerFrameProvider = viewerFrameProvider
     }
 
     func transitionDuration(using context: UIViewControllerContextTransitioning?) -> TimeInterval {
-        isPresenting ? 0.34 : 0.30
+        if ProcessInfo.processInfo.environment["ONLYDAVES_SLOW_TRANSITIONS"] != nil {
+            return isPresenting ? 3.0 : 3.0
+        }
+        return isPresenting ? 0.34 : 0.30
     }
 
     func animateTransition(using context: UIViewControllerContextTransitioning) {
@@ -80,12 +98,20 @@ final class ViewerZoomAnimator: NSObject, UIViewControllerAnimatedTransitioning 
         container.addSubview(travelling)
 
         source?.viewerTransitionSetSourceHidden(true, for: target.id)
-        toView.alpha = 0
         toView.isHidden = false
+        toView.alpha = 1
 
-        // Fade the backdrop in slightly ahead of the image landing.
+        // The viewer's own page must stay hidden until the flight ends. Its image is usually
+        // already decoded, so revealing it here would show the photo at full size immediately
+        // and leave the flying thumbnail with nothing to reveal — only the black backdrop
+        // fades in behind it.
+        let revealViews = destination?.transitionRevealViews ?? []
+        revealViews.forEach { $0.isHidden = true }
+
+        let backdrop = destination?.transitionBackdropView
+        backdrop?.alpha = 0
         UIView.animate(withDuration: transitionDuration(using: context) * 0.6) {
-            toView.alpha = 1
+            backdrop?.alpha = 1
         }
 
         UIView.animate(withDuration: transitionDuration(using: context),
@@ -96,6 +122,9 @@ final class ViewerZoomAnimator: NSObject, UIViewControllerAnimatedTransitioning 
             travelling.frame = target.frame
             travelling.contentMode = .scaleAspectFit
         } completion: { _ in
+            // Reveal before removing the placeholder, so there is never a frame with neither.
+            revealViews.forEach { $0.isHidden = false }
+            backdrop?.alpha = 1
             travelling.removeFromSuperview()
             self.source?.viewerTransitionSetSourceHidden(false, for: target.id)
             context.completeTransition(!context.transitionWasCancelled)
@@ -122,25 +151,45 @@ final class ViewerZoomAnimator: NSObject, UIViewControllerAnimatedTransitioning 
 
         source?.viewerTransitionPrepareForDismissal(to: current.id)
         container.layoutIfNeeded()
-        let destination = source?.viewerTransitionSourceFrame(for: current.id)
+        let tileFrame = source?.viewerTransitionSourceFrame(for: current.id)
 
         let travelling = UIImageView(image: image)
         travelling.contentMode = .scaleAspectFit
         travelling.clipsToBounds = true
         travelling.frame = current.frame
         container.addSubview(travelling)
-        fromView.isHidden = true
 
-        if let destination {
+        // Mirror of the presentation: hide the paged photo and chrome, then let the backdrop
+        // fade so the grid returns gradually instead of snapping back.
+        let revealViews = self.destination?.transitionRevealViews ?? []
+        let backdrop = self.destination?.transitionBackdropView
+        if backdrop != nil {
+            revealViews.forEach { $0.isHidden = true }
+            UIView.animate(withDuration: transitionDuration(using: context)) {
+                backdrop?.alpha = 0
+            }
+        } else {
+            fromView.isHidden = true
+        }
+
+        /// Puts the viewer back the way it was, for the cancelled-transition case.
+        let restoreViewer = {
+            revealViews.forEach { $0.isHidden = false }
+            backdrop?.alpha = 1
+            fromView.isHidden = false
+        }
+
+        if let tileFrame {
             source?.viewerTransitionSetSourceHidden(true, for: current.id)
             UIView.animate(withDuration: transitionDuration(using: context),
                            delay: 0,
                            options: [.curveEaseInOut]) {
-                travelling.frame = destination
+                travelling.frame = tileFrame
                 travelling.contentMode = .scaleAspectFill
             } completion: { _ in
                 travelling.removeFromSuperview()
                 self.source?.viewerTransitionSetSourceHidden(false, for: current.id)
+                if context.transitionWasCancelled { restoreViewer() }
                 context.completeTransition(!context.transitionWasCancelled)
             }
         } else {
@@ -150,6 +199,7 @@ final class ViewerZoomAnimator: NSObject, UIViewControllerAnimatedTransitioning 
                 travelling.transform = CGAffineTransform(scaleX: 0.85, y: 0.85)
             } completion: { _ in
                 travelling.removeFromSuperview()
+                if context.transitionWasCancelled { restoreViewer() }
                 context.completeTransition(!context.transitionWasCancelled)
             }
         }
@@ -160,6 +210,7 @@ final class ViewerZoomAnimator: NSObject, UIViewControllerAnimatedTransitioning 
 /// about paging.
 final class ViewerTransitionDelegate: NSObject, UIViewControllerTransitioningDelegate {
     weak var source: ViewerTransitionSource?
+    weak var destination: ViewerTransitionDestination?
     var viewerFrameProvider: () -> (frame: CGRect, image: UIImage?, id: AssetID)? = { nil }
 
     func animationController(forPresented presented: UIViewController,
@@ -167,6 +218,7 @@ final class ViewerTransitionDelegate: NSObject, UIViewControllerTransitioningDel
                              source: UIViewController) -> UIViewControllerAnimatedTransitioning? {
         ViewerZoomAnimator(isPresenting: true,
                            source: self.source,
+                           destination: destination,
                            viewerFrameProvider: viewerFrameProvider)
     }
 
@@ -174,6 +226,7 @@ final class ViewerTransitionDelegate: NSObject, UIViewControllerTransitioningDel
     -> UIViewControllerAnimatedTransitioning? {
         ViewerZoomAnimator(isPresenting: false,
                            source: source,
+                           destination: destination,
                            viewerFrameProvider: viewerFrameProvider)
     }
 }

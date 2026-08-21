@@ -199,8 +199,12 @@ struct TimelineBucketer {
 
         switch grouping {
         case .day:
-            if calendar.isDateInToday(start) { return "Today" }
-            if calendar.isDateInYesterday(start) { return "Yesterday" }
+            // Compare against the injected `now`, not the wall clock: `isDateInToday` would
+            // ignore it, which makes these titles untestable and lets a long-running session
+            // disagree with the rest of the snapshot after midnight.
+            if calendar.isDate(start, inSameDayAs: now) { return "Today" }
+            if let yesterday = calendar.date(byAdding: .day, value: -1, to: now),
+               calendar.isDate(start, inSameDayAs: yesterday) { return "Yesterday" }
             return (sameYear ? dayFormatter : dayWithYearFormatter).string(from: start)
         case .week:
             // `end` is exclusive; step back so the label reads "12 – 18 Aug".

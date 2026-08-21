@@ -50,6 +50,7 @@ final class ViewerPagerController: UIViewController {
         modalPresentationStyle = .overFullScreen
         modalPresentationCapturesStatusBarAppearance = true
         transitionDelegate.source = source
+        transitionDelegate.destination = self
         transitionDelegate.viewerFrameProvider = { [weak self] in self?.currentTransitionGeometry() }
         transitioningDelegate = transitionDelegate
     }
@@ -495,4 +496,15 @@ extension ViewerPagerController: UIGestureRecognizerDelegate {
                            shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
         false
     }
+}
+
+// MARK: - ViewerTransitionDestination
+
+extension ViewerPagerController: ViewerTransitionDestination {
+    var transitionBackdropView: UIView { backdropView }
+
+    /// The paged photo and the chrome sitting over it. Both stay hidden until the zoom lands,
+    /// so the viewer reads as black while the tile flies in rather than showing the photo at
+    /// full size the instant it is presented.
+    var transitionRevealViews: [UIView] { [contentContainer, toolbar] }
 }
