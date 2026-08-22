@@ -154,3 +154,52 @@ final class TimelineIndexTests: XCTestCase {
         XCTAssertNil(remote.localIdentifier)
     }
 }
+
+// MARK: - Merge visibility after Free Up Space (D18)
+
+/// A server copy must be hidden behind its local twin only while that twin exists.
+/// `facet_links` rows outlive the local file they name, so filtering on the link alone made
+/// every photo vanish from the grid once Free Up Space deleted the local copies — the exact
+/// opposite of that feature's purpose.
+final class RemoteMergeVisibilityTests: XCTestCase {
+
+    private func remoteStub(_ immichID: String) -> AssetStub {
+        AssetStub(id: .remote(immichID),
+                  captureDate: Date(timeIntervalSince1970: 1_700_000_000),
+                  hasLocal: false, hasRemote: true, kind: .image,
+                  durationSeconds: 0, pixelWidth: 100, pixelHeight: 100)
+    }
+
+    private func mergeData() -> RemoteMergeData {
+        var data = RemoteMergeData()
+        data.stubs = [remoteStub("r1"), remoteStub("r2"), remoteStub("r3")]
+        // r1 and r2 are linked to local copies; r3 was never on this device.
+        data.localIdentifierByImmichID = ["r1": "local-1", "r2": "local-2"]
+        data.linkedLocalIdentifiers = ["local-1", "local-2"]
+        return data
+    }
+
+    func testLinkedRemotesAreHiddenWhileTheirLocalCopyExists() {
+        let visible = mergeData().remoteOnlyStubs(presentLocalIdentifiers: ["local-1", "local-2"])
+        XCTAssertEqual(visible.map { $0.id.immichID }, ["r3"],
+                       "only the never-local asset should stand on its own")
+    }
+
+    func testRemoteReappearsWhenItsLocalCopyIsDeleted() {
+        // Free Up Space removed local-1; its server copy must come back as remote-only.
+        let visible = mergeData().remoteOnlyStubs(presentLocalIdentifiers: ["local-2"])
+        XCTAssertEqual(Set(visible.compactMap { $0.id.immichID }), ["r1", "r3"])
+    }
+
+    func testAllRemotesVisibleWhenEveryLocalCopyIsGone() {
+        // The state right after Free Up Space runs over the whole library.
+        let visible = mergeData().remoteOnlyStubs(presentLocalIdentifiers: [])
+        XCTAssertEqual(visible.count, 3, "freeing space must not empty the timeline")
+    }
+
+    func testUnlinkedRemotesAreAlwaysVisible() {
+        var data = RemoteMergeData()
+        data.stubs = [remoteStub("r9")]
+        XCTAssertEqual(data.remoteOnlyStubs(presentLocalIdentifiers: ["anything"]).count, 1)
+    }
+}

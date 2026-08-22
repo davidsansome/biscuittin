@@ -133,6 +133,7 @@ actor TimelineStore {
 
         Signposts.interval(Signposts.indexBuild) {
             var localStubs = [AssetStub]()
+            var presentLocalIdentifiers = Set<String>()
 
             if localLibrary.hasAnyAccess {
                 let result = localLibrary.fetchAllAssets()
@@ -140,6 +141,7 @@ actor TimelineStore {
                 localStubs.reserveCapacity(result.count)
                 result.enumerateObjects { asset, _, _ in
                     var stub = AssetStub(asset)
+                    presentLocalIdentifiers.insert(asset.localIdentifier)
                     // An asset with a server copy is one asset with two facets, not two rows.
                     if remote.linkedLocalIdentifiers.contains(asset.localIdentifier) {
                         stub = stub.withFacets(hasLocal: true, hasRemote: true)
@@ -150,18 +152,21 @@ actor TimelineStore {
                 fetchResult = nil
             }
 
+            // A server copy is hidden behind its local twin only while that twin actually
+            // exists. Link rows outlive the local file they name — after Free Up Space removes
+            // it (D18) the asset must reappear as remote-only, not disappear altogether.
+            let remoteOnly = remote.remoteOnlyStubs(presentLocalIdentifiers: presentLocalIdentifiers)
+
             // PhotoKit sorts by creationDate, but assets with no creation date fall back to
             // `.distantPast` and can land out of order; `replaceAll` sorts only if needed.
-            if remote.stubs.isEmpty {
-                index.replaceAll(localStubs)
-            } else {
-                index.replaceAll(localStubs)
-                index.insert(remote.stubs)
+            index.replaceAll(localStubs)
+            if !remoteOnly.isEmpty {
+                index.insert(remoteOnly)
             }
             provenance = .live
         }
 
-        Log.timeline.info("Live index built: \(self.index.count) items (\(remote.stubs.count) remote-only)")
+        Log.timeline.info("Live index built: \(self.index.count) items")
         emitNow()
         scheduleBootCacheSave()
     }

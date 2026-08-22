@@ -2,15 +2,30 @@ import Foundation
 import GRDB
 
 /// Everything `TimelineStore` needs to fold remote assets into the merged index.
+///
+/// Deliberately does *not* pre-filter the linked assets out. Whether a server copy should be
+/// hidden behind a local one depends on the local asset still existing, which only the timeline
+/// knows — a link row outlives the local file it names. Filtering here made every photo vanish
+/// from the grid after Free Up Space removed its local copy (D18).
 struct RemoteMergeData {
-    /// Remote-only candidates, newest first.
+    /// Every non-trashed remote asset, newest first.
     var stubs: [AssetStub] = []
-    /// Local identifiers already known to have a server copy (D5).
+    /// immich id → the local identifier it is linked to, where one is known (D5).
+    var localIdentifierByImmichID: [String: String] = [:]
+    /// Local identifiers known to have a server copy.
     var linkedLocalIdentifiers: Set<String> = []
-    /// Immich ids reachable through a linked local asset, so they are not added twice.
-    var linkedImmichIDs: Set<String> = []
 
     var isEmpty: Bool { stubs.isEmpty && linkedLocalIdentifiers.isEmpty }
+
+    /// The server copies that must be shown in their own right, given which local assets still
+    /// exist. A link row alone is not enough to hide one: the local file it names may be gone.
+    func remoteOnlyStubs(presentLocalIdentifiers: Set<String>) -> [AssetStub] {
+        stubs.filter { stub in
+            guard let immichID = stub.id.immichID,
+                  let localIdentifier = localIdentifierByImmichID[immichID] else { return true }
+            return !presentLocalIdentifiers.contains(localIdentifier)
+        }
+    }
 }
 
 /// Syncs Immich *metadata* into SQLite and serves it to the timeline (DESIGN.md §7.2, D9).
@@ -196,24 +211,18 @@ actor RemoteLibraryService {
         return try writer.read { db in
             var data = RemoteMergeData()
 
-            let links = try FacetLinkRecord.fetchAll(db)
-            var immichToLocal = [String: String]()
-            for link in links {
+            for link in try FacetLinkRecord.fetchAll(db) {
                 guard let localIdentifier = link.localIdentifier, let immichID = link.immichID else {
                     continue
                 }
-                immichToLocal[immichID] = localIdentifier
+                data.localIdentifierByImmichID[immichID] = localIdentifier
                 data.linkedLocalIdentifiers.insert(localIdentifier)
-                data.linkedImmichIDs.insert(immichID)
             }
 
-            let records = try RemoteAssetRecord
+            data.stubs = try RemoteAssetRecord
                 .filter(sql: "is_trashed = 0")
                 .order(sql: "capture_at DESC")
                 .fetchAll(db)
-
-            data.stubs = records
-                .filter { immichToLocal[$0.immichID] == nil }
                 .map(\.stub)
             return data
         }
