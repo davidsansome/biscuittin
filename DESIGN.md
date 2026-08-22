@@ -1169,6 +1169,34 @@ creating a 1400×900 replacement, preserving `localDateTime`, and repointing the
 Also worth noting: Immich's search index lags uploads, so freshly uploaded assets do not appear
 in `search/metadata` immediately. Delta sync picks them up on a later pass.
 
+### M8 and M9 exercised for real (2026-08-23)
+
+Both were previously implemented but never executed. Running them against the live server found
+three more defects, one of which defeated M8's entire purpose.
+
+**Free Up Space emptied the timeline.** `mergeData()` excluded any remote asset whose
+`facet_links` row named a local identifier, assuming the local twin would render it. That row
+outlives the local file, so once the local copies were deleted the remote asset was filtered out
+*and* the local stub was gone — 73 photos vanished from the grid while sitting safely on the
+server. Visibility now depends on the local identifiers actually present in the current PhotoKit
+fetch (`remoteOnlyStubs(presentLocalIdentifiers:)`), which self-heals for any local deletion.
+
+**Trashed copies counted as backups.** `bulk-upload-check` reports an asset in Immich's trash as
+a duplicate; the dedupe step marked the local copy `uploaded` on that basis. The app then
+reported "all backed up" while the only server copy awaited permanent deletion. A trashed
+duplicate is now left pending. M8 was already safe here by construction — its gate requires a
+non-trashed `remote_assets` row — but the backup state and indicator were lying.
+
+**Rotated videos lost their capture date.** The multipart `fileCreatedAt` is honoured only when
+the file carries no date of its own. A rotated JPEG keeps its EXIF; a remuxed video does not, so
+Immich re-derived the date and the clip jumped to the top of the timeline. Rotation now sets
+`dateTimeOriginal` explicitly after upload, covering every media kind.
+
+Confirmed working: M8 freed 14.8 MB across 73 items behind a single system prompt, left the
+server untouched at 77 assets, and the photos reappeared as remote-only with cloud badges. M9
+rotated both a 4 s and a 23 s clip losslessly — original trashed, 640×480 replaced by 480×640,
+capture date preserved — with the rotate controls correctly enabled on video pages.
+
 ### Notes for later milestones
 
 * `GridLayoutProvider` sizes tiles by giving the item `fractionalWidth(1/columns)` and
