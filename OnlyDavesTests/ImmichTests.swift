@@ -333,6 +333,47 @@ final class ImmichTests: XCTestCase {
     /// The request type is Encodable-only, so decode into a mirror for assertions.
     private struct DecodedLogin: Decodable { let email: String; let password: String }
 
+    // MARK: - Trashed duplicates
+    //
+    // Verified against a real server: bulk-upload-check reports an asset sitting in Immich's
+    // trash as `action: reject, reason: duplicate, isTrashed: true`. Treating that as backed up
+    // marked 72 local photos safe while their only server copy was awaiting permanent deletion.
+
+    func testBulkUploadCheckReportsTrashedDuplicates() throws {
+        let json = """
+        {"results":[
+          {"id":"live","action":"reject","reason":"duplicate","assetId":"a1","isTrashed":false},
+          {"id":"binned","action":"reject","reason":"duplicate","assetId":"a2","isTrashed":true},
+          {"id":"fresh","action":"accept"}
+        ]}
+        """
+        let decoded = try JSONDecoder().decode(Immich.BulkUploadCheckResponse.self,
+                                               from: Data(json.utf8))
+        XCTAssertEqual(decoded.results.count, 3)
+        XCTAssertEqual(decoded.results[0].isTrashed, false)
+        XCTAssertEqual(decoded.results[1].isTrashed, true,
+                       "a trashed duplicate must be distinguishable from a live one")
+        // `accept` results omit the field entirely, so it has to stay optional.
+        XCTAssertNil(decoded.results[2].isTrashed)
+        XCTAssertNil(decoded.results[2].reason)
+    }
+
+    /// The rule SyncEngine applies: only a *live* duplicate counts as backed up.
+    func testOnlyLiveDuplicatesCountAsBackedUp() throws {
+        let json = """
+        {"results":[
+          {"id":"live","action":"reject","reason":"duplicate","assetId":"a1","isTrashed":false},
+          {"id":"binned","action":"reject","reason":"duplicate","assetId":"a2","isTrashed":true}
+        ]}
+        """
+        let decoded = try JSONDecoder().decode(Immich.BulkUploadCheckResponse.self,
+                                               from: Data(json.utf8))
+        let backedUp = decoded.results.filter {
+            $0.action == "reject" && $0.reason == "duplicate" && $0.isTrashed != true
+        }
+        XCTAssertEqual(backedUp.map(\.id), ["live"])
+    }
+
     // MARK: - Disk cache keys
 
     func testDiskCacheHashIsStableAcrossCalls() {

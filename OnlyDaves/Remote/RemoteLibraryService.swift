@@ -299,6 +299,11 @@ actor RemoteLibraryService {
                                                        fileCreatedAt: captured,
                                                        fileModifiedAt: captured)
 
+        // The multipart timestamps only stick when the file carries no date of its own, which
+        // is true of a rotated JPEG but not a remuxed video. Set it explicitly so a rotated
+        // video keeps its place in the timeline instead of resurfacing as if shot just now.
+        try await client.updateCaptureDate(id: newID, to: captured)
+
         // Only trash the original once the replacement is safely stored.
         try await client.deleteAssets(ids: [immichID])
 

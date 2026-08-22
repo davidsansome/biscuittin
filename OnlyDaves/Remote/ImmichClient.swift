@@ -199,6 +199,28 @@ actor ImmichClient {
         }
     }
 
+    /// Forces an asset's capture date.
+    ///
+    /// Needed after a rotation replacement: the multipart `fileCreatedAt` is only honoured when
+    /// the file carries no date of its own. A rotated JPEG keeps its EXIF and so survives, but a
+    /// remuxed video does not, and Immich re-derives the date — landing the replacement at
+    /// "now" and jumping it to the top of the timeline. Setting it explicitly covers every kind.
+    func updateCaptureDate(id: String, to date: Date) async throws {
+        struct Update: Encodable { let dateTimeOriginal: String }
+        _ = try await dataForRequest(
+            authorize(try makeRequest(path: "/api/assets/\(id)",
+                                      method: "PUT",
+                                      body: Update(dateTimeOriginal: Immich.iso8601String(from: date)),
+                                      timeout: Self.metadataTimeout),
+                      token: await tokenProvider()))
+    }
+
+    private nonisolated func authorize(_ request: URLRequest, token: String?) -> URLRequest {
+        var request = request
+        if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        return request
+    }
+
     /// Streaming SHA-1, so a large original never has to sit in memory.
     static func sha1Hex(ofFileAt url: URL) throws -> String {
         let handle = try FileHandle(forReadingFrom: url)

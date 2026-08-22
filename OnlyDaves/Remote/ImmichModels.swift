@@ -220,6 +220,9 @@ enum Immich {
             let action: String        // "accept" | "reject"
             let reason: String?       // "duplicate" | "unsupported-format"
             let assetId: String?      // set when the server already has it
+            /// True when the matching asset is in the server's trash. Immich still reports it
+            /// as a duplicate, but a copy awaiting permanent deletion is not a backup.
+            let isTrashed: Bool?
         }
         let results: [Result]
     }

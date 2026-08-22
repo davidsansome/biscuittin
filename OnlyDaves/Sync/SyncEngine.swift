@@ -249,6 +249,16 @@ actor SyncEngine {
 
         for result in response.results where result.action == "reject" {
             guard result.reason == "duplicate" else { continue }
+
+            // Immich reports assets in its trash as duplicates too. Treating one as backed up
+            // would mark the local copy safe while its only server copy waits to be purged —
+            // and would then make it a candidate for Free Up Space (D18). Leave it pending so
+            // it uploads again.
+            if result.isTrashed == true {
+                Log.sync.info("Duplicate \(result.id, privacy: .public) is trashed on the server; re-uploading")
+                continue
+            }
+
             try await mark(result.id, state: .uploaded, error: nil)
             if let assetID = result.assetId {
                 try await writer.write { db in
