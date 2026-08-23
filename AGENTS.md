@@ -166,6 +166,19 @@ hardware must go through it, or it will not reach the terminal.
 `Tools/devrun.sh`-style capture: launch with `--console` redirected to a file, in the
 background, and let the user tap at their own pace rather than racing a fixed window.
 
+## Run the control before believing a negative
+
+Concluding "the API refuses X" needs a control that isolates X. While investigating lossless
+rotation, a rendition with an advanced EXIF orientation flag was rejected by PhotoKit, and the
+first conclusion drawn was "PhotoKit rejects flag-only renditions". That was believed on one
+observation. The control — running the *same* code path writing the source bytes verbatim, with
+no orientation change — was accepted, which is what actually proved the flag was the cause
+rather than a malformed file or a bad code path.
+
+Cheap, decisive, and it would have been just as cheap before the conclusion as after. When a
+result is negative, ask what single variable differs between it and a case that should succeed,
+and run that case.
+
 ## Launch the bundle id you just built
 
 The app's bundle id is **`com.davidsansome.onlydaves`**. An older `dev.onlydaves.app` build may

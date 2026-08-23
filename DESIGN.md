@@ -1269,8 +1269,22 @@ rejected the rendition with `PHPhotosError.invalidResource` (3302) for **both** 
 The produced files were valid (unit tests read them back with the correct flag and unchanged
 pixel dimensions); PhotoKit simply refuses a rendition that still needs a flag applied.
 
+**The control that isolates it.** Suspecting the rejection might be a malformed file rather than
+the flag, the same `CopyImageSource` path was run writing the source bytes *verbatim* — same
+mechanism, same format, no orientation change. PhotoKit **accepted** it. Only the flag value
+differed between accept and reject, so the file production is sound and the flag is the blocker.
+
+**An unexplained asymmetry, recorded because it is the strongest argument against the above.**
+Video rotation here *is* lossless: `VideoRotator` exports with `AVAssetExportPresetPassthrough`
+and carries the rotation in the track's `preferredTransform` — container metadata, not pixels —
+and PhotoKit accepts that happily (M9, verified on a real server). So PhotoKit does not enforce
+"right-side up without metadata" uniformly across media types; it is stricter for images than
+for video. No explanation was found for the difference. If someone later finds the image-side
+equivalent of a passthrough export, this decision deserves revisiting.
+
 So the re-encode stands, but for the correct reason. The accepted cost is generational loss when
 one photo is rotated repeatedly; a single rotation of an untouched original loses one encode.
+Accepted deliberately at review: in practice a photo is rotated once or twice, not repeatedly.
 
 **Still open, deliberately not taken here.** Two lossless routes exist and were not pursued:
 the *remote* copy could rotate by flag alone, since Immich accepts it, at the price of the two
