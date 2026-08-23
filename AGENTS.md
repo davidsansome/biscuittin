@@ -166,6 +166,24 @@ hardware must go through it, or it will not reach the terminal.
 `Tools/devrun.sh`-style capture: launch with `--console` redirected to a file, in the
 background, and let the user tap at their own pace rather than racing a fixed window.
 
+## Launch the bundle id you just built
+
+The app's bundle id is **`com.davidsansome.onlydaves`**. An older `dev.onlydaves.app` build may
+still be installed on the simulator, and `simctl launch dev.onlydaves.app` will happily start it
+— so you drive a stale binary while your new code sits unused. This cost several cycles: the fix
+under test appeared not to work and produced no logs at all, because the running app predated
+both.
+
+Symptom to recognise: **no app logs whatsoever**, plus UI that ignores a change you know is in
+the build. Check with:
+
+```bash
+xcrun simctl listapps <UDID> | grep -i onlydaves
+```
+
+`Log.subsystem` is still `dev.onlydaves.app` — the logging subsystem and the bundle id are
+deliberately different strings; do not "fix" one to match the other.
+
 ## The simulator is not the device
 
 Three bugs reached a real phone that the simulator structurally could not surface:
@@ -174,7 +192,9 @@ Three bugs reached a real phone that the simulator structurally could not surfac
   matched the one PhotoKit requested. Real camera photos are HEIC, and iOS asks for a **JPG**
   rendition of them — encoding HEIC into that slot fails with `PHPhotosError.invalidResource`
   (3302). `renderedContentURL` is the authority on the container; never infer it from the input.
-* **Photo library contents.** Generated test media has none of the shapes real photos do.
+* **Photo library contents.** Generated test media has none of the shapes real photos do. A HEIC
+  can be put into the simulator library with `simctl addmedia`, which is how the HEIC rendition
+  path was finally verified without asking the user to hunt for the right photo.
 * **Anything the user's own library gates**, such as iCloud-offloaded originals.
 
 Run milestones that touch PhotoKit editing on hardware before believing them.

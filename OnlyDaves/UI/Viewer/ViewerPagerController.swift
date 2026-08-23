@@ -307,7 +307,10 @@ final class ViewerPagerController: UIViewController {
             Toast.show("This item can’t be rotated yet.", in: view)
             return
         }
-        guard let cell = currentCell() else { return }
+        guard let cell = currentCell() else {
+            Log.device("ui", "rotateCurrent aborted: no cell for index \(currentIndex)")
+            return
+        }
 
         cell.previewRotation(clockwise: clockwise)
 

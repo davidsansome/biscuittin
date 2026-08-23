@@ -25,20 +25,47 @@ final class LocalAssetEditor: @unchecked Sendable {
                                                               output: output,
                                                               clockwise: clockwise)
         } else {
-            // renderedContentURL is the authority on the container PhotoKit will accept.
-            let renderedType = UTType(filenameExtension:
-                output.renderedContentURL.pathExtension.lowercased()) ?? .jpeg
-            let renderedURL = try await rotator.rotateLocal(input: input,
+            let (destination, renderedType) = renditionTarget(for: input, output: output)
+            let producedURL = try await rotator.rotateLocal(input: input,
                                                             clockwise: clockwise,
                                                             outputType: renderedType)
-            defer { try? FileManager.default.removeItem(at: renderedURL) }
-            let data = try Data(contentsOf: renderedURL)
-            try data.write(to: output.renderedContentURL, options: .atomic)
+            defer { try? FileManager.default.removeItem(at: producedURL) }
+            let data = try Data(contentsOf: producedURL)
+            try data.write(to: destination, options: .atomic)
         }
 
         try await PHPhotoLibrary.shared().performChanges {
             let request = PHAssetChangeRequest(for: asset)
             request.contentEditingOutput = output
+        }
+    }
+
+
+    /// Chooses where and in what container to write the edited rendition.
+    ///
+    /// `renderedContentURL` is only the *default* format — for a HEIC original iOS defaults to
+    /// JPEG, which would silently inflate every rotated photo. Since iOS 17 the output can be
+    /// asked for a specific container via `renderedContentURL(for:)`, so the original's own
+    /// format is preferred whenever `supportedRenderedContentTypes` allows it, and the default
+    /// is used only as a fallback.
+    private func renditionTarget(for input: PHContentEditingInput,
+                                 output: PHContentEditingOutput) -> (url: URL, type: UTType) {
+        let fallbackType = output.defaultRenderedContentType
+            ?? UTType(filenameExtension: output.renderedContentURL.pathExtension.lowercased())
+            ?? .jpeg
+
+        guard let sourceType = input.uniformTypeIdentifier.flatMap(UTType.init),
+              sourceType != fallbackType,
+              output.supportedRenderedContentTypes.contains(sourceType) else {
+            return (output.renderedContentURL, fallbackType)
+        }
+
+        do {
+            return (try output.renderedContentURL(for: sourceType), sourceType)
+        } catch {
+            // The type is advertised as supported but refused; the default always works.
+            Log.device("ui", "rendition \(sourceType.identifier) refused: \(error)")
+            return (output.renderedContentURL, fallbackType)
         }
     }
 

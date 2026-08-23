@@ -1224,6 +1224,32 @@ them. Cache invalidation also moved *before* the change is published, so a recon
 cannot re-request through a cached pre-edit `PHAsset`. The same blind spot would have hidden a
 tile gaining or losing its cloud badge after a sync.
 
+### Rotation keeps the original's container (2026-08-23)
+
+An earlier claim in this log — that a JPEG rendition was "PhotoKit's choice, not ours" — was
+**wrong**, and the correction matters: it inflated every rotated HEIC by roughly 29% (3.16 MB
+original → 4.07 MB rendition, measured on device).
+
+`renderedContentURL` is documented as the rendered output *"in the **default** format"*. Since
+iOS 17 the output also exposes `supportedRenderedContentTypes` and `renderedContentURL(for:)`,
+so a specific container can be requested. Measured on a real asset:
+
+```
+sourceUTI=public.heic  default=public.jpeg  supported=[public.jpeg, public.heic]
+```
+
+HEIC was available the whole time; the default simply is not it. `LocalAssetEditor` now prefers
+the original's own container whenever `supportedRenderedContentTypes` offers it, falling back to
+the default otherwise. Verified end to end with a HEIC placed in the simulator library via
+`simctl addmedia`: `rendition type=public.heic`, 2,359 bytes against a 2,801-byte original, and
+the image visibly rotated the right way.
+
+Two things this does not change. Rotation still re-encodes rather than flipping an orientation
+flag — the deliberate D10 tradeoff that keeps Immich's server-side thumbnails correct. And
+because the edit reads the *current* rendition rather than the original, repeated rotations of
+one photo still compound generational loss; fixing that means handling our own adjustment data
+and rendering from the original each time, which is a separate change.
+
 ### Notes for later milestones
 
 * `GridLayoutProvider` sizes tiles by giving the item `fractionalWidth(1/columns)` and
