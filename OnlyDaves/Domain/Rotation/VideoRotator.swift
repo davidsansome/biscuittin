@@ -1,6 +1,7 @@
 import Foundation
 import Photos
 import AVFoundation
+import UniformTypeIdentifiers
 
 /// Rotates videos losslessly (DESIGN.md D10, M9).
 ///
@@ -11,7 +12,9 @@ import AVFoundation
 struct VideoRotator: AssetRotator {
     let supportedKind: MediaKind = .video
 
-    func rotateLocal(input: PHContentEditingInput, clockwise: Bool) async throws -> URL {
+    func rotateLocal(input: PHContentEditingInput,
+                     clockwise: Bool,
+                     outputType: UTType) async throws -> URL {
         guard let avAsset = input.audiovisualAsset else { throw RotationError.missingImageSource }
         return try await rotate(asset: avAsset, clockwise: clockwise)
     }
@@ -69,7 +72,9 @@ struct VideoRotator: AssetRotator {
 struct LivePhotoRotator: AssetRotator {
     let supportedKind: MediaKind = .livePhoto
 
-    func rotateLocal(input: PHContentEditingInput, clockwise: Bool) async throws -> URL {
+    func rotateLocal(input: PHContentEditingInput,
+                     clockwise: Bool,
+                     outputType: UTType) async throws -> URL {
         // A Live Photo edit is applied through PhotoKit's own context rather than by producing
         // a rendition file, so this strategy is driven by `LocalAssetEditor` instead.
         throw RotationError.unsupportedMediaKind(.livePhoto)

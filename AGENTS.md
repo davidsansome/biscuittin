@@ -138,6 +138,47 @@ xcrun simctl addmedia <UDID> *.jpg *.mov
 xcrun simctl get_app_container <UDID> dev.onlydaves.app data   # inspect boot cache / prefs
 ```
 
+## Working on a physical device
+
+The full deploy loop runs from here — no hands needed on the phone:
+
+```bash
+xcodebuild -project OnlyDaves.xcodeproj -scheme OnlyDaves -destination 'platform=iOS,id=<DEVICE_UDID>' -derivedDataPath build/DeviceDD -allowProvisioningUpdates build
+```
+
+```bash
+xcrun devicectl device install app --device <DEVICE_UDID> build/DeviceDD/Build/Products/Debug-iphoneos/OnlyDaves.app
+```
+
+`xcrun devicectl list devices` gives the identifier; `xcrun xctrace list devices` gives the UDID
+that `xcodebuild -destination` wants — they are different strings for the same phone.
+
+**What cannot be done from here:** tapping the screen or taking live screenshots. The simulator
+MCP tools are simulator-only. Either write an XCUITest that runs on the device, or have the user
+tap and report.
+
+**Reading device logs — the part that is not obvious.**
+`xcrun devicectl device process launch --console` relays the process's stdout/stderr but **not**
+os_log, so every `Logger` call is invisible there. `Log.device(_:_:)` exists for this: it writes
+to os_log *and* mirrors to stderr in debug builds. Anything needed while debugging on real
+hardware must go through it, or it will not reach the terminal.
+
+`Tools/devrun.sh`-style capture: launch with `--console` redirected to a file, in the
+background, and let the user tap at their own pace rather than racing a fixed window.
+
+## The simulator is not the device
+
+Three bugs reached a real phone that the simulator structurally could not surface:
+
+* **HEIC.** The simulator's stock library is JPEG, so a rotation's source container always
+  matched the one PhotoKit requested. Real camera photos are HEIC, and iOS asks for a **JPG**
+  rendition of them — encoding HEIC into that slot fails with `PHPhotosError.invalidResource`
+  (3302). `renderedContentURL` is the authority on the container; never infer it from the input.
+* **Photo library contents.** Generated test media has none of the shapes real photos do.
+* **Anything the user's own library gates**, such as iCloud-offloaded originals.
+
+Run milestones that touch PhotoKit editing on hardware before believing them.
+
 ## Test media
 
 The simulator ships with only 6 stock photos and no videos, which is not enough to exercise

@@ -49,7 +49,11 @@ enum Toast {
     /// Summarises an action outcome, or returns nil when everything succeeded silently.
     static func message(for outcome: ActionOutcome, verb: String) -> String? {
         var parts: [String] = []
-        if !outcome.failures.isEmpty {
+        if outcome.failures.count == 1, let error = outcome.failures.first?.error {
+            // With a single failure there is room to say *why*. "1 couldn't be rotated" tells
+            // the user nothing and gives a bug report nothing to go on.
+            parts.append((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+        } else if !outcome.failures.isEmpty {
             parts.append("\(outcome.failures.count) couldn’t be \(verb)")
         }
         if !outcome.skippedUnsupported.isEmpty {

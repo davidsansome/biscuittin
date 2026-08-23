@@ -36,6 +36,8 @@ actor TimelineStore {
     private var isLive = false
 
     private var emitPending = false
+    /// Ids whose contents changed since the last emitted snapshot (see `reconfiguredIDs`).
+    private var pendingReconfiguredIDs = Set<AssetID>()
     private var bootCacheSaveTask: Task<Void, Never>?
     private var observationTask: Task<Void, Never>?
 
@@ -218,6 +220,9 @@ actor TimelineStore {
             guard index.remove(ids) else { return }
         case .update(let stubs):
             index.update(stubs)
+            // Identity is unchanged, so the grid's diff would otherwise be a no-op and the
+            // tile would keep showing the pre-edit thumbnail.
+            pendingReconfiguredIDs.formUnion(stubs.map(\.id))
         }
 
         scheduleEmit()
@@ -294,6 +299,7 @@ actor TimelineStore {
 
     private func emitNow() {
         continuation.yield(makeSnapshot())
+        pendingReconfiguredIDs.removeAll()
     }
 
     private func makeSnapshot() -> TimelineSnapshot {
@@ -302,7 +308,8 @@ actor TimelineStore {
         return TimelineSnapshot(grouping: grouping,
                                 buckets: buckets,
                                 totalCount: index.count,
-                                provenance: provenance)
+                                provenance: provenance,
+                                reconfiguredIDs: Array(pendingReconfiguredIDs))
     }
 
     // MARK: - Boot cache persistence

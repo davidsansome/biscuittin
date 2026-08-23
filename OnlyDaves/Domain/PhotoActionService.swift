@@ -159,10 +159,12 @@ actor PhotoActionService {
             }
         }
 
+        // Invalidate *before* publishing: the update makes the grid reconfigure those cells
+        // immediately, and they must not re-request through a cached pre-edit PHAsset.
+        invalidateCaches(for: outcome.succeeded)
         if !rotatedStubs.isEmpty {
             await timelineStore.applyChange(.update(rotatedStubs))
         }
-        invalidateCaches(for: outcome.succeeded)
         return outcome
     }
 

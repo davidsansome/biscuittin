@@ -1,5 +1,6 @@
 import Foundation
 import Photos
+import UniformTypeIdentifiers
 
 /// Applies edits to the device photo library (DESIGN.md §8).
 ///
@@ -24,7 +25,12 @@ final class LocalAssetEditor: @unchecked Sendable {
                                                               output: output,
                                                               clockwise: clockwise)
         } else {
-            let renderedURL = try await rotator.rotateLocal(input: input, clockwise: clockwise)
+            // renderedContentURL is the authority on the container PhotoKit will accept.
+            let renderedType = UTType(filenameExtension:
+                output.renderedContentURL.pathExtension.lowercased()) ?? .jpeg
+            let renderedURL = try await rotator.rotateLocal(input: input,
+                                                            clockwise: clockwise,
+                                                            outputType: renderedType)
             defer { try? FileManager.default.removeItem(at: renderedURL) }
             let data = try Data(contentsOf: renderedURL)
             try data.write(to: output.renderedContentURL, options: .atomic)

@@ -393,6 +393,12 @@ final class GridViewController: UIViewController {
         let delta = abs(new.totalCount - previousCount)
         let shouldReload = previousCount == 0 || groupingChanged || delta > 500
 
+        // Content-only changes keep their identifiers, so the diff misses them entirely.
+        let reconfigurable = new.reconfiguredIDs.filter { snapshot.indexOfItem($0) != nil }
+        if !reconfigurable.isEmpty {
+            snapshot.reconfigureItems(reconfigurable)
+        }
+
         if shouldReload {
             dataSource.applySnapshotUsingReloadData(snapshot)
         } else {

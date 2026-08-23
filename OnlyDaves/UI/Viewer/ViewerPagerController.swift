@@ -314,6 +314,14 @@ final class ViewerPagerController: UIViewController {
         Task { [weak self] in
             guard let self else { return }
             let outcome = await self.env.photoActions.rotate(ids: [stub.id], clockwise: clockwise)
+
+            for failure in outcome.failures {
+                Log.device("ui", "rotate failed for \(failure.id.raw): \(failure.error)")
+            }
+            for skipped in outcome.skippedUnsupported {
+                Log.device("ui", "rotate skipped \(skipped.raw): no rotator for its media kind")
+            }
+
             guard !outcome.succeeded.isEmpty else {
                 self.currentCell()?.revertPreviewRotation()
                 let message = Toast.message(for: outcome, verb: "rotated")

@@ -37,6 +37,24 @@ struct TimelineSnapshot {
     let buckets: [Bucket]
     let totalCount: Int
     let provenance: Provenance
+    /// Items whose *contents* changed while their identity stayed the same — a rotation, or a
+    /// facet gained or lost.
+    ///
+    /// A diffable data source keys on identity alone, so such a change diffs to "nothing" and
+    /// the cell keeps its stale thumbnail. These ids are the ones the grid must reconfigure.
+    let reconfiguredIDs: [AssetID]
+
+    init(grouping: Grouping,
+         buckets: [Bucket],
+         totalCount: Int,
+         provenance: Provenance,
+         reconfiguredIDs: [AssetID] = []) {
+        self.grouping = grouping
+        self.buckets = buckets
+        self.totalCount = totalCount
+        self.provenance = provenance
+        self.reconfiguredIDs = reconfiguredIDs
+    }
 
     static func empty(grouping: Grouping, provenance: Provenance = .live) -> TimelineSnapshot {
         TimelineSnapshot(grouping: grouping, buckets: [], totalCount: 0, provenance: provenance)

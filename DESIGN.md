@@ -1197,6 +1197,33 @@ server untouched at 77 assets, and the photos reappeared as remote-only with clo
 rotated both a 4 s and a 23 s clip losslessly — original trashed, 640×480 replaced by 480×640,
 capture date preserved — with the rotate controls correctly enabled on video pages.
 
+### First run on real hardware (2026-08-23)
+
+An iPhone 13 on iOS 26.6 found three bugs the simulator could not.
+
+**Rotation failed on every photo** with `PHPhotosError.invalidResource` (3302). The device log
+gave it away exactly: `inputUTI=public.heic renderedExt=JPG producedExt=heic`. `ImageRotator`
+chose its output container from the *input's* UTI, but iOS asks for a **JPG** rendition of a
+HEIC original, and PhotoKit rejects a rendition in any other container.
+`PHContentEditingOutput.renderedContentURL` is now the authority: `LocalAssetEditor` derives the
+required type from it and passes it to the rotator. The remote upload path still keeps the
+source container, since nothing there dictates otherwise. Invisible on the simulator, whose
+stock library is JPEG — source and requested type always matched.
+
+**The optimistic rotation zoomed the photo to full size.** `previewRotation` set a transform on
+`photoView.imageView`, which is the scroll view's `viewForZooming`; `UIScrollView` implements
+`zoomScale` through that same transform, so setting it directly wiped the zoom and snapped the
+image to 1:1 with its pixel dimensions. The spin now runs on a separate overlay above the scroll
+view, scaled so the rotated image still fits.
+
+**The grid kept the pre-rotation thumbnail.** The diffable data source keys on `AssetID`, which a
+rotation does not change, so the diff was a no-op and the cell was never touched — the viewer
+looked right only because it re-fetches. `TimelineSnapshot` now carries `reconfiguredIDs` for
+items whose contents changed under a stable identity, and the grid calls `reconfigureItems` on
+them. Cache invalidation also moved *before* the change is published, so a reconfigured cell
+cannot re-request through a cached pre-edit `PHAsset`. The same blind spot would have hidden a
+tile gaining or losing its cloud badge after a sync.
+
 ### Notes for later milestones
 
 * `GridLayoutProvider` sizes tiles by giving the item `fractionalWidth(1/columns)` and

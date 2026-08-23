@@ -1,5 +1,6 @@
 import Foundation
 import Photos
+import UniformTypeIdentifiers
 
 /// Strategy for physically rotating one kind of media (DESIGN.md D10).
 ///
@@ -11,8 +12,15 @@ protocol AssetRotator: Sendable {
     var supportedKind: MediaKind { get }
 
     /// Produces the rotated rendition for a PhotoKit content-editing session.
+    ///
+    /// - Parameter outputType: the container PhotoKit expects, derived from
+    ///   `PHContentEditingOutput.renderedContentURL`. It is **not** always the input's type —
+    ///   iOS asks for JPEG renditions of HEIC originals — and writing the wrong one is
+    ///   rejected with `PHPhotosError.invalidResource`.
     /// - Returns: a temporary file the caller moves into the editing output.
-    func rotateLocal(input: PHContentEditingInput, clockwise: Bool) async throws -> URL
+    func rotateLocal(input: PHContentEditingInput,
+                     clockwise: Bool,
+                     outputType: UTType) async throws -> URL
 
     /// Produces the replacement file for a downloaded Immich original (M7).
     func rotateRemoteOriginal(fileURL: URL, clockwise: Bool) async throws -> URL

@@ -41,7 +41,9 @@ final class RotationTests: XCTestCase {
     /// Stands in for M9's `VideoRotator` — only its `supportedKind` matters here.
     private struct StubVideoRotator: AssetRotator {
         let supportedKind: MediaKind = .video
-        func rotateLocal(input: PHContentEditingInput, clockwise: Bool) async throws -> URL {
+        func rotateLocal(input: PHContentEditingInput,
+                         clockwise: Bool,
+                         outputType: UTType) async throws -> URL {
             URL(fileURLWithPath: "/dev/null")
         }
         func rotateRemoteOriginal(fileURL: URL, clockwise: Bool) async throws -> URL { fileURL }
@@ -185,5 +187,67 @@ final class RotationTests: XCTestCase {
                                           bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
         ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
         return PixelBuffer(bytes: bytes, width: width)
+    }
+}
+
+// MARK: - Rendition container (PHPhotosError.invalidResource)
+
+/// PhotoKit dictates the container for an edited rendition via `renderedContentURL`, and it is
+/// not always the source's: iOS asks for a **JPG** rendition of a **HEIC** original. Encoding
+/// HEIC into that slot is rejected with `PHPhotosError.invalidResource` (3302) — which is
+/// exactly what every rotate on a real device hit, while the simulator's JPEG library never did.
+final class RenditionContainerTests: XCTestCase {
+
+    func testRequestedTypeWinsOverSourceType() throws {
+        let source = try makeHEICLikeSource()
+        defer { try? FileManager.default.removeItem(at: source) }
+
+        let out = try ImageRotator().rotate(fileURL: source,
+                                            clockwise: true,
+                                            preferredUTI: UTType.jpeg.identifier)
+        defer { try? FileManager.default.removeItem(at: out) }
+
+        let imageSource = try XCTUnwrap(CGImageSourceCreateWithURL(out as CFURL, nil))
+        XCTAssertEqual(CGImageSourceGetType(imageSource) as String?, UTType.jpeg.identifier,
+                       "the rendition must be the container PhotoKit asked for")
+    }
+
+    func testSourceTypeIsKeptWhenNoneIsRequested() throws {
+        // The remote path passes nil: there, preserving the original container is correct.
+        let source = try makeHEICLikeSource()
+        defer { try? FileManager.default.removeItem(at: source) }
+
+        let out = try ImageRotator().rotate(fileURL: source, clockwise: true, preferredUTI: nil)
+        defer { try? FileManager.default.removeItem(at: out) }
+
+        let imageSource = try XCTUnwrap(CGImageSourceCreateWithURL(out as CFURL, nil))
+        XCTAssertEqual(CGImageSourceGetType(imageSource) as String?, UTType.png.identifier)
+    }
+
+    func testRenderedURLExtensionMapsToAType() {
+        // How LocalAssetEditor derives the requested type; iOS spells it "JPG", uppercase.
+        XCTAssertEqual(UTType(filenameExtension: "JPG".lowercased()), .jpeg)
+        XCTAssertEqual(UTType(filenameExtension: "heic"), .heic)
+        XCTAssertEqual(UTType(filenameExtension: "mov"), .quickTimeMovie)
+    }
+
+    /// A PNG stands in for HEIC: the point is that the *source* type differs from the requested
+    /// one, and PNG encodes identically on every platform this test runs on.
+    private func makeHEICLikeSource() throws -> URL {
+        let cs = CGColorSpaceCreateDeviceRGB()
+        let ctx = try XCTUnwrap(CGContext(data: nil, width: 40, height: 20,
+                                          bitsPerComponent: 8, bytesPerRow: 0, space: cs,
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        ctx.setFillColor(CGColor(colorSpace: cs, components: [0, 0, 1, 1])!)
+        ctx.fill(CGRect(x: 0, y: 0, width: 40, height: 20))
+        let image = try XCTUnwrap(ctx.makeImage())
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rendition-src-\(UUID().uuidString).png")
+        let dest = try XCTUnwrap(CGImageDestinationCreateWithURL(
+            url as CFURL, UTType.png.identifier as CFString, 1, nil))
+        CGImageDestinationAddImage(dest, image, nil)
+        XCTAssertTrue(CGImageDestinationFinalize(dest))
+        return url
     }
 }

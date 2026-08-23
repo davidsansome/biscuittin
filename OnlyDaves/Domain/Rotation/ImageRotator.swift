@@ -13,9 +13,13 @@ import UniformTypeIdentifiers
 struct ImageRotator: AssetRotator {
     let supportedKind: MediaKind = .image
 
-    func rotateLocal(input: PHContentEditingInput, clockwise: Bool) async throws -> URL {
+    func rotateLocal(input: PHContentEditingInput,
+                     clockwise: Bool,
+                     outputType: UTType) async throws -> URL {
         guard let url = input.fullSizeImageURL else { throw RotationError.missingImageSource }
-        return try rotate(fileURL: url, clockwise: clockwise, preferredUTI: input.uniformTypeIdentifier)
+        // Must be the type PhotoKit asked for, not the source's: iOS requests a JPEG rendition
+        // for a HEIC original, and handing it HEIC bytes fails with invalidResource.
+        return try rotate(fileURL: url, clockwise: clockwise, preferredUTI: outputType.identifier)
     }
 
     func rotateRemoteOriginal(fileURL: URL, clockwise: Bool) async throws -> URL {
@@ -70,7 +74,11 @@ struct ImageRotator: AssetRotator {
         return outputURL
     }
 
-    /// Keeps the original container format where possible so a HEIC stays a HEIC.
+    /// Resolves the container to encode into.
+    ///
+    /// `preferredUTI` wins when given — for a PhotoKit rendition that is the type
+    /// `renderedContentURL` demands, which is not necessarily the source's. Only the remote
+    /// path leaves it nil, where keeping the original container is right.
     private func outputType(preferredUTI: String?, sourceURL: URL) -> UTType {
         if let preferredUTI, let type = UTType(preferredUTI), type.isSubtype(of: .image) {
             return type

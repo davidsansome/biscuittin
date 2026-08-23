@@ -11,7 +11,15 @@ final class ViewerPageCell: UICollectionViewCell {
     private(set) var stub: AssetStub?
     private var token: ImageRequestToken?
     private weak var loader: ImageLoader?
-    private var previewRotationAngle: CGFloat = 0
+
+    /// Carries the optimistic rotation (§14 P4).
+    ///
+    /// Deliberately *not* `photoView.imageView`: that is the scroll view's `viewForZooming`,
+    /// and `UIScrollView` implements `zoomScale` through its transform. Setting the transform
+    /// there clobbers the zoom, snapping the image to 1:1 with its full pixel size — which on a
+    /// real photo reads as "zoomed all the way in".
+    fileprivate let rotationOverlay = UIImageView()
+    fileprivate var previewRotationAngle: CGFloat = 0
 
     var onSingleTap: (() -> Void)?
     /// Raised when the user zooms in past the fit scale, so a full-resolution image is fetched.
@@ -45,8 +53,7 @@ final class ViewerPageCell: UICollectionViewCell {
         loader?.cancel(token)
         token = nil
         stub = nil
-        previewRotationAngle = 0
-        photoView.imageView.transform = .identity
+        clearRotationOverlay()
         photoView.setImage(nil, resetZoom: true)
         videoView.detachPlayer()
         videoView.setPoster(nil)
@@ -93,18 +100,61 @@ final class ViewerPageCell: UICollectionViewCell {
     /// Turns the displayed image immediately so the tap has a visible effect before the real
     /// edit completes (§14 P4). `revertPreviewRotation` undoes it if the edit fails.
     func previewRotation(clockwise: Bool) {
-        guard stub?.kind != .video else { return }
-        let delta: CGFloat = clockwise ? .pi / 2 : -.pi / 2
-        previewRotationAngle += delta
-        UIView.animate(withDuration: 0.2, delay: 0, options: [.curveEaseInOut]) {
-            self.photoView.imageView.transform = CGAffineTransform(rotationAngle: self.previewRotationAngle)
+        guard stub?.kind != .video, let image = photoView.imageView.image else { return }
+
+        // Spin a copy that sits above the scroll view. Rotating the scroll view's own zooming
+        // view would fight `zoomScale`, which is itself implemented as a transform.
+        if rotationOverlay.superview == nil {
+            rotationOverlay.contentMode = .scaleAspectFit
+            rotationOverlay.isUserInteractionEnabled = false
+            contentView.addSubview(rotationOverlay)
         }
+        if rotationOverlay.isHidden || rotationOverlay.image == nil {
+            rotationOverlay.image = image
+            rotationOverlay.transform = .identity
+            rotationOverlay.frame = Self.aspectFitRect(for: image.size, in: contentView.bounds)
+            rotationOverlay.isHidden = false
+            photoView.isHidden = true
+        }
+
+        previewRotationAngle += clockwise ? .pi / 2 : -.pi / 2
+        let angle = previewRotationAngle
+        let fitted = Self.fitScale(for: rotationOverlay.frame.size,
+                                   rotatedBy: angle,
+                                   in: contentView.bounds)
+
+        UIView.animate(withDuration: 0.2, delay: 0, options: [.curveEaseInOut]) {
+            self.rotationOverlay.transform = CGAffineTransform(rotationAngle: angle)
+                .scaledBy(x: fitted, y: fitted)
+        }
+    }
+
+    /// Where an aspect-fit image actually lands on screen.
+    private static func aspectFitRect(for imageSize: CGSize, in bounds: CGRect) -> CGRect {
+        guard imageSize.width > 0, imageSize.height > 0, !bounds.isEmpty else { return bounds }
+        let scale = min(bounds.width / imageSize.width, bounds.height / imageSize.height)
+        let size = CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
+        return CGRect(x: bounds.midX - size.width / 2,
+                      y: bounds.midY - size.height / 2,
+                      width: size.width,
+                      height: size.height)
+    }
+
+    /// Scale that keeps the rotated image inside the screen. A quarter turn swaps the bounding
+    /// box, so without this the long edge would overflow.
+    private static func fitScale(for size: CGSize, rotatedBy angle: CGFloat, in bounds: CGRect) -> CGFloat {
+        guard size.width > 0, size.height > 0, !bounds.isEmpty else { return 1 }
+        let quarterTurns = Int(round(abs(angle) / (.pi / 2)))
+        guard quarterTurns % 2 == 1 else { return 1 }   // 180° keeps the same box
+        return min(bounds.width / size.height, bounds.height / size.width)
     }
 
     func revertPreviewRotation() {
         previewRotationAngle = 0
         UIView.animate(withDuration: 0.2) {
-            self.photoView.imageView.transform = .identity
+            self.rotationOverlay.transform = .identity
+        } completion: { _ in
+            self.clearRotationOverlay()
         }
     }
 
@@ -115,5 +165,16 @@ final class ViewerPageCell: UICollectionViewCell {
     func setChromeVisible(_ visible: Bool, animated: Bool) {
         guard stub?.kind == .video else { return }
         videoView.setControlsVisible(visible, animated: animated)
+    }
+}
+
+extension ViewerPageCell {
+    /// Puts the real, zoomable image back in charge.
+    func clearRotationOverlay() {
+        previewRotationAngle = 0
+        rotationOverlay.isHidden = true
+        rotationOverlay.image = nil
+        rotationOverlay.transform = .identity
+        photoView.isHidden = stub?.kind == .video
     }
 }
