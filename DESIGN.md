@@ -1250,6 +1250,35 @@ because the edit reads the *current* rendition rather than the original, repeate
 one photo still compound generational loss; fixing that means handling our own adjustment data
 and rendering from the original each time, which is a separate change.
 
+### Why image rotation re-encodes (2026-08-23, corrected)
+
+D10's original rationale — that EXIF-orientation-only flips are "ambiguous across Immich's
+thumbnail pipeline" — was **wrong**, and was never tested. Both halves have now been measured.
+
+**Immich honours the orientation flag.** An image uploaded with pixels unrotated and EXIF
+orientation 6 came back reported as 1000×1600 (display dimensions, swapped from its 1600×1000
+pixels), and the server-generated thumbnail was itself rotated, with the marker band on the
+expected edge. A control at orientation 1 was untouched. So the server was never the obstacle.
+
+**PhotoKit forbids it.** Apple's documentation for edited asset content requires that it "must
+incorporate (or 'bake in') the intended orientation… the orientation metadata that you write
+must declare the 'up' orientation, and the image data must appear right-side up when presented
+without orientation metadata." A lossless implementation — `CGImageDestinationCopyImageSource`
+copying encoded pixels verbatim and advancing only the flag — was built and measured: PhotoKit
+rejected the rendition with `PHPhotosError.invalidResource` (3302) for **both** HEIC and JPEG.
+The produced files were valid (unit tests read them back with the correct flag and unchanged
+pixel dimensions); PhotoKit simply refuses a rendition that still needs a flag applied.
+
+So the re-encode stands, but for the correct reason. The accepted cost is generational loss when
+one photo is rotated repeatedly; a single rotation of an untouched original loses one encode.
+
+**Still open, deliberately not taken here.** Two lossless routes exist and were not pursued:
+the *remote* copy could rotate by flag alone, since Immich accepts it, at the price of the two
+copies being encoded differently; and a truly lossless *local* rotation would mean abandoning
+the content-editing API — losslessly rewriting the flag, creating a new asset, and deleting the
+original — which costs the revert-to-original history, the asset's identity, and its album
+membership, the same trade already accepted on the Immich side.
+
 ### Notes for later milestones
 
 * `GridLayoutProvider` sizes tiles by giving the item `fractionalWidth(1/columns)` and

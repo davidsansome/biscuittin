@@ -6,10 +6,20 @@ import UniformTypeIdentifiers
 
 /// Rotates still images by 90° (DESIGN.md D10).
 ///
-/// Rotates *pixels* rather than flipping the EXIF orientation flag. Orientation-only edits are
-/// ambiguous across Immich's thumbnail pipeline, so baking the rotation in keeps thumbnails
-/// correct everywhere at the cost of a re-encode. The source's EXIF orientation is applied
-/// first and the output is written with orientation 1, so rotations never compound incorrectly.
+/// Rotates *pixels* rather than flipping the EXIF orientation flag, because **PhotoKit requires
+/// it**: edited asset content "must incorporate (or 'bake in') the intended orientation… the
+/// orientation metadata that you write must declare the 'up' orientation, and the image data
+/// must appear right-side up when presented without orientation metadata." A rendition carrying
+/// the rotation in its flag instead is rejected with `PHPhotosError.invalidResource` — measured,
+/// for both HEIC and JPEG.
+///
+/// Note this is *not* an Immich limitation. Immich honours the flag perfectly well: an image
+/// uploaded with orientation 6 comes back with swapped display dimensions and a correctly
+/// rotated server-side thumbnail. An earlier version of this comment blamed Immich; that was
+/// wrong. The cost of the re-encode is generational loss on repeated rotations of one photo.
+///
+/// The source's EXIF orientation is applied first and the output is written with orientation 1,
+/// so rotations never compound incorrectly.
 struct ImageRotator: AssetRotator {
     let supportedKind: MediaKind = .image
 
