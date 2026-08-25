@@ -1293,6 +1293,41 @@ the content-editing API — losslessly rewriting the flag, creating a new asset,
 original — which costs the revert-to-original history, the asset's identity, and its album
 membership, the same trade already accepted on the Immich side.
 
+### M7 performance pass — measured on hardware (2026-08-25)
+
+Run on an **iPhone 13, iOS 26.6, 2,574-photo library**, over wireless debugging.
+
+| launch | first frame | first content | items |
+|---|---|---|---|
+| 1 — first after install | 2,829 ms | **2,986 ms** | 2,572 |
+| 2 | 122 ms | **249 ms** | 2,574 |
+| 3 | 129 ms | **249 ms** | 2,574 |
+
+**P1 holds in the steady state: 249 ms to put 2,574 photos on screen**, inside the 300 ms
+budget, painted from the boot cache before PhotoKit or SQLite are touched. That is D19 doing
+exactly what it was designed for.
+
+Three honest qualifications.
+
+**The first launch after install misses badly (≈3 s).** Cold dyld caches, no boot cache, and the
+first full index build all land at once. It is the least representative launch a user ever
+takes, but it is also their *first impression*, and nothing in D19 helps there because the cache
+it depends on does not exist yet. Not addressed.
+
+**"First frame" and "first content" are different moments, and only the second one matters.**
+`loadBootSnapshot()` is dispatched as a `Task`, so the view is presented before the snapshot is
+applied — roughly 122 ms to an *empty* grid, then ~127 ms more before photos appear. An earlier
+version of this measurement sampled the item count at `viewDidAppear` and reported `items=0`,
+making a working boot cache look broken. `LaunchClock` now reports both, and P1 is judged on
+first *content*.
+
+**The 120 Hz scroll budget in §14 P7 was not tested and cannot be, on this device.** An iPhone 13
+(non-Pro) has a 60 Hz display. That budget needs ProMotion hardware. Also untested: P2's
+new-photo latency, and any measurement on a library far larger than ~2.5 k assets.
+
+Measurements were taken over wireless debugging, which adds some launch overhead; a wired run
+would give slightly better and more trustworthy figures.
+
 ### Notes for later milestones
 
 * `GridLayoutProvider` sizes tiles by giving the item `fractionalWidth(1/columns)` and

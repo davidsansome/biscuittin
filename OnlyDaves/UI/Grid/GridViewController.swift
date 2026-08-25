@@ -98,6 +98,10 @@ final class GridViewController: UIViewController {
         super.viewDidAppear(animated)
         guard !hasSignalledFirstFrame else { return }
         hasSignalledFirstFrame = true
+        // §14 P1: measured here because this is the first moment the grid is actually visible.
+        LaunchClock.reportFirstFrame(
+            itemCount: timeline.totalCount,
+            provenance: timeline.provenance == .bootCache ? "boot-cache" : "live")
         // The grid is genuinely on screen now: everything deferred by D19 may start.
         env.startup.firstFrameDidRender()
     }
@@ -404,6 +408,11 @@ final class GridViewController: UIViewController {
         } else {
             dataSource.apply(snapshot, animatingDifferences: true)
         }
+
+        // §14 P1 is about photos being visible, not just a view existing.
+        LaunchClock.reportFirstContent(
+            itemCount: new.totalCount,
+            provenance: new.provenance == .bootCache ? "boot-cache" : "live")
 
         defaultRightBarButtonItem?.menu = makeGroupingMenu()
         // Assets can disappear underneath a live selection (deleted here or on another device).
