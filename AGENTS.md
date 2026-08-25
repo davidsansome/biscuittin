@@ -221,6 +221,32 @@ three videos of 4s/23s/75s to cover `M:SS` and `H:MM:SS` formatting), then `simc
 the output. Adding media while the app is running is also the quickest way to verify the
 incremental timeline path (DESIGN.md D20).
 
+## Measuring a stall, not guessing at it
+
+"It stalled for a few seconds" is a report about the **main thread**, and nothing else is evidence
+for it. Chasing the sign-in stall (DESIGN.md) took four device runs, and the useful instruments
+were these three — build them before forming a theory, not after:
+
+1. **Timestamps.** `Log.device` stamps elapsed-since-process-start on every line, because
+   `devicectl --console` supplies none. Without them a log cannot distinguish work that is *slow*
+   from work that merely *happens later*, and every gap looks like a stall.
+2. **A main-thread watchdog.** A background thread that pings `DispatchQueue.main` and reports
+   how long the ping took to be serviced. This is the only direct measurement of "the UI froze";
+   actor-side timings are not, however large they look. It falsified the first theory here — the
+   worst block was 467 ms, not seconds.
+3. **Phase breakdown, not totals.** `rebuildIndex took 394 ms` prompts guessing.
+   `(remote 41, photokit 348, merge 5)` ends the argument: PhotoKit enumeration is ~88 % of it.
+
+The first hypothesis — a per-page rebuild storm — turned out to be *real and worth fixing*, but it
+was not what produced the several seconds the user described. Both facts came out of the same
+capture. Instrument first; a plausible cause found by reading code is a hypothesis, not a finding.
+
+**Watch for a direct call racing the `AsyncStream` that already reports the same event.** Sign-in
+both awaited `fullSync` *and* called `timelineStore.refresh()`, while `fullSync` yields on the
+change stream the store observes. The yield is delivered asynchronously, so it landed after the
+refresh and triggered a second full rebuild. Two unordered sources for one event, not redundancy.
+Remove diagnostic instrumentation before committing — but `Log.device`'s timestamp stays.
+
 ## Conventions
 
 - Swift Concurrency throughout; `actor` or `@MainActor` types, no Combine except where UIKit

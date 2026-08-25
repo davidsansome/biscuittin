@@ -127,7 +127,11 @@ final class SettingsViewModel: ObservableObject {
                     Task { @MainActor [weak self] in self?.syncedCount = count }
                 }
 
-                await self.timelineStore.refresh()
+                // No explicit timeline refresh here. `fullSync` already yields on the remote
+                // change stream, and `TimelineStore` coalesces those into one rebuild. Calling
+                // `refresh()` as well raced that delivery — the stream's yield arrived after the
+                // refresh had run, re-arming the coalescer and costing a second full rebuild of
+                // the whole library for no change in the result.
                 self.lastSyncDate = await self.remoteLibrary.lastSyncDate()
                 self.statusMessage = nil
                 self.isWorking = false

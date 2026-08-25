@@ -1328,6 +1328,69 @@ new-photo latency, and any measurement on a library far larger than ~2.5 k asset
 Measurements were taken over wireless debugging, which adds some launch overhead; a wired run
 would give slightly better and more trustworthy figures.
 
+### The sign-in stall: one sync, three full rebuilds
+
+Signing in to a real server on an iPhone 13 with a 2,652-asset local library "stalled for a few
+seconds". Measured on hardware, sign-in itself was never the problem:
+
+| phase | ms |
+| --- | --- |
+| `auth/login` round trip | 130–176 |
+| `fullSync` (one page, 894 assets: net 114–192, SQLite store 167–193) | 316–356 |
+| **sign-in total, before the fix** | **692** |
+
+The cost was downstream. `RemoteLibraryService.sync` yields on its change stream **once per page**
+plus once at the end, and `TimelineStore.attach` mapped every yield straight onto `refresh()` — a
+*full* rebuild. `SettingsViewModel.performSignIn` then called `refresh()` a third time itself. So
+one sign-in produced three complete rebuilds of the timeline, each one re-enumerating the entire
+photo library and all producing an identical 2,652-item index.
+
+Phase-timing a rebuild showed where that lands:
+
+```
+rebuildIndex took 394 ms (remote 41, photokit 348, merge 5) (2652 items)   cold
+rebuildIndex took 127 ms (remote 41, photokit  83, merge 2) (2652 items)   warm
+```
+
+**PhotoKit enumeration is ~88 % of a rebuild.** The redundant rebuilds were almost pure wasted
+re-enumeration, serialised on the `TimelineStore` actor, interleaved with diffable-snapshot applies
+on the main thread — which is what the user actually felt.
+
+This was a violation of D20 hiding in plain sight: the incremental `applyChange` path existed and
+was correct, but the remote-change path never used it and took the `refresh()` fallback every time.
+
+**Fix.** `scheduleRemoteRefresh` coalesces the stream through a single drain task: yields set a
+flag, the drain sleeps 250 ms so a burst accumulates, then pays for one rebuild. Changes arriving
+*during* a rebuild re-arm the flag and get their own pass, so a long multi-page sync still updates
+progressively instead of showing nothing until the end.
+
+Two attempts were needed, and the first one is the instructive one:
+
+1. A trailing-edge debounce keyed on a burst-start timestamp. It cut three rebuilds to two. The
+   hole: `refresh()` cancelled the pending task but left the timestamp set, so a later yield
+   compared against a stale window, decided it had waited long enough, and took an *uncancellable*
+   immediate path. Timestamps plus cancellation gave more states than the logic actually handled.
+   The flag-and-drain version has no timestamp and nothing to cancel.
+2. Even with correct coalescing it stuck at two rebuilds, because `performSignIn`'s explicit
+   `refresh()` **races the stream it duplicates**: the end-of-sync `yield()` is delivered through
+   the `AsyncStream` asynchronously and arrived *after* the refresh had run, re-arming the
+   coalescer. Deleting the explicit call fixed it. When an `AsyncStream` already reports an event,
+   a direct call alongside it is not belt-and-braces — it is a second, unordered source.
+
+Verified on the device: **one** rebuild per sign-in, and sign-in total 692 ms → **471 ms**.
+
+**Not covered by a test.** `TimelineStore` binds PhotoKit and the concrete `RemoteLibraryService`
+actor directly, so there is no seam to inject a fake change stream and count rebuilds. The fix was
+verified by instrumented runs on hardware, not by the suite. A protocol seam for the remote library
+would make the coalescer testable and is worth doing before this logic is changed again.
+
+**Tooling note.** `Log.device` now stamps each line with elapsed time since process start.
+`devicectl --console` output carries no timestamps, and without them a capture cannot tell work
+that is slow from work that merely happens later — which is the entire question when chasing a
+stall. A temporary main-thread watchdog (a background thread timing how long `DispatchQueue.main`
+takes to service a ping) was used to confirm the UI never hard-blocked for seconds; the worst
+single block was 467 ms, around sign-*out*. It was removed before committing.
+
 ### Notes for later milestones
 
 * `GridLayoutProvider` sizes tiles by giving the item `fractionalWidth(1/columns)` and

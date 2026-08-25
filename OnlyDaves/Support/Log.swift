@@ -11,6 +11,11 @@ enum Log {
     static let ui = Logger(subsystem: subsystem, category: "ui")
     static let perf = Logger(subsystem: subsystem, category: "perf")
 
+    /// Stamped on every `device(_:_:)` line. `devicectl --console` output carries no timestamps
+    /// of its own, and without them a capture cannot distinguish work that is slow from work
+    /// that merely happens later — which is the whole question when chasing a stall.
+    nonisolated(unsafe) static let processStart = CFAbsoluteTimeGetCurrent()
+
     /// Mirrors a diagnostic to stderr as well as the log store.
     ///
     /// On a physical device the only channel available from a terminal is
@@ -26,7 +31,9 @@ enum Log {
         default: ui.error("\(text, privacy: .public)")
         }
         #if DEBUG
-        FileHandle.standardError.write(Data("[onlydaves/\(category)] \(text)\n".utf8))
+        let t = CFAbsoluteTimeGetCurrent() - Log.processStart
+        FileHandle.standardError.write(
+            Data(String(format: "[%7.3f onlydaves/%@] %@\n", t, category, text).utf8))
         #endif
     }
 }

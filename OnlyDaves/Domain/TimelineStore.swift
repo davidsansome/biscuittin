@@ -25,6 +25,9 @@ actor TimelineStore {
     /// configured, which is the offline-only case the app must fully support (D12).
     private var remoteLibrary: RemoteLibraryService?
     private var remoteObservationTask: Task<Void, Never>?
+    private var remoteRefreshTask: Task<Void, Never>?
+    private var remoteRefreshRequested = false
+    private static let remoteRefreshDebounce: Double = 0.25
 
     // MARK: - Index state
 
@@ -85,7 +88,7 @@ actor TimelineStore {
 
         remoteObservationTask = Task { [weak self] in
             for await _ in remoteLibrary.changes {
-                await self?.refresh()
+                await self?.scheduleRemoteRefresh()
             }
         }
         if isLive { Task { await refresh() } }
@@ -125,7 +128,39 @@ actor TimelineStore {
     /// Full re-enumeration. Reconciliation fallback only (D20) — the change path uses
     /// `applyChange`.
     func refresh() async {
+        // This rebuild subsumes anything the coalescer was still holding.
+        remoteRefreshRequested = false
         await rebuildIndex()
+    }
+
+    /// Coalesces a burst of remote-change notifications into a single rebuild.
+    ///
+    /// `RemoteLibraryService.sync` yields once per page of results, and a rebuild is a full
+    /// re-enumeration of the photo library — measured at 348 ms of a 394 ms rebuild on a
+    /// 2,652-asset library. Rebuilding per page therefore multiplied one sign-in into three
+    /// complete rebuilds that all produced an identical index.
+    ///
+    /// A single drain task owns the work: requests set a flag, and the drain sleeps once to let
+    /// a burst accumulate before paying for one rebuild. Changes that arrive *during* a rebuild
+    /// re-arm the flag and get their own pass, so a long multi-page sync still updates
+    /// progressively rather than showing nothing until the end.
+    private func scheduleRemoteRefresh() {
+        remoteRefreshRequested = true
+        guard remoteRefreshTask == nil else { return }
+        remoteRefreshTask = Task { [weak self] in
+            await self?.drainRemoteRefreshes()
+        }
+    }
+
+    private func drainRemoteRefreshes() async {
+        defer { remoteRefreshTask = nil }
+        while remoteRefreshRequested {
+            try? await Task.sleep(nanoseconds: UInt64(Self.remoteRefreshDebounce * 1_000_000_000))
+            // `refresh()` may have rebuilt in the meantime, which makes this pass redundant.
+            guard remoteRefreshRequested else { return }
+            remoteRefreshRequested = false
+            await rebuildIndex()
+        }
     }
 
     private func rebuildIndex() async {
