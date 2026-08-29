@@ -29,6 +29,8 @@ final class GridViewController: UIViewController {
     private var selectionToolbarBottom: NSLayoutConstraint?
     private var defaultRightBarButtonItem: UIBarButtonItem?
 
+    private let dateScrubber = DateScrubber()
+
     private lazy var statusLabel: UILabel = {
         let label = UILabel()
         label.textAlignment = .center
@@ -87,6 +89,7 @@ final class GridViewController: UIViewController {
         configureNavigationItem()
         configureStatusViews()
         configureSelection()
+        configureDateScrubber()
         observeStartupPhase()
 
         // Subscribe before kicking the boot cache so the very first snapshot is not missed.
@@ -110,6 +113,7 @@ final class GridViewController: UIViewController {
         super.viewDidLayoutSubviews()
         env.imageLoader.updateScreenMetrics(scale: view.window?.screen.scale ?? traitCollection.displayScale,
                                             size: view.bounds.size)
+        updateScrubberVisibility()
     }
 
     // MARK: - Setup
@@ -120,6 +124,8 @@ final class GridViewController: UIViewController {
         collectionView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         collectionView.backgroundColor = .systemBackground
         collectionView.alwaysBounceVertical = true
+        // The date scrubber replaces the system indicator; showing both is a duplicate.
+        collectionView.showsVerticalScrollIndicator = false
         collectionView.register(AssetCell.self, forCellWithReuseIdentifier: AssetCell.reuseIdentifier)
         collectionView.register(BucketHeaderView.self,
                                 forSupplementaryViewOfKind: UICollectionView.elementKindSectionHeader,
@@ -243,6 +249,58 @@ final class GridViewController: UIViewController {
         selectionDidChange()
     }
 
+    // MARK: - Date scrubber (fast-scroll index)
+
+    private func configureDateScrubber() {
+        dateScrubber.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(dateScrubber)
+        NSLayoutConstraint.activate([
+            dateScrubber.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            dateScrubber.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            dateScrubber.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+            dateScrubber.widthAnchor.constraint(equalToConstant: DateScrubber.hitTargetWidth)
+        ])
+        dateScrubber.onScrub = { [weak self] fraction in self?.scrub(toFraction: fraction) }
+    }
+
+    /// Total scrollable distance, accounting for content insets — 0 (or negative) when
+    /// everything already fits on screen, which is also when the scrubber has nothing to do.
+    private func scrollableContentHeight() -> CGFloat {
+        let insets = collectionView.adjustedContentInset
+        return collectionView.contentSize.height + insets.top + insets.bottom
+            - collectionView.bounds.height
+    }
+
+    private func currentScrollFraction() -> CGFloat {
+        let scrollable = scrollableContentHeight()
+        guard scrollable > 0 else { return 0 }
+        let offset = collectionView.contentOffset.y + collectionView.adjustedContentInset.top
+        return max(0, min(1, offset / scrollable))
+    }
+
+    private func updateScrubberVisibility() {
+        dateScrubber.isHidden = selection.isActive || scrollableContentHeight() <= 0
+    }
+
+    /// Jumps the grid to a normalized position and reports which bucket landed at the top, for
+    /// the scrubber's bubble. Mirrors the system scroll indicator's own travel range 1:1 rather
+    /// than modelling section heights separately — the compositional layout already knows the
+    /// true (self-sized) geometry, so asking it after the jump is simpler and can't drift out of
+    /// sync with what the layout actually did.
+    private func scrub(toFraction fraction: CGFloat) -> String? {
+        let scrollable = scrollableContentHeight()
+        guard scrollable > 0 else { return nil }
+        let y = fraction * scrollable - collectionView.adjustedContentInset.top
+        collectionView.setContentOffset(CGPoint(x: 0, y: y), animated: false)
+        return topmostVisibleBucketTitle()
+    }
+
+    private func topmostVisibleBucketTitle() -> String? {
+        guard let indexPath = collectionView.indexPathsForVisibleItems.min(),
+              indexPath.section < timeline.buckets.count else { return nil }
+        return timeline.buckets[indexPath.section].title
+    }
+
     @objc private func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
         guard gesture.state == .began else { return }
         let point = gesture.location(in: collectionView)
@@ -275,6 +333,7 @@ final class GridViewController: UIViewController {
 
         UIView.animate(withDuration: 0.22) { self.view.layoutIfNeeded() }
         refreshSelectionAppearance()
+        updateScrubberVisibility()
     }
 
     @objc private func cancelSelection() {
@@ -452,6 +511,7 @@ final class GridViewController: UIViewController {
         // Assets can disappear underneath a live selection (deleted here or on another device).
         selection.retain(only: Set(new.buckets.flatMap { $0.items.map(\.id) }))
         updateStatusViews()
+        updateScrubberVisibility()
     }
 
     private func stub(at indexPath: IndexPath, expecting id: AssetID) -> AssetStub? {
@@ -491,6 +551,7 @@ final class GridViewController: UIViewController {
             }
             // Tiles changed size, so visible thumbnails need re-requesting at the new scale.
             self.reconfigureVisibleCells()
+            self.updateScrubberVisibility()
         }
     }
 
@@ -570,6 +631,10 @@ extension GridViewController: UICollectionViewDelegate {
         } else {
             openViewer(at: indexPath)
         }
+    }
+
+    func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        dateScrubber.scrollFraction = currentScrollFraction()
     }
 }
 
