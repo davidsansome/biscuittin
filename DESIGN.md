@@ -50,9 +50,11 @@ Core surfaces:
   Rotation ships for images in v1 and for videos/Live Photos in M9 — the
   architecture supports all three from day one (D10).
 - Reliable background upload sync with a visible "not backed up" count.
+- Semantic photo search that works fully offline (requirement 15, M10, §19).
 
 ### Non-Goals (v1)
-- Albums, favorites, search, people/faces, memories, shared libraries.
+- Albums, favorites, people/faces, memories, shared libraries.
+  (Search was a non-goal at review; promoted to requirement 15 on 2026-08-29 — §19.)
 - Multi-account / multi-server support.
 - Downloading remote originals for permanent offline storage (beyond caches).
 - Any edits other than 90° rotation.
@@ -90,6 +92,9 @@ downstream assumes them as written.
 | **D19** | Instant startup: boot cache + staged init | At `scenePhase` background (and after each index change, debounced), `TimelineStore` serializes its stub index + current grouping to a **compact binary boot cache** (single flat file, versioned header). At launch, the grid renders **from the boot cache before PhotoKit or GRDB are touched** — target first grid frame < 300 ms cold. PhotoKit authorization check, live re-index, delta sync, and `SyncEngine` all start **after** the first frame is committed, in that order of priority. Cache staleness is invisible: the live index reconciles via diffable-snapshot diff (cells fade in/out, scroll position preserved). A missing/corrupt/version-mismatched cache falls back to the normal path. | The single biggest startup cost is enumerating PhotoKit + querying SQLite before showing anything. Rendering yesterday's index instantly and reconciling quietly is how Photos-class apps feel instant. Flat file (not GRDB) so the read is one `mmap`-friendly sequential load with zero SQLite warm-up on the critical path. |
 | **D20** | Responsiveness contract | Codified rules in §14 that all implementing agents must follow: incremental index updates (no full rebuild on the change path), optimistic mutations with rollback, zero awaits in gesture/tap handlers, zero synchronous I/O or image decode on the main thread, all network calls cancellable + off-main with the UI never blocked on them. | These are architectural obligations, not optimizations — several APIs below (e.g. `applyChange`, `ActionOutcome` rollback tokens) exist specifically to make the fast path the only path. |
 
+| **D21** | Search architecture | **Fully on-device semantic search**: a bundled CLIP-family model embeds every asset locally; queries are embedded and ranked on-device. The Immich server is not involved in any search. | The requirement is offline search, and the server can never index local-only photos. Rejected: (a) `POST /api/search/smart` — verified working on the live v3.1.0 server, but online-only and blind to assets not yet uploaded; (b) exporting the server's pgvector embeddings — no API exposes them (verified: search endpoints return assets, never vectors), it would couple us to the server's model choice, and still misses local-only photos. One code path that always works beats two that each sometimes do. |
+| **D22** | Search model & packaging | **MobileCLIP-S0** CoreML pair (image + text encoder, ~110 MB fp16, 512-dim) from Apple's official `apple/coreml-mobileclip` release, fetched at build time by a `Tools/fetch_models.sh` script (not committed to git) and bundled into the app; CLIP BPE tokenizer implemented in Swift with the vocab bundled. Every embedding row records `model_version`; a model upgrade triggers a staged re-embed. | S0's zero-shot quality ≈ OpenAI ViT-B/16 — *better* than the server's default ViT-B-32 — at a fraction of the latency. Matching the server's exact model buys nothing (embeddings never cross the wire, D21). MobileCLIP2 or S2 are drop-in upgrades behind `model_version` if quality disappoints; decided by measurement, not up front. |
+| **D23** | Embedding store & query path | Embeddings live in a GRDB table keyed by `AssetID.raw`: 512-dim **fp16 blobs** (1 KB/asset). Queries run as a **brute-force cosine scan** via Accelerate in chunks, returning the **top-K (200) ranked** — no similarity threshold, no ANN index. | At 100k assets a full scan is ~50M multiply-adds — milliseconds on any supported device — and fp16 keeps 100k assets ≈ 100 MB on disk, ~1 MB per 1k in the scan cache. CLIP thresholds are notoriously model- and query-dependent; ranking (as Immich itself does) sidesteps tuning. ANN adds build/update complexity that nothing below ~1M vectors needs. |
 ---
 
 ## 4. High-Level Architecture
@@ -820,6 +825,12 @@ Non-negotiable rules for every implementing agent. PR-blocking, not aspirational
   on a mid-range device verifying: P1 budget, 120 Hz scroll without dropped
   frames in cached regions, and photo-capture-to-grid latency.
 
+- **P8 — Search feels instant and indexing is invisible.** Query-to-ranked-results
+  < 150 ms on a 10k-asset library (text encode + scan + snapshot apply). Live
+  search re-runs per keystroke, debounced 250 ms, previous query cancelled. All
+  encoding — image and text — happens off the main thread; the image encoder is
+  resident only while an indexing batch runs; indexing obeys P6 (yields to
+  scrolling, `.utility` QoS) and must never drop grid frames.
 ---
 
 ## 15. Cross-Cutting Concerns
@@ -889,6 +900,10 @@ boot cache and incremental paths are foundations, not retrofits.
    (`PHLivePhotoEditingContext`), remote replacement for both, enable rotate
    controls for all kinds, confirm Live Photo paired-video handling against the
    v3.1.0 spec.
+10. **M10 — On-device search (D21–D23, §19)**: model fetch script + bundling,
+    Swift CLIP tokenizer (unit-tested against reference vectors), embedding
+    store, `SearchIndexer` background pass (local + remote-only assets),
+    query engine, search UI on the grid. *(req 15; P8)*
 
 ---
 
@@ -912,9 +927,158 @@ boot cache and incremental paths are foundations, not retrofits.
    timeline updates + optimistic mutations (D20), and the §14 responsiveness
    contract with measurable budgets (P1–P7), enforced from M1.
 
+**2026-08-29:**
+7. **Search added as requirement 15, and it must work offline** → on-device
+   CLIP embedding + ranking, no server involvement (D21–D23, §19, M10, P8).
+   The user's opening question — could we reuse Immich's search model or
+   database? — is answered in §19.1: the API was probed and exposes results,
+   never embeddings.
+
 ---
 
-## 19. Implementation Log
+## 19. Search (M10)
+
+Added 2026-08-29. Requirement 15: type a natural-language query ("dog on a
+beach", "birthday cake") and get ranked matching photos — online or offline.
+
+### 19.1 Why not the server's search?
+
+Three architectures were considered. The first two were investigated against
+the live v3.1.0 server before being rejected, not assumed away:
+
+1. **Use `POST /api/search/smart`.** Verified working: the server runs a CLIP
+   model (default `ViT-B-32__openai`) in its machine-learning container,
+   embeds every uploaded asset into pgvector, and the endpoint returns a
+   ranked page of assets for a text query. Rejected as the primary path:
+   it needs the network, and it can only ever rank assets that have been
+   uploaded — a local-only photo is invisible to it. Offline search is the
+   requirement, not a nice-to-have (D12's offline-first stance applies).
+2. **Download the server's model or embeddings.** The API was probed for any
+   endpoint exposing embeddings or vectors: there is none — every search
+   endpoint returns assets, and the pgvector table is internal to the server.
+   Scraping Postgres directly is not a client surface, would break on server
+   upgrades, couples us to whatever CLIP model the *server* happens to run
+   (a user-configurable setting), and still misses local-only photos. The
+   idea's one real attraction — reusing the server's per-asset compute —
+   buys nothing here: embedding a photo on-device costs milliseconds, and we
+   would still need the model locally to embed *queries* offline anyway.
+3. **Embed everything on-device.** Chosen (D21). One code path, works
+   offline, covers every asset in the merged timeline regardless of facet.
+   The cost — bundling a ~110 MB model and a one-time indexing pass over the
+   library — is bounded and measurable.
+
+The server's smart search remains untouched and available; a future hybrid
+(union of local and server results when online) is listed in §19.7.
+
+### 19.2 Components
+
+```
+SearchIndexer (actor)      background pass: unembedded assets → CLIP image
+                           encoder → EmbeddingStore. Obeys P6/P8.
+EmbeddingStore             GRDB table + chunked scan cache (D23).
+QueryEngine                tokenizer → CLIP text encoder → top-K scan.
+CLIPTokenizer              Swift BPE, 77-token context, bundled vocab.
+SearchViewController       UISearchController on the grid; results reuse
+                           AssetCell and the flattened-viewer path.
+```
+
+All of it hangs off `AppEnvironment` like every other service; zero I/O at
+init (D19). The indexer starts from `StartupSequencer` *after* delta sync and
+`SyncEngine.kick()` — search is the lowest-priority background work.
+
+### 19.3 Embedding store (D23)
+
+```sql
+CREATE TABLE clip_embedding (
+  asset_id      TEXT PRIMARY KEY,   -- AssetID.raw ("L:…" or "R:…")
+  model_version TEXT NOT NULL,      -- e.g. "mobileclip-s0-v1"
+  vector        BLOB NOT NULL,      -- 512 × fp16, little-endian
+  indexed_at    REAL NOT NULL
+);
+```
+
+- **Keying by `AssetID.raw`** means a linked asset (local + remote facet) is
+  embedded once, under whichever id the timeline shows it as. If Free Up
+  Space (D18) later flips an asset to remote-only, its id changes from `L:`
+  to `R:` — the old row is pruned and the asset re-embedded from the remote
+  thumb on the next pass. Rare enough not to special-case.
+- **Invalidation:** rotation and other content edits re-embed (CLIP is not
+  rotation-invariant) — the indexer subscribes to the same reconfigured-ids
+  signal the grid uses (§9). Deleted assets are pruned by the id-diff below.
+  A `model_version` mismatch re-embeds lazily, oldest first.
+
+### 19.4 Indexing pipeline
+
+Each pass: take the current timeline index's id set, diff against
+`clip_embedding` — inserts to embed, orphans to prune. The table is its own
+checkpoint; there is no separate progress state to corrupt.
+
+- **Source pixels, local facets:** `PHCachingImageManager` at 256 px
+  aspect-fill — the same request shape the grid uses (D13), and media-kind
+  agnostic: PhotoKit serves video posters and Live Photo stills through the
+  identical call.
+- **Source pixels, remote-only facets:** the cached grid `thumbnail` when
+  present, else fetched via `RemoteImageFetcher` when online, else skipped —
+  the id-diff naturally retries next pass. CLIP sees 224 px inputs; a 256 px
+  thumb loses nothing.
+- **Batching:** 32 images per CoreML batch, `Task.yield()` between batches,
+  `.utility` QoS, paused while the grid reports active scrolling (P6). The
+  image encoder is loaded at batch-run start and released when the queue
+  empties (P8) — it is the only part of the model with a meaningful resident
+  footprint.
+- **Big backlogs** (first index of an existing library): also registered as a
+  second `BGProcessingTask` with `requiresExternalPower = true`, through the
+  existing `BackgroundTaskRegistrar` (its register-before-launch rule
+  applies — see AGENTS.md on the uncatchable `submit` crash).
+
+Throughput target: ≥ 5 assets/s foreground without jank; a 10k library
+finishes in well under an hour of cumulative foreground time, or one charge
+session.
+
+### 19.5 Query path
+
+1. Tokenize (Swift BPE — unit-tested against reference token ids from the
+   Python implementation, the same class of test as the rotation corners).
+2. Text-encode via CoreML. The text encoder (~85 MB of the ~110 MB pair) is
+   loaded when the search UI opens and released when it closes or on memory
+   warning — not resident for the app's life.
+3. Normalize; scan the store in chunks (4096 vectors: fp16 → fp32 convert +
+   `vDSP` dot products), keep a running top-K heap, K = 200.
+4. Map ids through the live timeline index — an embedding row whose asset
+   has vanished mid-scan simply drops out.
+5. Publish as a `TimelineSnapshot`-shaped result (one "Results" bucket) so
+   the grid, cell, prefetch, and viewer paths are reused unchanged.
+
+Scan cache: chunks are cached in memory up to 32 MB (≈ 32k assets); beyond
+that the tail streams from SQLite each query. At the current 2.7k-asset
+scale the whole matrix is 2.8 MB — one chunk.
+
+### 19.6 UI
+
+- Search icon in the grid nav bar → `UISearchController`; the results grid
+  replaces the timeline in place, Cancel restores it (scroll position kept).
+- Live search per keystroke, 250 ms debounce, in-flight query cancelled by
+  the next (P8). No spinner-first flow: results update in place (P4).
+- Tap opens the standard viewer over the *result* list (flattened order =
+  rank order). Multi-select works in results like in the timeline.
+- Queries never leave the device — worth a line in the Settings/about text,
+  since users reasonably assume search means server round-trips.
+
+### 19.7 Explicitly out of scope (futures)
+
+- **OCR text-in-image search** (the server runs PP-OCRv5; an on-device
+  equivalent is a separate model and pipeline).
+- **Face/person search** (`buffalo_l` server-side; a much bigger feature).
+- **Hybrid online union** with `search/smart` for sharper ranking when
+  online — the one place the server API earns a role; needs rank fusion.
+- **Metadata query grammar** ("june 2024 videos") — the scrubber and
+  grouping cover date navigation for now.
+- **ANN index** — revisit only if a real library pushes the brute-force scan
+  past the P8 budget; the store schema does not change either way.
+
+---
+
+## 20. Implementation Log
 
 ### M1 — complete (2026-08-18)
 
