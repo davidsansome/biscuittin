@@ -18,6 +18,10 @@ struct RemoteAssetRecord: Codable, FetchableRecord, PersistableRecord, Equatable
     var height: Int?
     var isTrashed: Bool
     var exifJSON: String?
+    /// Promoted out of `exif_json` so the timeline can build map-ready stubs without decoding
+    /// JSON per asset (§20.1).
+    var latitude: Double?
+    var longitude: Double?
     var updatedAt: Double
 
     enum CodingKeys: String, CodingKey {
@@ -33,6 +37,7 @@ struct RemoteAssetRecord: Codable, FetchableRecord, PersistableRecord, Equatable
         case width, height
         case isTrashed = "is_trashed"
         case exifJSON = "exif_json"
+        case latitude, longitude
         case updatedAt = "updated_at"
     }
 
@@ -49,7 +54,9 @@ struct RemoteAssetRecord: Codable, FetchableRecord, PersistableRecord, Equatable
                   kind: mediaKind,
                   durationSeconds: Float(durationSeconds),
                   pixelWidth: Int32(clamping: width ?? 0),
-                  pixelHeight: Int32(clamping: height ?? 0))
+                  pixelHeight: Int32(clamping: height ?? 0),
+                  latitude: latitude.map(Float.init) ?? .nan,
+                  longitude: longitude.map(Float.init) ?? .nan)
     }
 
     init(_ asset: Immich.Asset) {
@@ -69,6 +76,8 @@ struct RemoteAssetRecord: Codable, FetchableRecord, PersistableRecord, Equatable
         exifJSON = asset.exifInfo.flatMap { info in
             (try? JSONEncoder().encode(info)).flatMap { String(data: $0, encoding: .utf8) }
         }
+        latitude = asset.exifInfo?.latitude
+        longitude = asset.exifInfo?.longitude
         updatedAt = (asset.updatedDate ?? Date()).timeIntervalSince1970
     }
 

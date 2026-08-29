@@ -51,6 +51,8 @@ Core surfaces:
   architecture supports all three from day one (D10).
 - Reliable background upload sync with a visible "not backed up" count.
 - Semantic photo search that works fully offline (requirement 15, M10, §19).
+- A map of where photos were taken, with the grid filtered to the visible
+  region (requirement 16, M11, §20).
 
 ### Non-Goals (v1)
 - Albums, favorites, people/faces, memories, shared libraries.
@@ -95,6 +97,7 @@ downstream assumes them as written.
 | **D21** | Search architecture | **Fully on-device semantic search**: a bundled CLIP-family model embeds every asset locally; queries are embedded and ranked on-device. The Immich server is not involved in any search. | The requirement is offline search, and the server can never index local-only photos. Rejected: (a) `POST /api/search/smart` — verified working on the live v3.1.0 server, but online-only and blind to assets not yet uploaded; (b) exporting the server's pgvector embeddings — no API exposes them (verified: search endpoints return assets, never vectors), it would couple us to the server's model choice, and still misses local-only photos. One code path that always works beats two that each sometimes do. |
 | **D22** | Search model & packaging | **MobileCLIP-S0** CoreML pair (image + text encoder, ~110 MB fp16, 512-dim) from Apple's official `apple/coreml-mobileclip` release, fetched at build time by a `Tools/fetch_models.sh` script (not committed to git) and bundled into the app; CLIP BPE tokenizer implemented in Swift with the vocab bundled. Every embedding row records `model_version`; a model upgrade triggers a staged re-embed. | S0's zero-shot quality ≈ OpenAI ViT-B/16 — *better* than the server's default ViT-B-32 — at a fraction of the latency. Matching the server's exact model buys nothing (embeddings never cross the wire, D21). MobileCLIP2 or S2 are drop-in upgrades behind `model_version` if quality disappoints; decided by measurement, not up front. |
 | **D23** | Embedding store & query path | Embeddings live in a GRDB table keyed by `AssetID.raw`: 512-dim **fp16 blobs** (1 KB/asset). Queries run as a **brute-force cosine scan** via Accelerate in chunks, returning the **top-K (200) ranked** — no similarity threshold, no ANN index. | At 100k assets a full scan is ~50M multiply-adds — milliseconds on any supported device — and fp16 keeps 100k assets ≈ 100 MB on disk, ~1 MB per 1k in the scan cache. CLIP thresholds are notoriously model- and query-dependent; ranking (as Immich itself does) sidesteps tuning. ANN adds build/update complexity that nothing below ~1M vectors needs. |
+| **D24** | Map data path | Capture coordinates live **on `AssetStub`** (two `Float`s, `.nan` for absent) rather than being fetched per asset: filtering by map region is then an in-memory scan over the timeline index. Remote coordinates are promoted from `exif_json` into `latitude`/`longitude` columns on `remote_assets`. Boot cache goes to format v2. | Filtering must keep up with a pan, which rules out a query per map move. Measured first (§20.1): reading `PHAsset.location` during enumeration costs nothing, and 88 % of a real library carries coordinates — the two facts that made carrying them in the stub viable. `Float` gives ~1 m resolution, far finer than a dot needs, and `.nan` encodes absence without a tag byte. Alternative rejected: a separate lazily-populated location table, which is the shape M10's embeddings need but is pure overhead when the source data is already free to read.
 ---
 
 ## 4. High-Level Architecture
@@ -904,6 +907,9 @@ boot cache and incremental paths are foundations, not retrofits.
     Swift CLIP tokenizer (unit-tested against reference vectors), embedding
     store, `SearchIndexer` background pass (local + remote-only assets),
     query engine, search UI on the grid. *(req 15; P8)*
+11. **M11 — Map (D24, §20)**: coordinates on `AssetStub` (boot-cache format v2),
+    coordinate columns on `remote_assets`, split map/grid screen with region
+    filtering, two-stop drag handle. *(req 16)*
 
 ---
 
@@ -1091,7 +1097,103 @@ scale the whole matrix is 2.8 MB — one chunk.
 
 ---
 
-## 20. Implementation Log
+## 20. Map (M11)
+
+Added 2026-08-29. Requirement 16: a map of where photos were taken, above a grid
+filtered to whatever the map is showing.
+
+### 20.1 Where coordinates live, and why (D24)
+
+Filtering has to track a pan, so it must be an in-memory scan — a query per map
+move would lag the gesture. That means a coordinate on every `AssetStub`, which
+is only affordable if reading one is cheap. Measured on an iPhone 13 over 2,643
+local assets before writing any of it:
+
+| | |
+|---|---|
+| Enumeration, current properties | 8 ms |
+| Same, plus `PHAsset.location` | 6 ms |
+| Assets carrying coordinates | 2,329 of 2,643 (88 %) |
+
+Reading location is free, so it goes in the stub: two `Float`s (~1 m resolution,
+far finer than a dot needs) with `.nan` for absent, keeping the record flat and
+tag-free. The boot cache is format **v2**; a v1 file is rejected rather than
+misread, since the record grew by eight bytes and every field after the first
+record would otherwise slide.
+
+**The first version of that measurement was wrong**, and instructively so. Run as
+control-then-variant, the *variant* came out 8× faster — an artefact of the first
+pass paying PhotoKit's faulting cost for the whole library. The numbers above come
+from a warm-up pass followed by alternating order, reporting both. A first-touch
+cost attributed to whichever branch happens to run first is a general hazard when
+benchmarking anything lazily faulted.
+
+Remote coordinates are promoted out of `exif_json` into `latitude`/`longitude`
+columns (migration `v3-remote-coordinates`, with a backfill so existing installs
+populate without a re-sync). The timeline builds a stub per remote asset on every
+rebuild; decoding a JSON blob per asset to reach two numbers would put that on a
+hot path.
+
+### 20.2 The split, and why the map is clipped rather than resized
+
+Two stops only — bar centred, or raised to 10 % — snapping between them. Free
+positioning shipped first and was disorienting in exactly the way that matters:
+shrinking the map narrowed its visible region, which silently dropped photos from
+the grid, so a gesture about *layout* changed *content*.
+
+The fix is not arithmetic. The map is a **fixed-height view inside a clipping
+container**; only the container changes height, and the map's region never moves.
+Raising the bar reveals the middle strip of the same map.
+
+The first attempt did try arithmetic — expand the visible rect back to the height
+it would cover at the centred stop — and instrumenting the filter count is what
+showed it was wrong:
+
+```
+mapH 82 | visibleH 19578784 -> filterH 97814006   150 photos
+mapH 82 | visibleH  8630647 -> filterH 43118010     0 photos
+```
+
+Two region callbacks per drag: the first preserves zoom (so the correction worked),
+and a second arrives with a completely different region, because **`MKMapView`
+re-adjusts its own region after a resize**. The compensation was chasing a moving
+target. Clipping makes the filter invariant by construction instead of by
+correction. Verified after the change — 150 photos at both stops, 127 at both
+after zooming in, with `mapH` constant at 408 throughout.
+
+### 20.3 The grid half is the real grid
+
+`GridViewController` gained a `Mode`: `.timeline` (home screen, owns the timeline
+and its chrome) and `.map` (a panel driven entirely by `showExternalSnapshot`).
+The map's lower half is therefore the same code as the home screen, so tiles,
+prefetching, pinch columns, multi-select and the zoom transition into the viewer
+all behave identically — because they *are* identical. `.map` suppresses the
+search bar, date scrubber and navigation items, none of which belong in a panel
+filtered by geography.
+
+Region changes are coalesced (120 ms) rather than applied per callback, since a
+pan fires them continuously and re-applying a diffable snapshot each time would
+fight the gesture (§14 P4). Snapshots are applied with a reload rather than a
+diff: consecutive regions share most of their photos but differ in *order*, and
+animating a reorder of a few hundred tiles per pan is both costly and noisy.
+
+Dots are plain red circles with `isEnabled = false` — a density display, not tap
+targets. The grid below is how photos are opened.
+
+### 20.4 Not built
+
+- **Clustering.** At 2.3k dots MapKit's own collision handling is enough. A
+  library with a dense city cluster may want real clustering; that is a change to
+  the annotation layer alone.
+- **Filtering to a dot.** Tapping a dot to isolate that photo was considered and
+  dropped: dots overlap at any realistic zoom, so the tap target is ambiguous.
+- **Coordinates for remote-only assets in the boot cache** are whatever the last
+  sync wrote; an asset whose EXIF arrives later appears on the map after the next
+  rebuild rather than immediately.
+
+---
+
+## 21. Implementation Log
 
 
 ### M10 — complete (2026-08-29)

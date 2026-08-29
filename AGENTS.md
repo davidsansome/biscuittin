@@ -263,6 +263,27 @@ have come first — log the store's row count, not the absence of progress lines
 Absence of logging is never evidence of absence of work. Prove the negative with a
 positive reading of state.
 
+## Benchmarking anything lazily faulted: warm up, then alternate
+
+Deciding whether photo coordinates could live on every `AssetStub` came down to
+one question — does reading `PHAsset.location` during enumeration cost anything?
+The first measurement said the variant *with* the extra property was 8× faster
+than the control without it.
+
+That is not a surprising result, it is an impossible one, and it should have been
+read as a broken experiment rather than a finding. PhotoKit faults property values
+on first touch, so whichever pass runs first pays for the whole library. The
+control ran first and absorbed the cost.
+
+Corrected shape: a warm-up pass over every property either branch will touch, then
+run the branches in **both orders**, and report all four numbers plus the best of
+each. The honest answer was 8 ms versus 6 ms — free, which is what unlocked the
+design. Applies to anything with first-touch cost: Core Data faults, lazily
+decoded images, memory-mapped files, a cold SQLite page cache.
+
+**A result that is too good is a bug in the measurement.** Reach for the ordering
+explanation before the flattering one.
+
 ## Conventions
 
 - Swift Concurrency throughout; `actor` or `@MainActor` types, no Combine except where UIKit

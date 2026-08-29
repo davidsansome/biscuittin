@@ -9,10 +9,21 @@ import Photos
 /// a diffable data source, custom pinch relayout, and (from M2) a custom zoom transition.
 final class GridViewController: UIViewController {
 
+    /// Where this grid is being used. The home screen owns the timeline and its chrome; the map
+    /// panel (§20) is handed a filtered snapshot and must not draw a search bar, a date scrubber
+    /// or navigation items of its own.
+    enum Mode {
+        /// Home screen: subscribes to the timeline, full chrome.
+        case timeline
+        /// A panel inside another screen, driven entirely by `showExternalSnapshot`.
+        case map
+    }
+
     private typealias DataSource = UICollectionViewDiffableDataSource<String, AssetID>
     private typealias Snapshot = NSDiffableDataSourceSnapshot<String, AssetID>
 
     private let env: AppEnvironment
+    private let mode: Mode
     private var collectionView: UICollectionView!
     private var dataSource: DataSource!
     private var pinchController: PinchColumnsController
@@ -35,6 +46,7 @@ final class GridViewController: UIViewController {
     private let selectionToolbar = SelectionToolbar()
     private var selectionToolbarBottom: NSLayoutConstraint?
     private var defaultRightBarButtonItem: UIBarButtonItem?
+    private var mapBarButtonItem: UIBarButtonItem?
 
     private let dateScrubber = DateScrubber()
 
@@ -74,8 +86,9 @@ final class GridViewController: UIViewController {
         return button
     }()
 
-    init(env: AppEnvironment) {
+    init(env: AppEnvironment, mode: Mode = .timeline) {
         self.env = env
+        self.mode = mode
         self.columns = env.settings.gridColumns
         self.pinchController = PinchColumnsController(columns: env.settings.gridColumns)
         self.timeline = .empty(grouping: env.settings.grouping, provenance: .bootCache)
@@ -96,8 +109,18 @@ final class GridViewController: UIViewController {
 
         configureCollectionView()
         configureDataSource()
-        configureNavigationItem()
         configureStatusViews()
+
+        guard mode == .timeline else {
+            // The map panel gets its content pushed in; everything below drives or decorates the
+            // home screen's own timeline.
+            configureSelection()
+            return
+        }
+
+        // Before `configureSelection`: its initial `selectionDidChange` installs the right-hand
+        // bar items, and would otherwise install them while they are still nil.
+        configureNavigationItem()
         configureSelection()
         configureDateScrubber()
         configureSearch()
@@ -108,9 +131,23 @@ final class GridViewController: UIViewController {
         Task { await env.timelineStore.loadBootSnapshot() }
     }
 
+    /// Displays a snapshot chosen by an owning screen (the map's region filter, §20). Only valid
+    /// in `.map` mode; the timeline grid publishes its own content.
+    func showExternalSnapshot(_ snapshot: TimelineSnapshot) {
+        guard mode == .map, isViewLoaded else { return }
+        let isFirst = timeline.isEmpty
+        timeline = snapshot
+        selection.retain(only: Set(snapshot.buckets.flatMap { $0.items.map(\.id) }))
+        // Reload rather than diff: consecutive map regions share most of their photos but the
+        // *order* is what changed, and animating a reorder of a few hundred tiles per pan is
+        // both expensive and visually noisy.
+        applyDisplayedSnapshot(reloading: true)
+        if !isFirst { collectionView.setContentOffset(.zero, animated: false) }
+    }
+
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
-        guard !hasSignalledFirstFrame else { return }
+        guard mode == .timeline, !hasSignalledFirstFrame else { return }
         hasSignalledFirstFrame = true
         // §14 P1: measured here because this is the first moment the grid is actually visible.
         LaunchClock.reportFirstFrame(
@@ -135,8 +172,9 @@ final class GridViewController: UIViewController {
         collectionView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         collectionView.backgroundColor = .systemBackground
         collectionView.alwaysBounceVertical = true
-        // The date scrubber replaces the system indicator; showing both is a duplicate.
-        collectionView.showsVerticalScrollIndicator = false
+        // The date scrubber replaces the system indicator; showing both is a duplicate. The map
+        // panel has no scrubber, so there it keeps the system one.
+        collectionView.showsVerticalScrollIndicator = (mode == .map)
         collectionView.register(AssetCell.self, forCellWithReuseIdentifier: AssetCell.reuseIdentifier)
         collectionView.register(BucketHeaderView.self,
                                 forSupplementaryViewOfKind: UICollectionView.elementKindSectionHeader,
@@ -184,7 +222,13 @@ final class GridViewController: UIViewController {
         let item = UIBarButtonItem(image: UIImage(systemName: "square.grid.2x2"),
                                    menu: makeGroupingMenu())
         defaultRightBarButtonItem = item
-        navigationItem.rightBarButtonItem = item
+        mapBarButtonItem = UIBarButtonItem(image: UIImage(systemName: "map"),
+                                           style: .plain,
+                                           target: self,
+                                           action: #selector(presentMap))
+        mapBarButtonItem?.accessibilityLabel = "Map"
+        // `rightBarButtonItems` is ordered right-to-left, so the map sits outermost.
+        navigationItem.rightBarButtonItems = [mapBarButtonItem, item].compactMap { $0 }
         navigationItem.leftBarButtonItems = [
             UIBarButtonItem(image: UIImage(systemName: "gearshape"),
                             style: .plain,
@@ -224,6 +268,14 @@ final class GridViewController: UIViewController {
         backupIndicatorButton.accessibilityLabel = status.remainingCount > 0
             ? "\(status.remainingCount) items waiting to back up"
             : "All items backed up"
+    }
+
+    /// Full screen: the map owns the whole window, and its own close button dismisses it
+    /// (§20.2). A sheet would put a second dismissal affordance next to that one.
+    @objc private func presentMap() {
+        let map = MapViewController(env: env)
+        map.modalPresentationStyle = .fullScreen
+        present(map, animated: true)
     }
 
     @objc private func presentSettings() {
@@ -372,10 +424,10 @@ final class GridViewController: UIViewController {
         let active = selection.isActive
 
         // Nav bar reflects the mode: count and Cancel while selecting, grouping menu otherwise.
-        navigationItem.rightBarButtonItem = active
-            ? UIBarButtonItem(title: "Cancel", style: .done, target: self,
-                              action: #selector(cancelSelection))
-            : defaultRightBarButtonItem
+        navigationItem.rightBarButtonItems = active
+            ? [UIBarButtonItem(title: "Cancel", style: .done, target: self,
+                               action: #selector(cancelSelection))]
+            : [mapBarButtonItem, defaultRightBarButtonItem].compactMap { $0 }
         title = active
             ? (selection.isEmpty ? "Select Items" : "\(selection.count) Selected")
             : "Photos"

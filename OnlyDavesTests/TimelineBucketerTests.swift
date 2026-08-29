@@ -23,7 +23,8 @@ final class TimelineBucketerTests: XCTestCase {
 
     private func stub(_ id: String, _ iso: String) -> AssetStub {
         AssetStub(id: AssetID(raw: id), captureDate: date(iso), hasLocal: true, hasRemote: false,
-                  kind: .image, durationSeconds: 0, pixelWidth: 100, pixelHeight: 100)
+                  kind: .image, durationSeconds: 0, pixelWidth: 100, pixelHeight: 100,
+                  latitude: .nan, longitude: .nan)
     }
 
     /// Bucketing assumes a newest-first input, which is what `TimelineIndex` guarantees.

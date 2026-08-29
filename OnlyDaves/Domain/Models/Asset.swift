@@ -1,4 +1,5 @@
 import Foundation
+import CoreLocation
 
 /// Stable app-level identity for one asset, regardless of where it lives (DESIGN.md D5).
 /// The raw value is namespaced by the facet that introduced it, so a local-only and a
@@ -52,8 +53,23 @@ struct AssetStub: Hashable {
     let durationSeconds: Float
     let pixelWidth: Int32
     let pixelHeight: Int32
+    /// Capture coordinates, when the asset carries them (§20). Stored as `Float` rather than
+    /// `Double` and as two fields rather than a `CLLocationCoordinate2D?`, to keep the stub flat
+    /// and small — it is also the boot-cache record (D19). `Float` resolves to roughly a metre
+    /// at these magnitudes, far finer than a map dot needs, and `.nan` encodes "no location"
+    /// without a byte of tag. Reading `PHAsset.location` during enumeration was measured to cost
+    /// nothing (§20.1), which is what made carrying it here viable.
+    let latitude: Float
+    let longitude: Float
 
     var isRemoteOnly: Bool { hasRemote && !hasLocal }
+
+    var hasCoordinate: Bool { !latitude.isNaN && !longitude.isNaN }
+
+    var coordinate: CLLocationCoordinate2D? {
+        guard hasCoordinate else { return nil }
+        return CLLocationCoordinate2D(latitude: Double(latitude), longitude: Double(longitude))
+    }
 
     var aspectRatio: CGFloat {
         guard pixelWidth > 0, pixelHeight > 0 else { return 1 }
@@ -69,7 +85,24 @@ struct AssetStub: Hashable {
                   kind: kind,
                   durationSeconds: durationSeconds,
                   pixelWidth: pixelWidth,
-                  pixelHeight: pixelHeight)
+                  pixelHeight: pixelHeight,
+                  latitude: latitude,
+                  longitude: longitude)
+    }
+
+    /// Returns a copy carrying a coordinate, used when remote EXIF supplies one the local
+    /// facet lacked.
+    func withCoordinate(latitude: Float, longitude: Float) -> AssetStub {
+        AssetStub(id: id,
+                  captureDate: captureDate,
+                  hasLocal: hasLocal,
+                  hasRemote: hasRemote,
+                  kind: kind,
+                  durationSeconds: durationSeconds,
+                  pixelWidth: pixelWidth,
+                  pixelHeight: pixelHeight,
+                  latitude: latitude,
+                  longitude: longitude)
     }
 }
 

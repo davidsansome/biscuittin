@@ -154,7 +154,9 @@ actor PhotoActionService {
                                                   kind: stub.kind,
                                                   durationSeconds: stub.durationSeconds,
                                                   pixelWidth: stub.pixelHeight,
-                                                  pixelHeight: stub.pixelWidth))
+                                                  pixelHeight: stub.pixelWidth,
+                                                  latitude: stub.latitude,
+                                                  longitude: stub.longitude))
                 }
             }
         }

@@ -16,7 +16,9 @@ final class TimelineIndexTests: XCTestCase {
                   kind: kind,
                   durationSeconds: kind == .video ? 12 : 0,
                   pixelWidth: 4032,
-                  pixelHeight: 3024)
+                  pixelHeight: 3024,
+                  latitude: .nan,
+                  longitude: .nan)
     }
 
     private func assertSortedNewestFirst(_ index: TimelineIndex,
@@ -167,7 +169,8 @@ final class RemoteMergeVisibilityTests: XCTestCase {
         AssetStub(id: .remote(immichID),
                   captureDate: Date(timeIntervalSince1970: 1_700_000_000),
                   hasLocal: false, hasRemote: true, kind: .image,
-                  durationSeconds: 0, pixelWidth: 100, pixelHeight: 100)
+                  durationSeconds: 0, pixelWidth: 100, pixelHeight: 100,
+                  latitude: .nan, longitude: .nan)
     }
 
     private func mergeData() -> RemoteMergeData {

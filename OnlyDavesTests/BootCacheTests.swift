@@ -7,7 +7,11 @@ import XCTest
 /// rather than crash or produce a partial index.
 final class BootCacheTests: XCTestCase {
 
-    private func stub(_ id: String, _ offset: Double, kind: MediaKind = .image) -> AssetStub {
+    private func stub(_ id: String,
+                      _ offset: Double,
+                      kind: MediaKind = .image,
+                      latitude: Float = 51.5074,
+                      longitude: Float = -0.1278) -> AssetStub {
         AssetStub(id: AssetID(raw: id),
                   captureDate: Date(timeIntervalSinceReferenceDate: 700_000_000 - offset),
                   hasLocal: offset.truncatingRemainder(dividingBy: 2) == 0,
@@ -15,14 +19,19 @@ final class BootCacheTests: XCTestCase {
                   kind: kind,
                   durationSeconds: kind == .video ? 42.5 : 0,
                   pixelWidth: 4032,
-                  pixelHeight: 3024)
+                  pixelHeight: 3024,
+                  latitude: latitude,
+                  longitude: longitude)
     }
 
     func testRoundTripPreservesEveryField() {
         let original = [
             stub("L:local-1", 0),
             stub("R:remote-2", 1, kind: .video),
-            stub("L:live-3", 2, kind: .livePhoto)
+            stub("L:live-3", 2, kind: .livePhoto),
+            // Southern/western hemisphere, to catch a sign lost in encoding.
+            stub("L:south-4", 3, latitude: -33.8688, longitude: 151.2093),
+            stub("L:nowhere-5", 4, latitude: .nan, longitude: .nan)
         ]
         let data = BootCache.encode(stubs: original, grouping: .week)
         let decoded = BootCache.decode(data)
@@ -40,7 +49,24 @@ final class BootCacheTests: XCTestCase {
             XCTAssertEqual(lhs.durationSeconds, rhs.durationSeconds, accuracy: 0.001)
             XCTAssertEqual(lhs.pixelWidth, rhs.pixelWidth)
             XCTAssertEqual(lhs.pixelHeight, rhs.pixelHeight)
+
+            // Coordinates are the v2 addition (§20). `.nan` is the encoding for "no location",
+            // and NaN != NaN, so absence has to be asserted through `hasCoordinate`.
+            XCTAssertEqual(lhs.hasCoordinate, rhs.hasCoordinate)
+            if lhs.hasCoordinate {
+                XCTAssertEqual(lhs.latitude, rhs.latitude, accuracy: 0.00001)
+                XCTAssertEqual(lhs.longitude, rhs.longitude, accuracy: 0.00001)
+            }
         }
+    }
+
+    /// A cache written by the previous format must be rejected rather than misread: the record
+    /// grew by eight bytes, so decoding v1 bytes as v2 would slide every field after the first
+    /// record and produce plausible-looking garbage.
+    func testPreviousFormatVersionIsRejected() {
+        var data = BootCache.encode(stubs: [stub("L:a", 0)], grouping: .day)
+        data.replaceSubrange(4..<8, with: withUnsafeBytes(of: UInt32(1)) { Data($0) })
+        XCTAssertNil(BootCache.decode(data))
     }
 
     func testRoundTripPreservesOrder() {

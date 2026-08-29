@@ -105,6 +105,7 @@ extension AssetStub {
             kind = .image
         }
 
+        let coordinate = asset.location?.coordinate
         self.init(id: .local(asset.localIdentifier),
                   captureDate: asset.creationDate ?? asset.modificationDate ?? .distantPast,
                   hasLocal: true,
@@ -112,6 +113,8 @@ extension AssetStub {
                   kind: kind,
                   durationSeconds: kind == .video ? Float(asset.duration) : 0,
                   pixelWidth: Int32(clamping: asset.pixelWidth),
-                  pixelHeight: Int32(clamping: asset.pixelHeight))
+                  pixelHeight: Int32(clamping: asset.pixelHeight),
+                  latitude: coordinate.map { Float($0.latitude) } ?? .nan,
+                  longitude: coordinate.map { Float($0.longitude) } ?? .nan)
     }
 }

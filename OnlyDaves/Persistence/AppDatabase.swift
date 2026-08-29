@@ -112,6 +112,27 @@ final class AppDatabase: @unchecked Sendable {
             try db.create(index: "idx_clip_model", on: "clip_embedding", columns: ["model_version"])
         }
 
+        migrator.registerMigration("v3-remote-coordinates") { db in
+            // Promoted out of `exif_json` into columns: the map builds a stub for every remote
+            // asset on each index rebuild, and decoding a JSON blob per asset to reach two
+            // numbers would put that cost on a hot path (§20.1).
+            try db.alter(table: "remote_assets") { t in
+                t.add(column: "latitude", .double)
+                t.add(column: "longitude", .double)
+            }
+            // Backfill from the EXIF already cached, so existing installs get a populated map
+            // without waiting for a full re-sync.
+            let rows = try Row.fetchAll(db, sql: "SELECT immich_id, exif_json FROM remote_assets WHERE exif_json IS NOT NULL")
+            for row in rows {
+                guard let json: String = row["exif_json"],
+                      let data = json.data(using: .utf8),
+                      let exif = try? JSONDecoder().decode(Immich.ExifInfo.self, from: data),
+                      let latitude = exif.latitude, let longitude = exif.longitude else { continue }
+                try db.execute(sql: "UPDATE remote_assets SET latitude = ?, longitude = ? WHERE immich_id = ?",
+                               arguments: [latitude, longitude, row["immich_id"] as String])
+            }
+        }
+
         return migrator
     }
 }

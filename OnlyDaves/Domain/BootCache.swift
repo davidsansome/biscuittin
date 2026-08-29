@@ -15,10 +15,14 @@ final class BootCache {
 
     private enum Format {
         static let magic: UInt32 = 0x4F44_4243 // "ODBC"
-        static let version: UInt32 = 1
+        /// v2 added per-stub coordinates for the map (§20). A version bump discards the
+        /// old cache rather than misreading it; the live index repopulates within a frame.
+        static let version: UInt32 = 2
         static let headerSize = 16
         /// Fixed-size portion of a record; the UTF-8 identifier follows it.
-        static let recordFixedSize = 24
+        /// Fixed portion of one record; the variable-length id follows it.
+        /// 24 through format v1, plus 8 for the v2 coordinate pair.
+        static let recordFixedSize = 32
     }
 
     private let fileURL: URL
@@ -85,6 +89,8 @@ final class BootCache {
                       let duration = read(Float.self),
                       let width = read(Int32.self),
                       let height = read(Int32.self),
+                      let latitude = read(Float.self),
+                      let longitude = read(Float.self),
                       let flags = read(UInt8.self),
                       let kindRaw = read(UInt8.self),
                       let idLength = read(UInt16.self),
@@ -103,7 +109,9 @@ final class BootCache {
                                        kind: kind,
                                        durationSeconds: duration,
                                        pixelWidth: width,
-                                       pixelHeight: height))
+                                       pixelHeight: height,
+                                       latitude: latitude,
+                                       longitude: longitude))
             }
             return Payload(grouping: grouping, stubs: stubs)
         }
@@ -154,6 +162,8 @@ final class BootCache {
             append(stub.durationSeconds)
             append(stub.pixelWidth)
             append(stub.pixelHeight)
+            append(stub.latitude)
+            append(stub.longitude)
             append(UInt8((stub.hasLocal ? 0b01 : 0) | (stub.hasRemote ? 0b10 : 0)))
             append(stub.kind.rawValue)
             append(UInt16(idBytes.count))
