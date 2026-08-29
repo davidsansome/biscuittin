@@ -14,7 +14,7 @@ enum Log {
     /// Stamped on every `device(_:_:)` line. `devicectl --console` output carries no timestamps
     /// of its own, and without them a capture cannot distinguish work that is slow from work
     /// that merely happens later — which is the whole question when chasing a stall.
-    nonisolated(unsafe) static let processStart = CFAbsoluteTimeGetCurrent()
+    static let processStart = CFAbsoluteTimeGetCurrent()
 
     /// Mirrors a diagnostic to stderr as well as the log store.
     ///

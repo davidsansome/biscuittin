@@ -237,6 +237,7 @@ final class GridViewController: UIViewController {
         selectionToolbar.onRotateLeft = { [weak self] in self?.rotateSelection(clockwise: false) }
         selectionToolbar.onRotateRight = { [weak self] in self?.rotateSelection(clockwise: true) }
         selectionToolbar.onDelete = { [weak self] in self?.deleteSelection() }
+        selectionToolbar.onShare = { [weak self] in self?.shareSelection() }
 
         selection.onChange = { [weak self] in self?.selectionDidChange() }
         selectionDidChange()
@@ -327,6 +328,39 @@ final class GridViewController: UIViewController {
             }
             self.selection.end()
         }
+    }
+
+    private func shareSelection() {
+        let ids = selection.orderedIDs
+        guard !ids.isEmpty else { return }
+
+        Task { [weak self] in
+            guard let self else { return }
+            let (items, failures) = await self.env.shareService.activityItems(for: ids)
+            guard !items.isEmpty else {
+                let message = (failures.first?.error as? LocalizedError)?.errorDescription
+                    ?? failures.first?.error.localizedDescription
+                    ?? "Couldn’t share the selection."
+                Toast.show(message, in: self.view)
+                return
+            }
+            if !failures.isEmpty {
+                let noun = failures.count == 1 ? "1 item" : "\(failures.count) items"
+                Toast.show("\(noun) couldn’t be shared", in: self.view)
+            }
+            self.presentActivity(items: items, anchor: self.selectionToolbar.shareButton)
+        }
+    }
+
+    /// Anchors the iPad popover on the button that opened it; a nil `sourceView` crashes on
+    /// iPad the first time the share sheet is presented from a regular (non-compact) size class.
+    private func presentActivity(items: [Any], anchor: UIView) {
+        let activityVC = UIActivityViewController(activityItems: items, applicationActivities: nil)
+        if let popover = activityVC.popoverPresentationController {
+            popover.sourceView = anchor
+            popover.sourceRect = anchor.bounds
+        }
+        present(activityVC, animated: true)
     }
 
     private func confirmDelete(plan: DeletePlan) async -> Bool {

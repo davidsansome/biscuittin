@@ -4,13 +4,14 @@ import UIKit
 ///
 /// Semi-transparent with a vertical gradient — fully clear at the top, ~55 % black at the
 /// bottom — so it reads over any photo without hiding it. Back sits on the left; rotate left,
-/// rotate right, delete and info are grouped on the right.
+/// rotate right, delete, share and info are grouped on the right.
 final class ViewerToolbar: UIView {
 
     var onBack: (() -> Void)?
     var onRotateLeft: (() -> Void)?
     var onRotateRight: (() -> Void)?
     var onDelete: (() -> Void)?
+    var onShare: (() -> Void)?
     var onInfo: (() -> Void)?
 
     private let gradientLayer = CAGradientLayer()
@@ -18,6 +19,7 @@ final class ViewerToolbar: UIView {
     private let rotateLeftButton = UIButton(type: .system)
     private let rotateRightButton = UIButton(type: .system)
     private let deleteButton = UIButton(type: .system)
+    let shareButton = UIButton(type: .system)
     private let infoButton = UIButton(type: .system)
     private let rightStack = UIStackView()
 
@@ -42,6 +44,8 @@ final class ViewerToolbar: UIView {
                   accessibilityLabel: "Rotate right")
         configure(deleteButton, systemName: "trash", action: #selector(deleteTapped),
                   accessibilityLabel: "Delete")
+        configure(shareButton, systemName: "square.and.arrow.up", action: #selector(shareTapped),
+                  accessibilityLabel: "Share")
         configure(infoButton, systemName: "info.circle", action: #selector(infoTapped),
                   accessibilityLabel: "Info")
 
@@ -49,7 +53,7 @@ final class ViewerToolbar: UIView {
         rightStack.spacing = 4
         rightStack.alignment = .center
         rightStack.translatesAutoresizingMaskIntoConstraints = false
-        [rotateLeftButton, rotateRightButton, deleteButton, infoButton]
+        [rotateLeftButton, rotateRightButton, deleteButton, shareButton, infoButton]
             .forEach(rightStack.addArrangedSubview)
 
         addSubview(backButton)
@@ -108,7 +112,7 @@ final class ViewerToolbar: UIView {
     /// Touches only count inside the actual controls; the gradient area above them stays
     /// transparent to taps so the chrome toggle keeps working there.
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
-        for control in [backButton, rotateLeftButton, rotateRightButton, deleteButton, infoButton]
+        for control in [backButton, rotateLeftButton, rotateRightButton, deleteButton, shareButton, infoButton]
         where control.isEnabled && control.frame.contains(convert(point, to: control.superview)) {
             return true
         }
@@ -119,5 +123,6 @@ final class ViewerToolbar: UIView {
     @objc private func rotateLeftTapped() { onRotateLeft?() }
     @objc private func rotateRightTapped() { onRotateRight?() }
     @objc private func deleteTapped() { onDelete?() }
+    @objc private func shareTapped() { onShare?() }
     @objc private func infoTapped() { onInfo?() }
 }

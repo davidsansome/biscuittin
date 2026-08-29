@@ -17,6 +17,7 @@ final class AppEnvironment: ObservableObject {
     let startup: StartupSequencer
     let assetEditor: LocalAssetEditor
     let photoActions: PhotoActionService
+    let shareService: ShareService
     let rotators: RotatorRegistry
     let immichSession: ImmichAuthSession
     let remoteLibrary: RemoteLibraryService
@@ -73,6 +74,10 @@ final class AppEnvironment: ObservableObject {
                                                registry: rotators,
                                                imageLoader: imageLoader,
                                                remoteLibrary: remoteLibrary)
+        self.shareService = ShareService(timelineStore: timelineStore,
+                                         resolver: resolver,
+                                         remoteImages: remoteImages,
+                                         exporter: exporter)
         self.startup = StartupSequencer(localLibrary: localLibrary,
                                         timelineStore: timelineStore,
                                         remoteLibrary: remoteLibrary,

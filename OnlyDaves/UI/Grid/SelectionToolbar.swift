@@ -2,8 +2,8 @@ import UIKit
 
 /// Bottom bar shown in the grid's multi-select mode (requirement 11).
 ///
-/// Mirrors the viewer toolbar's action set — back, rotate left, rotate right, delete — but sits
-/// on a material background rather than a gradient, because it appears over the light grid
+/// Mirrors the viewer toolbar's action set — back, rotate left, rotate right, delete, share — but
+/// sits on a material background rather than a gradient, because it appears over the light grid
 /// rather than over a photo.
 final class SelectionToolbar: UIView {
 
@@ -11,6 +11,7 @@ final class SelectionToolbar: UIView {
     var onRotateLeft: (() -> Void)?
     var onRotateRight: (() -> Void)?
     var onDelete: (() -> Void)?
+    var onShare: (() -> Void)?
 
     static let contentHeight: CGFloat = 56
 
@@ -20,6 +21,7 @@ final class SelectionToolbar: UIView {
     private let rotateLeftButton = UIButton(type: .system)
     private let rotateRightButton = UIButton(type: .system)
     private let deleteButton = UIButton(type: .system)
+    let shareButton = UIButton(type: .system)
     private let rightStack = UIStackView()
 
     override init(frame: CGRect) {
@@ -41,12 +43,14 @@ final class SelectionToolbar: UIView {
                   label: "Rotate right", tint: .label)
         configure(deleteButton, systemName: "trash", action: #selector(deleteTapped),
                   label: "Delete", tint: .systemRed)
+        configure(shareButton, systemName: "square.and.arrow.up", action: #selector(shareTapped),
+                  label: "Share", tint: .label)
 
         rightStack.axis = .horizontal
         rightStack.spacing = 4
         rightStack.alignment = .center
         rightStack.translatesAutoresizingMaskIntoConstraints = false
-        [rotateLeftButton, rotateRightButton, deleteButton].forEach(rightStack.addArrangedSubview)
+        [rotateLeftButton, rotateRightButton, deleteButton, shareButton].forEach(rightStack.addArrangedSubview)
 
         addSubview(cancelButton)
         addSubview(rightStack)
@@ -96,10 +100,13 @@ final class SelectionToolbar: UIView {
         }
         deleteButton.isEnabled = hasSelection
         deleteButton.alpha = hasSelection ? 1 : 0.35
+        shareButton.isEnabled = hasSelection
+        shareButton.alpha = hasSelection ? 1 : 0.35
     }
 
     @objc private func cancelTapped() { onCancel?() }
     @objc private func rotateLeftTapped() { onRotateLeft?() }
     @objc private func rotateRightTapped() { onRotateRight?() }
     @objc private func deleteTapped() { onDelete?() }
+    @objc private func shareTapped() { onShare?() }
 }

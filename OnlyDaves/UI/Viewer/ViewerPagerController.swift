@@ -164,6 +164,7 @@ final class ViewerPagerController: UIViewController {
         toolbar.onRotateLeft = { [weak self] in self?.rotateCurrent(clockwise: false) }
         toolbar.onRotateRight = { [weak self] in self?.rotateCurrent(clockwise: true) }
         toolbar.onDelete = { [weak self] in self?.deleteCurrent() }
+        toolbar.onShare = { [weak self] in self?.shareCurrent() }
     }
 
     private func configureDismissGesture() {
@@ -357,6 +358,35 @@ final class ViewerPagerController: UIViewController {
             }
             self.advanceAfterDeleting(stub.id)
         }
+    }
+
+    private func shareCurrent() {
+        guard items.indices.contains(currentIndex) else { return }
+        let stub = items[currentIndex]
+
+        Task { [weak self] in
+            guard let self else { return }
+            let (items, failures) = await self.env.shareService.activityItems(for: [stub.id])
+            guard !items.isEmpty else {
+                let message = (failures.first?.error as? LocalizedError)?.errorDescription
+                    ?? failures.first?.error.localizedDescription
+                    ?? "Couldn’t share this item."
+                Toast.show(message, in: self.view)
+                return
+            }
+            self.presentActivity(items: items, anchor: self.toolbar.shareButton)
+        }
+    }
+
+    /// Anchors the iPad popover on the button that opened it; a nil `sourceView` crashes on
+    /// iPad the first time the share sheet is presented from a regular (non-compact) size class.
+    private func presentActivity(items: [Any], anchor: UIView) {
+        let activityVC = UIActivityViewController(activityItems: items, applicationActivities: nil)
+        if let popover = activityVC.popoverPresentationController {
+            popover.sourceView = anchor
+            popover.sourceRect = anchor.bounds
+        }
+        present(activityVC, animated: true)
     }
 
     /// Confirms deletions that reach the server (D11). Purely local deletions rely on the
