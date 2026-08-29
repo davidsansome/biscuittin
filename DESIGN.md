@@ -1019,9 +1019,22 @@ checkpoint; there is no separate progress state to corrupt.
   identical call.
 - **Source pixels, remote-only facets:** the cached grid `thumbnail` when
   present, else fetched via `RemoteImageFetcher` when online, else skipped —
-  the id-diff naturally retries next pass. CLIP sees 224 px inputs; a 256 px
-  thumb loses nothing.
-- **Batching:** 32 images per CoreML batch, `Task.yield()` between batches,
+  the id-diff naturally retries next pass.
+
+**Measured model contract** (probed with `Tools/modelprobe.swift` against the
+compiled packages — the authority is the model, not the docs):
+
+| | input | output |
+|---|---|---|
+| `mobileclip_s0_image` | `image`: BGRA image **256×256** | `final_emb_1`: float32 `[1, 512]` |
+| `mobileclip_s0_text` | `text`: int32 `[1, 77]` | `final_emb_1`: float32 `[1, 512]` |
+
+Both models are **fixed batch-1** — there is no batch dimension to fill, so
+"batching" means `MLBatchProvider` / `predictions(fromBatch:)` amortising the
+per-call overhead, not a wider tensor. The 256 px source request in the
+indexer matches the image encoder's native input exactly (an earlier draft of
+this section said 224 px, which was wrong — MobileCLIP-S0 is a 256 px model).
+- **Batching:** 32 images per `MLBatchProvider` call, `Task.yield()` between batches,
   `.utility` QoS, paused while the grid reports active scrolling (P6). The
   image encoder is loaded at batch-run start and released when the queue
   empties (P8) — it is the only part of the model with a meaningful resident

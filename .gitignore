@@ -15,3 +15,6 @@ Package.resolved.bak
 
 # macOS
 .DS_Store
+
+# CLIP models fetched by Tools/fetch_models.sh (~120 MB) — reproducible, not committed (D22).
+OnlyDaves/Resources/Models/
