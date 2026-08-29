@@ -19,6 +19,10 @@ final class AppEnvironment: ObservableObject {
     let photoActions: PhotoActionService
     let shareService: ShareService
     let rotators: RotatorRegistry
+    let embeddingStore: EmbeddingStore
+    let clipEncoder: CLIPEncoder
+    let searchEngine: SearchEngine
+    let searchIndexer: SearchIndexer
     let immichSession: ImmichAuthSession
     let remoteLibrary: RemoteLibraryService
     let remoteImages: RemoteImageFetcher
@@ -78,11 +82,23 @@ final class AppEnvironment: ObservableObject {
                                          resolver: resolver,
                                          remoteImages: remoteImages,
                                          exporter: exporter)
+
+        let embeddingStore = EmbeddingStore(database: database)
+        let clipEncoder = CLIPEncoder()
+        self.embeddingStore = embeddingStore
+        self.clipEncoder = clipEncoder
+        self.searchEngine = SearchEngine(encoder: clipEncoder, store: embeddingStore)
+        self.searchIndexer = SearchIndexer(store: embeddingStore,
+                                           encoder: clipEncoder,
+                                           timelineStore: timelineStore,
+                                           resolver: resolver,
+                                           remoteImages: remoteImages)
         self.startup = StartupSequencer(localLibrary: localLibrary,
                                         timelineStore: timelineStore,
                                         remoteLibrary: remoteLibrary,
                                         session: immichSession,
-                                        syncEngine: syncEngine)
+                                        syncEngine: syncEngine,
+                                        searchIndexer: self.searchIndexer)
 
         // Wiring that would otherwise be an initialisation cycle. Still zero I/O (D19).
         imageLoader.attachRemoteFetcher(remoteImages)

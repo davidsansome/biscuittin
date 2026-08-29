@@ -25,18 +25,21 @@ final class StartupSequencer: ObservableObject {
     private let remoteLibrary: RemoteLibraryService
     private let session: ImmichAuthSession
     private let syncEngine: SyncEngine
+    private let searchIndexer: SearchIndexer
     private var hasStarted = false
 
     init(localLibrary: LocalLibraryService,
          timelineStore: TimelineStore,
          remoteLibrary: RemoteLibraryService,
          session: ImmichAuthSession,
-         syncEngine: SyncEngine) {
+         syncEngine: SyncEngine,
+         searchIndexer: SearchIndexer) {
         self.localLibrary = localLibrary
         self.timelineStore = timelineStore
         self.remoteLibrary = remoteLibrary
         self.session = session
         self.syncEngine = syncEngine
+        self.searchIndexer = searchIndexer
         self.authorizationStatus = localLibrary.authorizationStatus
     }
 
@@ -74,6 +77,10 @@ final class StartupSequencer: ObservableObject {
         await syncEngine.publishStatus(uploading: false)
         syncEngine.scheduleBackgroundTask()
         await syncEngine.kick()
+
+        // Search indexing is the lowest-priority work in the app (§19.2): it runs only once
+        // the grid is up, remote metadata is current, and uploads have been kicked off.
+        await searchIndexer.run()
     }
 
     /// Catches up with the server after the first frame. Failures are logged, never surfaced

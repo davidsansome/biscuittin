@@ -17,8 +17,15 @@ final class GridViewController: UIViewController {
     private var dataSource: DataSource!
     private var pinchController: PinchColumnsController
 
-    /// The snapshot currently on screen. Cell configuration resolves index paths against it.
+    /// The live, date-grouped timeline. Kept even while search results are on screen, so
+    /// cancelling search restores instantly and snapshot updates keep flowing underneath.
     private var timeline: TimelineSnapshot
+    /// Ranked search results, when a search is active. `displayed` is what the grid draws;
+    /// everything that resolves an index path must go through it, not `timeline`.
+    private var searchResults: TimelineSnapshot?
+
+    /// What the collection view is currently showing.
+    private var displayed: TimelineSnapshot { searchResults ?? timeline }
     private var columns: Int
     private var snapshotTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
@@ -30,6 +37,9 @@ final class GridViewController: UIViewController {
     private var defaultRightBarButtonItem: UIBarButtonItem?
 
     private let dateScrubber = DateScrubber()
+
+    private var searchController: UISearchController?
+    private lazy var searchSession = SearchSessionController(engine: env.searchEngine)
 
     private lazy var statusLabel: UILabel = {
         let label = UILabel()
@@ -90,6 +100,7 @@ final class GridViewController: UIViewController {
         configureStatusViews()
         configureSelection()
         configureDateScrubber()
+        configureSearch()
         observeStartupPhase()
 
         // Subscribe before kicking the boot cache so the very first snapshot is not missed.
@@ -163,8 +174,8 @@ final class GridViewController: UIViewController {
                 withReuseIdentifier: BucketHeaderView.reuseIdentifier,
                 for: indexPath)
             guard let self, let header = view as? BucketHeaderView,
-                  indexPath.section < self.timeline.buckets.count else { return view }
-            header.configure(title: self.timeline.buckets[indexPath.section].title)
+                  indexPath.section < self.displayed.buckets.count else { return view }
+            header.configure(title: self.displayed.buckets[indexPath.section].title)
             return header
         }
     }
@@ -249,6 +260,48 @@ final class GridViewController: UIViewController {
         selectionDidChange()
     }
 
+    // MARK: - Search (requirement 15)
+
+    private func configureSearch() {
+        // Search is unavailable rather than broken when the CLIP resources were never fetched
+        // (Tools/fetch_models.sh is a manual build step) — no bar at all beats one that
+        // silently returns nothing.
+        guard env.clipEncoder.isAvailable else {
+            Log.search.info("CLIP models absent; search UI disabled")
+            return
+        }
+
+        let controller = UISearchController(searchResultsController: nil)
+        controller.searchResultsUpdater = self
+        controller.delegate = self
+        controller.obscuresBackgroundDuringPresentation = false
+        controller.searchBar.placeholder = "Search your photos"
+        controller.searchBar.autocapitalizationType = .none
+        navigationItem.searchController = controller
+        navigationItem.hidesSearchBarWhenScrolling = true
+        definesPresentationContext = true
+        searchController = controller
+
+        searchSession.stubProvider = { [weak self] id in
+            guard let self, let indexPath = self.timeline.indexPath(of: id) else { return nil }
+            return self.timeline.stub(at: indexPath)
+        }
+        searchSession.onResults = { [weak self] results in
+            self?.showSearchResults(results)
+        }
+    }
+
+    private func showSearchResults(_ results: TimelineSnapshot?) {
+        searchResults = results
+        // A selection carried from the timeline into a result set (or back) would act on items
+        // the user can no longer see.
+        selection.end()
+        applyDisplayedSnapshot(reloading: true)
+        updateStatusViews()
+        updateScrubberVisibility()
+        if results != nil { collectionView.setContentOffset(.zero, animated: false) }
+    }
+
     // MARK: - Date scrubber (fast-scroll index)
 
     private func configureDateScrubber() {
@@ -279,7 +332,11 @@ final class GridViewController: UIViewController {
     }
 
     private func updateScrubberVisibility() {
-        dateScrubber.isHidden = selection.isActive || scrollableContentHeight() <= 0
+        // Search results are ranked by relevance, not date, so a date scrubber over them would
+        // be lying about what it scrolls to.
+        dateScrubber.isHidden = selection.isActive
+            || searchResults != nil
+            || scrollableContentHeight() <= 0
     }
 
     /// Jumps the grid to a normalized position and reports which bucket landed at the top, for
@@ -297,15 +354,15 @@ final class GridViewController: UIViewController {
 
     private func topmostVisibleBucketTitle() -> String? {
         guard let indexPath = collectionView.indexPathsForVisibleItems.min(),
-              indexPath.section < timeline.buckets.count else { return nil }
-        return timeline.buckets[indexPath.section].title
+              indexPath.section < displayed.buckets.count else { return nil }
+        return displayed.buckets[indexPath.section].title
     }
 
     @objc private func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
         guard gesture.state == .began else { return }
         let point = gesture.location(in: collectionView)
         guard let indexPath = collectionView.indexPathForItem(at: point),
-              let stub = timeline.stub(at: indexPath) else { return }
+              let stub = displayed.stub(at: indexPath) else { return }
 
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         selection.begin(with: stub.id)
@@ -341,7 +398,7 @@ final class GridViewController: UIViewController {
     }
 
     private func selectionContainsRotatable() -> Bool {
-        for bucket in timeline.buckets {
+        for bucket in displayed.buckets {
             for stub in bucket.items where selection.contains(stub.id) {
                 if env.photoActions.canRotate(stub.kind) { return true }
             }
@@ -479,47 +536,58 @@ final class GridViewController: UIViewController {
         let groupingChanged = new.grouping != timeline.grouping
         timeline = new
 
-        var snapshot = Snapshot()
-        snapshot.appendSections(new.buckets.map(\.id))
-        for bucket in new.buckets {
-            snapshot.appendItems(bucket.items.map(\.id), toSection: bucket.id)
-        }
+        // §14 P1 is about photos being visible, not just a view existing. Measured from the
+        // live timeline even mid-search: it is a launch metric, not a display one.
+        LaunchClock.reportFirstContent(
+            itemCount: new.totalCount,
+            provenance: new.provenance == .bootCache ? "boot-cache" : "live")
+        defaultRightBarButtonItem?.menu = makeGroupingMenu()
+
+        // While search results are on screen the timeline keeps updating underneath but must not
+        // replace them. Cancelling search re-applies whatever the timeline has become by then.
+        guard searchResults == nil else { return }
 
         // Animate small deltas; fall back to a straight reload for first paint, regrouping,
         // and bulk changes where diffing would cost more than it buys (§14 P3).
         let delta = abs(new.totalCount - previousCount)
         let shouldReload = previousCount == 0 || groupingChanged || delta > 500
+        applyDisplayedSnapshot(reloading: shouldReload)
+    }
+
+    /// Pushes `displayed` — timeline or search results — into the diffable data source.
+    private func applyDisplayedSnapshot(reloading: Bool) {
+        let current = displayed
+
+        var snapshot = Snapshot()
+        snapshot.appendSections(current.buckets.map(\.id))
+        for bucket in current.buckets {
+            snapshot.appendItems(bucket.items.map(\.id), toSection: bucket.id)
+        }
 
         // Content-only changes keep their identifiers, so the diff misses them entirely.
-        let reconfigurable = new.reconfiguredIDs.filter { snapshot.indexOfItem($0) != nil }
+        let reconfigurable = current.reconfiguredIDs.filter { snapshot.indexOfItem($0) != nil }
         if !reconfigurable.isEmpty {
             snapshot.reconfigureItems(reconfigurable)
         }
 
-        if shouldReload {
+        if reloading {
             dataSource.applySnapshotUsingReloadData(snapshot)
         } else {
             dataSource.apply(snapshot, animatingDifferences: true)
         }
 
-        // §14 P1 is about photos being visible, not just a view existing.
-        LaunchClock.reportFirstContent(
-            itemCount: new.totalCount,
-            provenance: new.provenance == .bootCache ? "boot-cache" : "live")
-
-        defaultRightBarButtonItem?.menu = makeGroupingMenu()
         // Assets can disappear underneath a live selection (deleted here or on another device).
-        selection.retain(only: Set(new.buckets.flatMap { $0.items.map(\.id) }))
+        selection.retain(only: Set(current.buckets.flatMap { $0.items.map(\.id) }))
         updateStatusViews()
         updateScrubberVisibility()
     }
 
     private func stub(at indexPath: IndexPath, expecting id: AssetID) -> AssetStub? {
-        if let stub = timeline.stub(at: indexPath), stub.id == id { return stub }
+        if let stub = displayed.stub(at: indexPath), stub.id == id { return stub }
         // Index paths and the local snapshot can disagree for one frame mid-apply; fall back
         // to an identity lookup rather than showing the wrong photo.
-        guard let fallback = timeline.indexPath(of: id) else { return nil }
-        return timeline.stub(at: fallback)
+        guard let fallback = displayed.indexPath(of: id) else { return nil }
+        return displayed.stub(at: fallback)
     }
 
     private func currentTileSize() -> CGSize {
@@ -564,7 +632,7 @@ final class GridViewController: UIViewController {
         let tileSize = currentTileSize()
         for case let cell as AssetCell in collectionView.visibleCells {
             guard let indexPath = collectionView.indexPath(for: cell),
-                  let stub = timeline.stub(at: indexPath) else { continue }
+                  let stub = displayed.stub(at: indexPath) else { continue }
             cell.configure(stub: stub, loader: env.imageLoader, tileSize: tileSize, isSelected: false)
         }
     }
@@ -580,7 +648,15 @@ final class GridViewController: UIViewController {
 
     private func updateStatusViews() {
         let phase = env.startup.phase
-        let isEmpty = timeline.isEmpty
+        let isEmpty = displayed.isEmpty
+
+        // A search with no matches is not an empty library; saying so would read as data loss.
+        if searchSession.isSearching {
+            statusLabel.text = isEmpty ? "No photos match that search." : nil
+            statusLabel.isHidden = !isEmpty
+            settingsButton.isHidden = true
+            return
+        }
 
         switch phase {
         case .accessDenied:
@@ -603,14 +679,14 @@ final class GridViewController: UIViewController {
 
 extension GridViewController: UICollectionViewDataSourcePrefetching {
     func collectionView(_ collectionView: UICollectionView, prefetchItemsAt indexPaths: [IndexPath]) {
-        let stubs = indexPaths.compactMap { timeline.stub(at: $0) }
+        let stubs = indexPaths.compactMap { displayed.stub(at: $0) }
         guard !stubs.isEmpty else { return }
         let scale = traitCollection.displayScale > 0 ? traitCollection.displayScale : 2
         env.imageLoader.startPrefetch(stubs, variant: .gridThumb(pointSize: currentTileSize(), scale: scale))
     }
 
     func collectionView(_ collectionView: UICollectionView, cancelPrefetchingForItemsAt indexPaths: [IndexPath]) {
-        let stubs = indexPaths.compactMap { timeline.stub(at: $0) }
+        let stubs = indexPaths.compactMap { displayed.stub(at: $0) }
         guard !stubs.isEmpty else { return }
         let scale = traitCollection.displayScale > 0 ? traitCollection.displayScale : 2
         env.imageLoader.cancelPrefetch(stubs, variant: .gridThumb(pointSize: currentTileSize(), scale: scale))
@@ -622,7 +698,7 @@ extension GridViewController: UICollectionViewDataSourcePrefetching {
 extension GridViewController: UICollectionViewDelegate {
     func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
         collectionView.deselectItem(at: indexPath, animated: false)
-        guard let stub = timeline.stub(at: indexPath) else { return }
+        guard let stub = displayed.stub(at: indexPath) else { return }
 
         // In selection mode a tap adds to or removes from the selection instead of opening the
         // viewer (requirement 11).
@@ -636,6 +712,44 @@ extension GridViewController: UICollectionViewDelegate {
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
         dateScrubber.scrollFraction = currentScrollFraction()
     }
+
+    // §14 P6: search indexing yields while the user is scrolling. Embedding a batch competes
+    // for the same CPU as cell configuration, and the grid must win.
+    func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+        setIndexingPaused(true)
+    }
+
+    func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+        if !decelerate { setIndexingPaused(false) }
+    }
+
+    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        setIndexingPaused(false)
+    }
+
+    private func setIndexingPaused(_ paused: Bool) {
+        Task { await env.searchIndexer.setPaused(paused) }
+    }
+}
+
+// MARK: - Search (requirement 15)
+
+extension GridViewController: UISearchResultsUpdating, UISearchControllerDelegate {
+    func updateSearchResults(for searchController: UISearchController) {
+        searchSession.update(query: searchController.searchBar.text ?? "")
+    }
+
+    func willPresentSearchController(_ searchController: UISearchController) {
+        // Parse the vocabulary and warm the text encoder now, so the first keystroke is not the
+        // thing that pays for them (P8).
+        searchSession.begin()
+    }
+
+    func didDismissSearchController(_ searchController: UISearchController) {
+        // Frees the tokenizer tables and the text encoder's weights, and restores the timeline —
+        // which may have moved on while results were on screen.
+        searchSession.end()
+    }
 }
 
 // MARK: - Viewer presentation (requirement 5)
@@ -645,8 +759,8 @@ extension GridViewController {
     /// (§14 P4). The flattened item list and start index both come from the snapshot already
     /// in hand.
     private func openViewer(at indexPath: IndexPath) {
-        guard let startIndex = timeline.flatIndex(of: indexPath) else { return }
-        let items = timeline.flattened()
+        guard let startIndex = displayed.flatIndex(of: indexPath) else { return }
+        let items = displayed.flattened()
         guard !items.isEmpty else { return }
 
         let viewer = ViewerPagerController(env: env,
@@ -661,7 +775,7 @@ extension GridViewController {
 
 extension GridViewController: ViewerTransitionSource {
     func viewerTransitionSourceFrame(for id: AssetID) -> CGRect? {
-        guard let indexPath = timeline.indexPath(of: id),
+        guard let indexPath = displayed.indexPath(of: id),
               let attributes = collectionView.layoutAttributesForItem(at: indexPath) else { return nil }
         let frameInCollectionView = attributes.frame
         // Only offer a frame when the tile is actually on screen; otherwise the animation
@@ -671,13 +785,13 @@ extension GridViewController: ViewerTransitionSource {
     }
 
     func viewerTransitionSourceImage(for id: AssetID) -> UIImage? {
-        guard let indexPath = timeline.indexPath(of: id),
+        guard let indexPath = displayed.indexPath(of: id),
               let cell = collectionView.cellForItem(at: indexPath) as? AssetCell else { return nil }
         return cell.thumbnailImage
     }
 
     func viewerTransitionPrepareForDismissal(to id: AssetID) {
-        guard let indexPath = timeline.indexPath(of: id), isValid(indexPath) else { return }
+        guard let indexPath = displayed.indexPath(of: id), isValid(indexPath) else { return }
         // Scroll the destination tile into view so the viewer has somewhere to land.
         guard !collectionView.indexPathsForVisibleItems.contains(indexPath) else { return }
         collectionView.scrollToItem(at: indexPath, at: .centeredVertically, animated: false)
@@ -685,7 +799,7 @@ extension GridViewController: ViewerTransitionSource {
     }
 
     func viewerTransitionSetSourceHidden(_ hidden: Bool, for id: AssetID) {
-        guard let indexPath = timeline.indexPath(of: id),
+        guard let indexPath = displayed.indexPath(of: id),
               let cell = collectionView.cellForItem(at: indexPath) as? AssetCell else { return }
         cell.contentView.alpha = hidden ? 0 : 1
     }

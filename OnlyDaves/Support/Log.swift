@@ -10,6 +10,7 @@ enum Log {
     static let sync = Logger(subsystem: subsystem, category: "sync")
     static let ui = Logger(subsystem: subsystem, category: "ui")
     static let perf = Logger(subsystem: subsystem, category: "perf")
+    static let search = Logger(subsystem: subsystem, category: "search")
 
     /// Stamped on every `device(_:_:)` line. `devicectl --console` output carries no timestamps
     /// of its own, and without them a capture cannot distinguish work that is slow from work
@@ -28,6 +29,7 @@ enum Log {
         case "sync": sync.error("\(text, privacy: .public)")
         case "immich": immich.error("\(text, privacy: .public)")
         case "timeline": timeline.error("\(text, privacy: .public)")
+        case "search": search.error("\(text, privacy: .public)")
         default: ui.error("\(text, privacy: .public)")
         }
         #if DEBUG

@@ -247,6 +247,22 @@ change stream the store observes. The yield is delivered asynchronously, so it l
 refresh and triggered a second full rebuild. Two unordered sources for one event, not redundancy.
 Remove diagnostic instrumentation before committing — but `Log.device`'s timestamp stays.
 
+## A new log category is invisible on device until it goes through `Log.device`
+
+Search indexing appeared not to run on a real phone: 90 seconds of console output
+with nothing from the indexer. It had actually embedded the entire 2,721-asset
+library in that window. The new `Log.search` category was writing to os_log, and
+`devicectl --console` relays only stdout/stderr.
+
+This file already said that about `Log.device` — the point worth adding is that
+the rule applies to **every category you add later**, and that its failure mode is
+not silence you notice but a *wrong conclusion you act on*: "the feature never
+ran" instead of "I cannot see it". The confirming instrument was cheap and should
+have come first — log the store's row count, not the absence of progress lines.
+
+Absence of logging is never evidence of absence of work. Prove the negative with a
+positive reading of state.
+
 ## Conventions
 
 - Swift Concurrency throughout; `actor` or `@MainActor` types, no Combine except where UIKit

@@ -1093,6 +1093,69 @@ scale the whole matrix is 2.8 MB — one chunk.
 
 ## 20. Implementation Log
 
+
+### M10 — complete (2026-08-29)
+
+Shipped as designed; the measurements are below and two design claims were wrong.
+
+**The model contract had to be measured, not read.** §19.4 originally said CLIP
+takes 224 px inputs. MobileCLIP-S0 takes **256×256**. `Tools/modelprobe.swift`
+compiles a package and prints its real input/output description; that is now the
+authority, and the doc was corrected. Also learned both encoders are fixed
+batch-1, so `MLBatchProvider` amortises call overhead rather than filling a wider
+tensor.
+
+**The tokenizer is pinned to an external reference.** Expected token ids in
+`CLIPTokenizerTests` come from HuggingFace `transformers`, never from this code.
+This is the AGENTS.md "a mock you wrote yourself cannot falsify your own
+assumptions" trap in its purest form: a self-consistent tokenizer encodes a
+*different sentence* than the user typed and still returns a plausible 512-dim
+vector, so search degrades with nothing failing. `"onlydaves"` tokenizes to
+`[11646, 3700, 542]` — `only|dav|es`, not the `only|da|ves` that reading the
+vocabulary suggests.
+
+**One control experiment covered what no unit test could.**
+`Tools/clipprobe.swift` ran a fixed prompt set against four photos of known
+content. Each ranked its own caption first at roughly twice the runner-up
+(flower 0.273, leaf 0.254, waterfall 0.252 / 0.273). Tokenizer, preprocessing and
+comparison are only correct *together*, and this is what showed they are —
+including that the exported model bakes in its own normalisation, which nothing
+in the file format states.
+
+**Measured on an iPhone 13, 2,721-asset library:**
+
+| | result |
+|---|---|
+| Full first index | 2,721 assets in under 90 s (budget was ≥ 5/s) |
+| Query, worst observed | 55 ms — `person`, first after a pause |
+| Query, typical | 6.5–27 ms |
+| Scan alone (2,721 vectors) | 3.2–24 ms |
+| P8 budget | 150 ms at 10k assets |
+
+Scan cost is roughly linear in library size, so 10k assets extrapolates to well
+inside the budget; that projection is *not* measured and 100k libraries remain
+untested (§19.7 keeps ANN as the escape hatch if it ever stops holding).
+
+**Watching the wrong log channel cost a diagnosis.** The first device run looked
+like indexing had never started — no output for 90 seconds. It had in fact
+finished the entire library. `Log.search.info` goes only to os_log, which
+`devicectl --console` does not relay (AGENTS.md already records this about
+`Log.device`; the lesson generalises to any new category). The store count, once
+logged through `Log.device`, showed 2,721 rows.
+
+**The grid now separates the live timeline from what is displayed.**
+`GridViewController.displayed` returns search results when a search is active and
+the timeline otherwise; every index-path resolution goes through it. Snapshots
+keep arriving underneath results without replacing them, and cancelling search
+re-applies whatever the timeline has become. Resolving an index path against the
+timeline while results were on screen would open the wrong photo.
+
+**Deferred, and why.** The `requiresExternalPower` `BGProcessingTask` for
+first-index backlogs (§19.4) is not implemented: the full index finished in one
+foreground session on a 2,721-asset library, so the backlog path has no evidence
+behind it yet. It matters for libraries an order of magnitude larger — where it
+should be written against a real measurement rather than a guess.
+
 ### M1 — complete (2026-08-18)
 
 Delivered: Xcode project (hand-written `project.pbxproj` using Xcode 16+

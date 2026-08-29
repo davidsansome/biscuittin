@@ -96,6 +96,22 @@ final class AppDatabase: @unchecked Sendable {
             }
         }
 
+        migrator.registerMigration("v2-clip-embeddings") { db in
+            try db.create(table: "clip_embedding") { t in
+                // AssetID.raw — namespaced ("L:…" / "R:…"), so a local and a remote asset can
+                // never collide (D5).
+                t.primaryKey("asset_id", .text)
+                // Which model produced this vector. Comparing vectors across models is
+                // meaningless, so a mismatch re-embeds rather than silently ranking garbage.
+                t.column("model_version", .text).notNull()
+                t.column("vector", .blob).notNull()
+                t.column("indexed_at", .double).notNull()
+            }
+            // The indexing pass sweeps rows whose model is stale; the query path reads every
+            // row for the current model.
+            try db.create(index: "idx_clip_model", on: "clip_embedding", columns: ["model_version"])
+        }
+
         return migrator
     }
 }
