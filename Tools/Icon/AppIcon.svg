@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+      <clipPath id="bc5"><circle cx="512" cy="512" r="152"/></clipPath>
+      <rect width="1024" height="1024" rx="228" fill="#12303F"/>
+      <g fill="#D9A566">
+        <circle cx="512" cy="512" r="286"/>
+        <circle cx="798" cy="512" r="58"/>
+        <circle cx="776.2" cy="621.5" r="58"/>
+        <circle cx="714.2" cy="714.2" r="58"/>
+        <circle cx="621.5" cy="776.2" r="58"/>
+        <circle cx="512" cy="798" r="58"/>
+        <circle cx="402.5" cy="776.2" r="58"/>
+        <circle cx="309.8" cy="714.2" r="58"/>
+        <circle cx="247.8" cy="621.5" r="58"/>
+        <circle cx="226" cy="512" r="58"/>
+        <circle cx="247.8" cy="402.5" r="58"/>
+        <circle cx="309.8" cy="309.8" r="58"/>
+        <circle cx="402.5" cy="247.8" r="58"/>
+        <circle cx="512" cy="226" r="58"/>
+        <circle cx="621.5" cy="247.8" r="58"/>
+        <circle cx="714.2" cy="309.8" r="58"/>
+        <circle cx="776.2" cy="402.5" r="58"/>
+      </g>
+      <g fill="#A8763A">
+        <circle cx="730" cy="602.3" r="15"/>
+        <circle cx="602.3" cy="730" r="15"/>
+        <circle cx="421.7" cy="730" r="15"/>
+        <circle cx="294" cy="602.3" r="15"/>
+        <circle cx="294" cy="421.7" r="15"/>
+        <circle cx="421.7" cy="294" r="15"/>
+        <circle cx="602.3" cy="294" r="15"/>
+        <circle cx="730" cy="421.7" r="15"/>
+      </g>
+      <circle cx="512" cy="512" r="186" fill="#F3EADA"/>
+      <g clip-path="url(#bc5)">
+        <rect x="360" y="360" width="304" height="304" fill="#8FB6C8"/>
+        <circle cx="570" cy="454" r="38" fill="#F0D08A"/>
+        <path d="M360 664 L436 560 L494 620 L544 570 L664 664 Z" fill="#3E6B57"/>
+      </g>
+    
+</svg>

@@ -1,4 +1,4 @@
-# Working notes for agents on Hatbox
+# Working notes for agents on Biscuit Tin
 
 Product design lives in [DESIGN.md](DESIGN.md) — read it first; it is the source of truth for
 architecture, milestones and the performance contract. This file is about *how to work on this
@@ -7,17 +7,17 @@ repo* and the mistakes already made here, so they are not repeated.
 ## Build, test, run
 
 ```bash
-xcodebuild -project Hatbox.xcodeproj -scheme Hatbox -destination 'id=<SIM_UDID>' -derivedDataPath build/DerivedData build
+xcodebuild -project BiscuitTin.xcodeproj -scheme BiscuitTin -destination 'id=<SIM_UDID>' -derivedDataPath build/DerivedData build
 ```
 
 ```bash
-xcodebuild test -project Hatbox.xcodeproj -scheme Hatbox -destination 'id=<SIM_UDID>' -derivedDataPath build/DerivedData
+xcodebuild test -project BiscuitTin.xcodeproj -scheme BiscuitTin -destination 'id=<SIM_UDID>' -derivedDataPath build/DerivedData
 ```
 
 - Target the simulator by **UDID**, not name: several installed simulators share names like
   "iPhone 16 Pro" and `xcodebuild` fails with an ambiguous-destination error.
 - `project.pbxproj` uses Xcode 16+ **filesystem-synchronized groups**. New `.swift` files under
-  `Hatbox/` and `HatboxTests/` are picked up automatically — do not hand-edit the project
+  `BiscuitTin/` and `BiscuitTinTests/` are picked up automatically — do not hand-edit the project
   file to add sources.
 - Running the test suite reinstalls the app and can reset its container, wiping `UserDefaults`
   and the boot cache. Expect grouping/column preferences to be back at defaults afterwards;
@@ -51,7 +51,7 @@ asserted a cause that had never been demonstrated.
      frames.
    - A temporary `Log.ui.error(...)` of the frames in question (`.debug` and `.info` are **not**
      persisted to the log store; read them back with
-     `xcrun simctl spawn <UDID> log show --last 60s --predicate 'subsystem BEGINSWITH "dev.hatbox"' --style compact`).
+     `xcrun simctl spawn <UDID> log show --last 60s --predicate 'subsystem BEGINSWITH "dev.biscuittin"' --style compact`).
    - `Tools/pixelprobe.swift` to map the actual framebuffer — see below.
 3. When an authoritative non-visual source contradicts your reading of an image, **the image
    reading is wrong**. Re-derive the mapping before doubting the instrument.
@@ -124,7 +124,7 @@ where a `Button` in the same form does. Verify toggle-gated behaviour by setting
 default and relaunching:
 
 ```bash
-xcrun simctl spawn <UDID> defaults write dev.hatbox.app "sync.enabled" -bool YES
+xcrun simctl spawn <UDID> defaults write com.davidsansome.biscuittin "sync.enabled" -bool YES
 ```
 
 Write it through `simctl spawn defaults`, not by editing the plist file — the simulator's
@@ -133,9 +133,9 @@ preference daemon caches and will overwrite a direct file edit on next launch.
 Useful non-UI shortcuts:
 
 ```bash
-xcrun simctl privacy <UDID> grant photos dev.hatbox.app
+xcrun simctl privacy <UDID> grant photos com.davidsansome.biscuittin
 xcrun simctl addmedia <UDID> *.jpg *.mov
-xcrun simctl get_app_container <UDID> dev.hatbox.app data   # inspect boot cache / prefs
+xcrun simctl get_app_container <UDID> com.davidsansome.biscuittin data   # boot cache / prefs
 ```
 
 ## Working on a physical device
@@ -143,11 +143,11 @@ xcrun simctl get_app_container <UDID> dev.hatbox.app data   # inspect boot cache
 The full deploy loop runs from here — no hands needed on the phone:
 
 ```bash
-xcodebuild -project Hatbox.xcodeproj -scheme Hatbox -destination 'platform=iOS,id=<DEVICE_UDID>' -derivedDataPath build/DeviceDD -allowProvisioningUpdates build
+xcodebuild -project BiscuitTin.xcodeproj -scheme BiscuitTin -destination 'platform=iOS,id=<DEVICE_UDID>' -derivedDataPath build/DeviceDD -allowProvisioningUpdates build
 ```
 
 ```bash
-xcrun devicectl device install app --device <DEVICE_UDID> build/DeviceDD/Build/Products/Debug-iphoneos/Hatbox.app
+xcrun devicectl device install app --device <DEVICE_UDID> build/DeviceDD/Build/Products/Debug-iphoneos/BiscuitTin.app
 ```
 
 `xcrun devicectl list devices` gives the identifier; `xcrun xctrace list devices` gives the UDID
@@ -181,21 +181,25 @@ and run that case.
 
 ## Launch the bundle id you just built
 
-The app's bundle id is **`com.davidsansome.hatbox`**. Builds under the app's earlier names —
-`com.davidsansome.onlydaves`, and before that `dev.onlydaves.app` — may still be installed on
-the simulator, and `simctl launch dev.onlydaves.app` will happily start one — so you drive a
-stale binary while your new code sits unused. This cost several cycles: the fix under test
-appeared not to work and produced no logs at all, because the running app predated both.
+The app's bundle id is **`com.davidsansome.biscuittin`**. It has been renamed more than once,
+and a build under a superseded bundle id can still be sitting on the simulator; `simctl launch`
+will happily start one, so you drive a stale binary while your new code sits unused. This cost
+several cycles: the fix under test appeared not to work and produced no logs at all, because
+the running app predated it.
 
 Symptom to recognise: **no app logs whatsoever**, plus UI that ignores a change you know is in
-the build. Check with:
+the build. List every non-Apple bundle and look for one that is this app under a name nobody
+remembers — which beats grepping for known-stale ids, because it also catches the next rename:
 
 ```bash
-xcrun simctl listapps <UDID> | grep -iE 'hatbox|onlydaves'
+xcrun simctl listapps <UDID> | grep CFBundleIdentifier | grep -v com.apple
 ```
 
-`Log.subsystem` is `dev.hatbox.app` — the logging subsystem and the bundle id are
-deliberately different strings; do not "fix" one to match the other.
+`Log.subsystem` is `dev.biscuittin.app` — the logging subsystem and the bundle id are
+deliberately different strings; do not "fix" one to match the other. The corollary is that
+every `simctl` subcommand above wants the **bundle id**, never the subsystem — a substitution
+that survived undetected through a previous rename, because the subsystem reads like a bundle
+id right up until the command silently does nothing.
 
 ## The simulator is not the device
 

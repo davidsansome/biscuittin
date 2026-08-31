@@ -68,7 +68,7 @@ func writeJPEG(_ image: CGImage, to url: URL, date: Date, index: Int) {
         kCGImagePropertyExifDictionary: [
             kCGImagePropertyExifDateTimeOriginal: stamp,
             kCGImagePropertyExifDateTimeDigitized: stamp,
-            kCGImagePropertyExifLensModel: "Hatbox Test Lens 24mm",
+            kCGImagePropertyExifLensModel: "BiscuitTin Test Lens 24mm",
             kCGImagePropertyExifFNumber: 1.8,
             kCGImagePropertyExifISOSpeedRatings: [index % 6 == 0 ? 400 : 100],
             kCGImagePropertyExifExposureTime: 0.008,
@@ -76,7 +76,7 @@ func writeJPEG(_ image: CGImage, to url: URL, date: Date, index: Int) {
         ],
         kCGImagePropertyTIFFDictionary: [
             kCGImagePropertyTIFFDateTime: stamp,
-            kCGImagePropertyTIFFMake: "Hatbox",
+            kCGImagePropertyTIFFMake: "BiscuitTin",
             kCGImagePropertyTIFFModel: "Test Camera \(index % 3 + 1)"
         ],
         kCGImagePropertyGPSDictionary: [

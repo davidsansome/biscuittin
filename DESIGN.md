@@ -1,16 +1,17 @@
-# Hatbox — iOS Photo Browser: Design Document
+# Biscuit Tin — iOS Photo Browser: Design Document
 
 **Status:** Draft v3 — adds the future-proofed rotation architecture (video/Live
 Photo rotation in M9) and the performance & responsiveness contract. No code
 written yet.
 **Target:** Native iOS app (iOS 17+, iPhone-first, iPad-compatible layout).
-**Name:** `Hatbox` (renamed from the working name `OnlyDaves` on 2026-08-31).
+**Name:** `Biscuit Tin`, shown with a space; one word (`BiscuitTin`) wherever a space is
+illegal — the Swift module, the target, the directories and the bundle-id stem.
 
 ---
 
 ## 1. Overview
 
-Hatbox is a minimal native photo browser that presents a **single merged timeline** of:
+Biscuit Tin is a minimal native photo browser that presents a **single merged timeline** of:
 
 - **Local photos and videos** from the device photo library (PhotoKit), and
 - **Remote assets** from an optional, user-configured **Immich** server.
@@ -142,9 +143,9 @@ All services are created once in `AppEnvironment` (a plain composition-root clas
 Single Xcode app target plus a test target. SPM dependency: GRDB.
 
 ```
-Hatbox/
+BiscuitTin/
 ├── App/
-│   ├── HatboxApp.swift          # @main SwiftUI App; owns AppEnvironment
+│   ├── BiscuitTinApp.swift          # @main SwiftUI App; owns AppEnvironment
 │   ├── AppEnvironment.swift        # Composition root; zero-I/O init (D19)
 │   ├── StartupSequencer.swift      # staged post-first-frame init order (D19)
 │   └── RootView.swift              # Hosts GridScreen; injects environment
@@ -227,7 +228,7 @@ Hatbox/
 │   ├── Signposts.swift             # os_signpost helpers for §14 budgets
 │   └── Log.swift                   # os.Logger categories
 │
-└── HatboxTests/
+└── BiscuitTinTests/
     ├── TimelineStoreTests.swift    # merge + bucketing + incremental apply
     ├── BootCacheTests.swift        # round-trip, corruption, version mismatch
     ├── ImmichClientTests.swift     # URLProtocol-stubbed endpoint tests
@@ -460,7 +461,7 @@ CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
 
 final class LocalAssetEditor {
     /// Applies a rotator's output (D10) via PHContentEditingInput/Output.
-    /// adjustmentData: formatIdentifier "dev.hatbox.rotate", version "1".
+    /// adjustmentData: formatIdentifier "dev.biscuittin.rotate", version "1".
     func applyRotation(asset: PHAsset, clockwise: Bool, rotator: AssetRotator) async throws
 }
 
@@ -681,7 +682,7 @@ Pipeline when enabled:
 5. **Publish**: recompute `remainingCount` = local assets minus `uploaded`/`ineligible`/`out_of_scope`.
 
 Scheduling: foreground kick on app-active (deferred behind first frame, D19) +
-library change; `BGProcessingTaskRequest` (id `dev.hatbox.sync`,
+library change; `BGProcessingTaskRequest` (id `dev.biscuittin.sync`,
 `requiresNetworkConnectivity = true`, external power not required) re-submitted
 after each run. Wi-Fi-only is **not** a v1 setting (uploads respect Low Data Mode
 via `allowsConstrainedNetworkAccess = false`). All engine work runs at
@@ -1214,9 +1215,17 @@ assumptions" trap in its purest form: a self-consistent tokenizer encodes a
 *different sentence* than the user typed and still returns a plausible 512-dim
 vector, so search degrades with nothing failing. `"mobileclip"` tokenizes to
 `[9451, 944, 8546]` — `mobi|lec|lip`, not the `mobile|clip` that reading the
-vocabulary suggests. A second pin covers the `</w>` end-of-word marker, which the
-vocabulary carries as separate entries: `"hatbox"` opens with the bare `hat`
-(3447) where a standalone `"hat"` is `hat</w>` (3801).
+vocabulary suggests, and the app's own name run together gives `biscu|ittin`,
+which crosses the seam between its two halves. A second pin covers the `</w>`
+end-of-word marker, which the vocabulary carries as separate entries: `"tinfoil"`
+opens with the bare `tin` (1310) where a standalone `"tin"` is `tin</w>` (5420).
+
+`tin` carries that case rather than `biscuit` because the vocabulary has **no
+bare `biscuit`** — it exists only as `biscuit</w>` — so no compound can reach the
+marker through it. Renaming the app therefore could not be a string substitution
+here: the ids were re-derived from the reference on Python 3.12 (the system 3.14
+cannot run it), and the reference was re-validated first against the bundled
+vocabulary and against every sequence already pinned.
 
 **One control experiment covered what no unit test could.**
 `Tools/clipprobe.swift` ran a fixed prompt set against four photos of known

@@ -7,7 +7,7 @@
 #
 #   ./Tools/fetch_models.sh
 #
-# Output lands in Hatbox/Resources/Models/, which the Xcode target bundles.
+# Output lands in BiscuitTin/Resources/Models/, which the Xcode target bundles.
 set -euo pipefail
 
 REPO="apple/coreml-mobileclip"
@@ -20,7 +20,7 @@ TOKENIZER_REPO="openai/clip-vit-base-patch32"
 TOKENIZER_REVISION="main"
 
 cd "$(dirname "$0")/.."
-DEST="Hatbox/Resources/Models"
+DEST="BiscuitTin/Resources/Models"
 mkdir -p "$DEST"
 
 fetch() {

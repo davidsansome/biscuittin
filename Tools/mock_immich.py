@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal mock Immich server for verifying the Hatbox read path end to end.
+"""Minimal mock Immich server for verifying the Biscuit Tin read path end to end.
 
 Serves only the endpoints M5 uses: server/about, auth/login, users/me,
 search/metadata and asset thumbnails. Assets are synthetic, with solid-colour
