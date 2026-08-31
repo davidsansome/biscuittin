@@ -4,7 +4,7 @@ import CoreML
 // Prints a CoreML model's real input/output description. The authority on tensor shapes,
 // names and preprocessing is the compiled model itself — never the docs or the export script.
 //
-//   swift Tools/modelprobe.swift OnlyDaves/Resources/Models/mobileclip_s0_image.mlpackage
+//   swift Tools/modelprobe.swift Hatbox/Resources/Models/mobileclip_s0_image.mlpackage
 
 let path = CommandLine.arguments[1]
 let url = URL(fileURLWithPath: path)

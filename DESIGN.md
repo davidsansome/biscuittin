@@ -1,16 +1,16 @@
-# OnlyDaves — iOS Photo Browser: Design Document
+# Hatbox — iOS Photo Browser: Design Document
 
 **Status:** Draft v3 — adds the future-proofed rotation architecture (video/Live
 Photo rotation in M9) and the performance & responsiveness contract. No code
 written yet.
 **Target:** Native iOS app (iOS 17+, iPhone-first, iPad-compatible layout).
-**Working name:** `OnlyDaves` (from the repo name; trivial to rename).
+**Name:** `Hatbox` (renamed from the working name `OnlyDaves` on 2026-08-31).
 
 ---
 
 ## 1. Overview
 
-OnlyDaves is a minimal native photo browser that presents a **single merged timeline** of:
+Hatbox is a minimal native photo browser that presents a **single merged timeline** of:
 
 - **Local photos and videos** from the device photo library (PhotoKit), and
 - **Remote assets** from an optional, user-configured **Immich** server.
@@ -142,9 +142,9 @@ All services are created once in `AppEnvironment` (a plain composition-root clas
 Single Xcode app target plus a test target. SPM dependency: GRDB.
 
 ```
-OnlyDaves/
+Hatbox/
 ├── App/
-│   ├── OnlyDavesApp.swift          # @main SwiftUI App; owns AppEnvironment
+│   ├── HatboxApp.swift          # @main SwiftUI App; owns AppEnvironment
 │   ├── AppEnvironment.swift        # Composition root; zero-I/O init (D19)
 │   ├── StartupSequencer.swift      # staged post-first-frame init order (D19)
 │   └── RootView.swift              # Hosts GridScreen; injects environment
@@ -227,7 +227,7 @@ OnlyDaves/
 │   ├── Signposts.swift             # os_signpost helpers for §14 budgets
 │   └── Log.swift                   # os.Logger categories
 │
-└── OnlyDavesTests/
+└── HatboxTests/
     ├── TimelineStoreTests.swift    # merge + bucketing + incremental apply
     ├── BootCacheTests.swift        # round-trip, corruption, version mismatch
     ├── ImmichClientTests.swift     # URLProtocol-stubbed endpoint tests
@@ -460,7 +460,7 @@ CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
 
 final class LocalAssetEditor {
     /// Applies a rotator's output (D10) via PHContentEditingInput/Output.
-    /// adjustmentData: formatIdentifier "dev.onlydaves.rotate", version "1".
+    /// adjustmentData: formatIdentifier "dev.hatbox.rotate", version "1".
     func applyRotation(asset: PHAsset, clockwise: Bool, rotator: AssetRotator) async throws
 }
 
@@ -681,7 +681,7 @@ Pipeline when enabled:
 5. **Publish**: recompute `remainingCount` = local assets minus `uploaded`/`ineligible`/`out_of_scope`.
 
 Scheduling: foreground kick on app-active (deferred behind first frame, D19) +
-library change; `BGProcessingTaskRequest` (id `dev.onlydaves.sync`,
+library change; `BGProcessingTaskRequest` (id `dev.hatbox.sync`,
 `requiresNetworkConnectivity = true`, external power not required) re-submitted
 after each run. Wi-Fi-only is **not** a v1 setting (uploads respect Low Data Mode
 via `allowsConstrainedNetworkAccess = false`). All engine work runs at
@@ -1212,9 +1212,11 @@ tensor.
 This is the AGENTS.md "a mock you wrote yourself cannot falsify your own
 assumptions" trap in its purest form: a self-consistent tokenizer encodes a
 *different sentence* than the user typed and still returns a plausible 512-dim
-vector, so search degrades with nothing failing. `"onlydaves"` tokenizes to
-`[11646, 3700, 542]` — `only|dav|es`, not the `only|da|ves` that reading the
-vocabulary suggests.
+vector, so search degrades with nothing failing. `"mobileclip"` tokenizes to
+`[9451, 944, 8546]` — `mobi|lec|lip`, not the `mobile|clip` that reading the
+vocabulary suggests. A second pin covers the `</w>` end-of-word marker, which the
+vocabulary carries as separate entries: `"hatbox"` opens with the bare `hat`
+(3447) where a standalone `"hat"` is `hat</w>` (3801).
 
 **One control experiment covered what no unit test could.**
 `Tools/clipprobe.swift` ran a fixed prompt set against four photos of known

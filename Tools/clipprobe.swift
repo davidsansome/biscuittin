@@ -14,12 +14,12 @@ import Vision
 // with that name, and this tool needs a second file for the tokenizer):
 //
 //   mkdir -p /tmp/clipprobe-build && cp Tools/clipprobe.swift /tmp/clipprobe-build/main.swift
-//   swiftc -O /tmp/clipprobe-build/main.swift OnlyDaves/Search/CLIPTokenizer.swift -o /tmp/clipprobe
+//   swiftc -O /tmp/clipprobe-build/main.swift Hatbox/Search/CLIPTokenizer.swift -o /tmp/clipprobe
 //   /tmp/clipprobe <image.jpg> "a photo of a waterfall" "a photo of a dog" …
 //
 // Run it from the repository root; the model paths are relative to it.
 
-let modelDir = URL(fileURLWithPath: "OnlyDaves/Resources/Models")
+let modelDir = URL(fileURLWithPath: "Hatbox/Resources/Models")
 
 func compiled(_ name: String) throws -> MLModel {
     let cache = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("\(name).mlmodelc")
