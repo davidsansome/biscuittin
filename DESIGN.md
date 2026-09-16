@@ -729,10 +729,12 @@ disabled. Tapping opens Settings. `out_of_scope` assets do **not** count as
   off-screen: crossfade.
 - Horizontal paging across the **flattened timeline order** (bucket boundaries are
   invisible here). Pager keeps 3 live pages (prev/current/next). Image pages are
-  `ZoomablePhotoView` (UIScrollView, min zoom aspect-fit, max 4×, double-tap to
-  toggle); they show the grid thumbnail instantly, load `viewerPreview`, and
-  upgrade to `fullResolution` when the user zooms past 1×. Neighbor pages
-  prefetch their previews.
+  `ZoomablePhotoView` (UIScrollView, min zoom aspect-fit, max 4× aspect-fit **or
+  the photo's own pixels at 1:1, whichever is larger**, double-tap to toggle);
+  they show the grid thumbnail instantly, load `viewerPreview`, and upgrade to
+  `fullResolution` when the user zooms past 1×. The upgrade carries the current
+  magnification and centre across the swap, and waits for an in-flight pinch to
+  end. Neighbor pages prefetch their previews.
 - **Video pages** (`VideoPlayerPageView`): show the poster frame instantly, attach
   an `AVPlayer` from `VideoPlaybackProvider`, and autoplay when the page becomes
   current; pause and reset when paged away. Center play/pause button appears with
@@ -1195,6 +1197,62 @@ targets. The grid below is how photos are opened.
 ---
 
 ## 21. Implementation Log
+
+
+### Zoom stopped short of a photo's own pixels (2026-09-16)
+
+Reported as "zooming into a high-resolution photo shows it at lower than native
+resolution". The `fullResolution` upgrade was firing and arriving correctly — the
+ceiling on how far you were allowed to zoom was the defect.
+
+`maximumZoomScale = fitScale * 4` is measured against the **screen**: it caps the
+photo at four viewports wide however many pixels it holds, so the higher the
+resolution the smaller the fraction of it that can ever be reached. Measured on an
+iPhone 17 Pro (402 pt wide) against a striped test chart, reading the framebuffer
+rather than judging sharpness by eye:
+
+| original | at maximum zoom | source stripe period | on-screen period |
+|---|---|---|---|
+| 12 MP (4032 px) | 1.20× its pixels | 4 px | 4.78 device px |
+| 48 MP (8064 px) | **0.60× its pixels** | 4 px | **2.40 device px** |
+
+So a 48 MP photo could only ever show 36 % of its pixels, and pinching further just
+rubber-banded. Exactly the photos with the most detail were the ones whose detail was
+unreachable — which is why the report was specific to high-resolution photos. The
+ceiling is now `max(fitScale * 4, image.scale / screenScale)`: the second term is the
+scale at which one image pixel covers one device pixel, past which there is nothing
+more to reveal. The chart now measures a 4.00 px on-screen period at maximum zoom —
+1:1, no resampling. Nothing changes for photos of 4 viewports or fewer (a 12 MP
+original still tops out at 4× fit), so this is a widening of §13.2's "max 4×", not a
+replacement.
+
+Three further defects on the same path, all found by instrumenting the run:
+
+1. **The swap did not preserve the zoom.** `zoomScale` is relative to the image's own
+   pixel size, so it means something different for every rendition; carrying the raw
+   number across meant a photo the user had magnified 1.2× jumped to the maximum the
+   instant the full-resolution image landed — 600 ms after they had let go. A
+   `ZoomAnchor` (magnification relative to aspect-fit, plus the centre point in unit
+   image coordinates) now carries the *view of the photo* instead of the number.
+2. **A rendition arriving mid-pinch fought the gesture.** UIScrollView derives
+   `zoomScale` from the scale at the gesture's start, expressed in the outgoing image's
+   coordinate space, so re-laying out underneath it snaps. Held until the fingers lift.
+3. **The full-resolution request belonged to the pager, keyed to `currentCell()`, on a
+   single shared token.** Any other page's request cancelled it, and a delivery that
+   landed after the user had paged on was discarded for belonging to a different asset.
+   Since the trigger is one-shot, a page that lost its request that way stayed on the
+   screen-sized preview however far it was zoomed. It is now the cell's own request,
+   with its own token, cancelled in `prepareForReuse`. Relatedly, `configureZoomScales`
+   steps `zoomScale` through 1× with the limits relaxed, and `scrollViewDidZoom` read
+   that as a user zoom — it would have spent the one-shot trigger on a request nobody
+   asked for and left none for the real pinch. Guarded.
+
+`fullResolution` requests now use `.highQualityFormat` + `resizeMode = .none`. `.fast`
+is free to return a rendition merely "similar to" the target, which is the wrong
+contract for a variant whose entire point is the asset's own pixels, and a degraded
+first delivery cannot improve on the preview already on screen. Opening a photo is
+untouched: it still requests `viewerPreview` alone, and fix (3) removes a spurious
+full-resolution fetch that could fire at open time.
 
 
 ### M10 — complete (2026-08-29)

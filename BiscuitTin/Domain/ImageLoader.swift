@@ -153,10 +153,20 @@ final class ImageLoader: @unchecked Sendable {
             guard !token.isCancelled else { return }
 
             let options = PHImageRequestOptions()
-            options.deliveryMode = .opportunistic
-            options.resizeMode = .fast
             options.isNetworkAccessAllowed = true
             options.isSynchronous = false
+            switch variant {
+            case .fullResolution:
+                // The point of this variant is the asset's own pixels, so nothing may resize
+                // it: `.fast` is free to hand back a rendition merely "similar to" the target.
+                // A degraded first delivery is wasted work too — the caller is already showing
+                // a screen-sized preview that no intermediate would improve on.
+                options.deliveryMode = .highQualityFormat
+                options.resizeMode = .none
+            case .gridThumb, .viewerPreview:
+                options.deliveryMode = .opportunistic
+                options.resizeMode = .fast
+            }
 
             let id = self.manager.requestImage(
                 for: asset,

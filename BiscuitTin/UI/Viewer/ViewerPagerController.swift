@@ -20,7 +20,6 @@ final class ViewerPagerController: UIViewController {
     private var items: [AssetStub]
     private(set) var currentIndex: Int
     private var isChromeVisible = true
-    private var fullResolutionToken: ImageRequestToken?
 
     // MARK: - Views
 
@@ -244,15 +243,6 @@ final class ViewerPagerController: UIViewController {
             }
         }
         cell.videoView.setLoadTask(task)
-    }
-
-    private func requestFullResolution(for stub: AssetStub) {
-        env.imageLoader.cancel(fullResolutionToken)
-        fullResolutionToken = env.imageLoader.requestImage(for: stub, variant: .fullResolution) {
-            [weak self] image, degraded in
-            guard let self, !degraded, let image else { return }
-            self.currentCell()?.applyFullResolution(image, for: stub.id)
-        }
     }
 
     // MARK: - Dismissal (requirement 6)
@@ -493,7 +483,6 @@ extension ViewerPagerController: UICollectionViewDataSource {
                        loader: env.imageLoader,
                        toolbarInset: currentVideoControlInset)
         page.onSingleTap = { [weak self] in self?.toggleChrome() }
-        page.onNeedsFullResolution = { [weak self] stub in self?.requestFullResolution(for: stub) }
         page.setChromeVisible(isChromeVisible, animated: false)
         return page
     }

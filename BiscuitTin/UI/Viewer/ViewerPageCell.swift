@@ -10,6 +10,8 @@ final class ViewerPageCell: UICollectionViewCell {
 
     private(set) var stub: AssetStub?
     private var token: ImageRequestToken?
+    private var fullResolutionToken: ImageRequestToken?
+    private var hasFullResolution = false
     private weak var loader: ImageLoader?
 
     /// Carries the optimistic rotation (§14 P4).
@@ -22,8 +24,6 @@ final class ViewerPageCell: UICollectionViewCell {
     fileprivate var previewRotationAngle: CGFloat = 0
 
     var onSingleTap: (() -> Void)?
-    /// Raised when the user zooms in past the fit scale, so a full-resolution image is fetched.
-    var onNeedsFullResolution: ((AssetStub) -> Void)?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -40,10 +40,7 @@ final class ViewerPageCell: UICollectionViewCell {
 
         photoView.onSingleTap = { [weak self] in self?.onSingleTap?() }
         videoView.onSingleTap = { [weak self] in self?.onSingleTap?() }
-        photoView.onZoomedIn = { [weak self] in
-            guard let self, let stub = self.stub else { return }
-            self.onNeedsFullResolution?(stub)
-        }
+        photoView.onZoomedIn = { [weak self] in self?.requestFullResolution() }
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -51,7 +48,10 @@ final class ViewerPageCell: UICollectionViewCell {
     override func prepareForReuse() {
         super.prepareForReuse()
         loader?.cancel(token)
+        loader?.cancel(fullResolutionToken)
         token = nil
+        fullResolutionToken = nil
+        hasFullResolution = false
         stub = nil
         clearRotationOverlay()
         photoView.setImage(nil, resetZoom: true)
@@ -79,6 +79,8 @@ final class ViewerPageCell: UICollectionViewCell {
         // upgrades, which is what keeps the page from ever showing empty (§14 P4).
         token = loader.requestImage(for: stub, variant: .viewerPreview) { [weak self] image, _ in
             guard let self, self.stub?.id == stub.id, let image else { return }
+            // A late preview must not undo the native-resolution rendition already on screen.
+            guard !self.hasFullResolution else { return }
             if isVideo {
                 self.videoView.setPoster(image)
             } else {
@@ -87,10 +89,22 @@ final class ViewerPageCell: UICollectionViewCell {
         }
     }
 
-    /// Swaps in a higher-quality rendition without disturbing the current zoom.
-    func applyFullResolution(_ image: UIImage, for id: AssetID) {
-        guard stub?.id == id, stub?.kind != .video else { return }
-        photoView.setImage(image, resetZoom: false)
+    /// Fetches the photo's native-resolution pixels, once, for the page the user is zooming.
+    ///
+    /// Owned by the cell rather than the pager: a single pager-wide request was cancelled by
+    /// whichever page asked next, and a delivery that landed after the user had paged on was
+    /// discarded for belonging to a different asset. Since the trigger is one-shot, a page that
+    /// lost its request that way stayed on the screen-sized preview however far it was zoomed.
+    private func requestFullResolution() {
+        guard let stub, stub.kind != .video, let loader,
+              !hasFullResolution, fullResolutionToken == nil else { return }
+
+        fullResolutionToken = loader.requestImage(for: stub, variant: .fullResolution) {
+            [weak self] image, degraded in
+            guard let self, !degraded, let image, self.stub?.id == stub.id else { return }
+            self.hasFullResolution = true
+            self.photoView.setImage(image, resetZoom: false)
+        }
     }
 
     func resetZoom(animated: Bool) {
