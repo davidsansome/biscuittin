@@ -26,10 +26,10 @@ final class DateScrubber: UIView {
         }
     }
 
-    /// Width of the invisible strip that accepts touches. Much wider than the visible handle —
-    /// a hairline is not something a thumb can reliably grab, and the system scroll indicator's
-    /// own hit area is similarly generous.
-    static let hitTargetWidth: CGFloat = 44
+    /// Width of the invisible strip that accepts touches. Wider than the visible handle —
+    /// a hairline is not something a thumb can reliably grab — but kept narrow enough that it
+    /// doesn't swallow horizontal swipes aimed at the rightmost column of thumbnails.
+    static let hitTargetWidth: CGFloat = 12
 
     private let handle = UIView()
     private let bubble = DateScrubberBubble()
