@@ -85,6 +85,63 @@ struct RemoteAssetRecord: Codable, FetchableRecord, PersistableRecord, Equatable
         guard let exifJSON, let data = exifJSON.data(using: .utf8) else { return nil }
         return try? JSONDecoder().decode(Immich.ExifInfo.self, from: data)
     }
+
+    // MARK: - Sync stream merge (D9)
+    //
+    // An `AssetV2` line and its `AssetExifV1` line are independent — one can change without the
+    // other, and either may be missing from a given batch. `apply` therefore only ever *overlays*
+    // fields the line actually carries, onto whatever this row already has, rather than
+    // reconstructing the row from scratch and losing the other side.
+
+    /// A not-yet-populated row for an id seen for the first time this batch. Always followed
+    /// immediately by `apply(_ asset:)`, which fills in everything that matters.
+    init(placeholderID immichID: String) {
+        self.immichID = immichID
+        checksumHex = ""
+        deviceAssetID = nil
+        deviceID = nil
+        type = Immich.AssetType.image.rawValue
+        livePhotoVideoID = nil
+        durationSeconds = 0
+        fileName = nil
+        captureAt = 0
+        width = nil
+        height = nil
+        isTrashed = false
+        exifJSON = nil
+        latitude = nil
+        longitude = nil
+        updatedAt = 0
+    }
+
+    /// Overlays a `sync/stream` `AssetV2` line. EXIF fields are left untouched — a changed asset
+    /// row does not imply changed EXIF, which arrives as its own line.
+    mutating func apply(_ asset: Immich.SyncAssetV2) {
+        checksumHex = asset.checksumHex
+        type = asset.type.rawValue
+        livePhotoVideoID = asset.livePhotoVideoId
+        durationSeconds = asset.durationSeconds
+        fileName = asset.originalFileName
+        captureAt = (Immich.parseDate(asset.localDateTime) ?? Immich.parseDate(asset.fileCreatedAt) ?? .distantPast)
+            .timeIntervalSince1970
+        if let assetWidth = asset.width { width = assetWidth }
+        if let assetHeight = asset.height { height = assetHeight }
+        // Immich reports trashing through `deletedAt`; the old `isTrashed` boolean doesn't exist
+        // on this DTO.
+        isTrashed = asset.deletedAt != nil
+        updatedAt = Date().timeIntervalSince1970
+    }
+
+    /// Overlays a `sync/stream` `AssetExifV1` line. Dimensions fill in only where `apply(_
+    /// asset:)` had none (v3.1.0 reports them at the asset's top level too, which takes priority).
+    mutating func apply(_ exif: Immich.SyncAssetExifV1) {
+        if width == nil { width = exif.exifImageWidth }
+        if height == nil { height = exif.exifImageHeight }
+        latitude = exif.latitude
+        longitude = exif.longitude
+        let info = Immich.ExifInfo(exif)
+        exifJSON = (try? JSONEncoder().encode(info)).flatMap { String(data: $0, encoding: .utf8) }
+    }
 }
 
 /// Row in `facet_links` — the checksum-keyed join between a local and a remote copy (D5).

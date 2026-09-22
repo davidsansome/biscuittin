@@ -184,6 +184,14 @@ final class GridViewController: UIViewController {
         collectionView.delegate = self
         view.addSubview(collectionView)
 
+        // Only the home screen owns a live server connection; the map panel is fed a filtered
+        // snapshot and has nothing of its own to refresh (D9).
+        if mode == .timeline {
+            let refresh = UIRefreshControl()
+            refresh.addAction(UIAction { [weak self] _ in self?.handlePullToRefresh() }, for: .valueChanged)
+            collectionView.refreshControl = refresh
+        }
+
         let pinch = UIPinchGestureRecognizer(target: pinchController,
                                              action: #selector(PinchColumnsController.handle(_:)))
         collectionView.addGestureRecognizer(pinch)
@@ -580,6 +588,15 @@ final class GridViewController: UIViewController {
             for await snapshot in self.env.timelineStore.snapshots {
                 await MainActor.run { self.apply(snapshot) }
             }
+        }
+    }
+
+    /// Pull-to-refresh (D9): a manual `sync/stream` catch-up, including any server-side deletes.
+    private func handlePullToRefresh() {
+        Task { [weak self] in
+            guard let self else { return }
+            await self.env.startup.pullToRefresh()
+            await MainActor.run { self.collectionView.refreshControl?.endRefreshing() }
         }
     }
 

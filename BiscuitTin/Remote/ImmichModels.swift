@@ -58,6 +58,28 @@ enum Immich {
         let exifImageHeight: Double?
         let dateTimeOriginal: String?
         let description: String?
+
+        /// From a `sync/stream` `AssetExifV1` line — same information, different shape
+        /// (`iso`/`exifImageWidth`/`exifImageHeight` are integers there, doubles here).
+        init(_ exif: SyncAssetExifV1) {
+            make = exif.make
+            model = exif.model
+            lensModel = exif.lensModel
+            fNumber = exif.fNumber
+            focalLength = exif.focalLength
+            iso = exif.iso.map(Double.init)
+            exposureTime = exif.exposureTime
+            latitude = exif.latitude
+            longitude = exif.longitude
+            city = exif.city
+            state = exif.state
+            country = exif.country
+            fileSizeInByte = exif.fileSizeInByte.map(Int64.init)
+            exifImageWidth = exif.exifImageWidth.map(Double.init)
+            exifImageHeight = exif.exifImageHeight.map(Double.init)
+            dateTimeOriginal = exif.dateTimeOriginal
+            description = exif.description
+        }
     }
 
     /// An asset's duration, however the server chooses to express it.
@@ -196,6 +218,97 @@ enum Immich {
             }
         }
         let assets: Bucket
+    }
+
+    // MARK: - Sync stream (D9)
+    //
+    // Verified against a real v3.1.0 server: `POST /sync/stream` reports changes against a
+    // cursor Immich tracks server-side per access token — upserts *and* explicit delete events —
+    // replacing both the paged full/delta sync above and the weekly hard-delete sweep it needed.
+    // A hard delete shows up as an `AssetDeleteV1` line on the very next call, so there is
+    // nothing left to reconcile locally.
+
+    /// What `sync/stream` may be asked for. Note the plural: the *request* names are "AssetsV2"
+    /// / "AssetExifsV1", but each returned *line*'s `type` is the singular "AssetV2" etc.
+    /// (`SyncEntityType` below) — easy to conflate, verified against the live server.
+    enum SyncRequestType: String, Encodable {
+        case assets = "AssetsV2"
+        case assetExifs = "AssetExifsV1"
+    }
+
+    struct SyncStreamRequest: Encodable {
+        let types: [SyncRequestType]
+        let reset: Bool
+    }
+
+    struct SyncAckRequest: Encodable {
+        let acks: [String]
+    }
+
+    /// Just enough of a `sync/stream` line to route it to the right payload type. Decoded twice
+    /// per line (header, then typed payload) rather than a custom single-pass decoder — simpler,
+    /// and a line is a few hundred bytes at most.
+    struct SyncLineHeader: Decodable {
+        let type: String
+        let ack: String
+    }
+
+    struct SyncLine<Payload: Decodable>: Decodable {
+        let data: Payload
+        let ack: String
+    }
+
+    enum AssetVisibility: String, Decodable {
+        case archive, timeline, hidden, locked
+    }
+
+    struct SyncAssetV2: Decodable {
+        let id: String
+        let originalFileName: String?
+        let checksum: String?
+        let fileCreatedAt: String?
+        let fileModifiedAt: String?
+        let localDateTime: String?
+        /// Milliseconds, nullable — unlike the mixed string/int `Duration` the old
+        /// `search/metadata` endpoint sends (see `Duration` above).
+        let duration: Int?
+        let type: AssetType
+        /// Non-nil once trashed; still present, not yet purged (D9).
+        let deletedAt: String?
+        let visibility: AssetVisibility
+        let livePhotoVideoId: String?
+        let width: Int?
+        let height: Int?
+
+        var checksumHex: String { Immich.normalizedChecksumHex(checksum) }
+        var durationSeconds: Double { Double(duration ?? 0) / 1000 }
+    }
+
+    /// A separate sync line from the asset it describes — may arrive before, after, or without
+    /// its matching `AssetV2` line in a given batch (D9).
+    struct SyncAssetExifV1: Decodable {
+        let assetId: String
+        let description: String?
+        let exifImageWidth: Int?
+        let exifImageHeight: Int?
+        let fileSizeInByte: Int?
+        let dateTimeOriginal: String?
+        let latitude: Double?
+        let longitude: Double?
+        let city: String?
+        let state: String?
+        let country: String?
+        let make: String?
+        let model: String?
+        let lensModel: String?
+        let fNumber: Double?
+        let focalLength: Double?
+        let iso: Int?
+        let exposureTime: String?
+    }
+
+    struct SyncAssetDeleteV1: Decodable {
+        let assetId: String
     }
 
     // MARK: - Mutations

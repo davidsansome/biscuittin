@@ -31,8 +31,10 @@ struct RemoteMergeData {
 /// Syncs Immich *metadata* into SQLite and serves it to the timeline (DESIGN.md §7.2, D9).
 ///
 /// Files are never synced here — only the rows that let the grid show remote assets offline.
-/// Full sync pages `search/metadata`; delta sync replays the same endpoint with an
-/// `updatedAfter` cursor.
+/// Both full and incremental sync go through `POST /sync/stream`, whose cursor Immich tracks
+/// server-side per access token: `reset: true` replays the whole library, `reset: false` replays
+/// only what changed since the last acknowledged position. Hard deletes arrive as explicit
+/// `AssetDeleteV1` lines in that same stream, so there is no separate reconciliation sweep.
 actor RemoteLibraryService {
 
     /// Emitted after each committed batch so the timeline can re-merge.
@@ -46,8 +48,9 @@ actor RemoteLibraryService {
     private var isSyncing = false
 
     private enum Cursor {
-        static let lastSync = "last_sync_cursor"
-        static let lastFullSweep = "last_full_sweep"
+        /// Wall-clock time of the last successful sync, for display only (§13.4) — the sync
+        /// cursor itself lives server-side, keyed to the access token.
+        static let lastSyncedAt = "last_synced_at"
     }
 
     init(database: AppDatabase,
@@ -76,130 +79,121 @@ actor RemoteLibraryService {
 
     // MARK: - Sync
 
-    /// First run against a server: pages the entire library into SQLite.
-    func fullSync(progress: (@Sendable (Int) -> Void)? = nil) async throws {
-        try await sync(updatedAfter: nil, progress: progress)
-        try setCursor(Cursor.lastFullSweep, to: Immich.iso8601String(from: Date()))
-    }
-
-    /// Incremental catch-up using the stored cursor.
-    func deltaSync() async throws {
-        let cursor = try getCursor(Cursor.lastSync)
-        try await sync(updatedAfter: cursor, progress: nil)
-    }
-
-    private func sync(updatedAfter: String?, progress: (@Sendable (Int) -> Void)?) async throws {
+    /// Streams every change since the server-tracked cursor (or the whole library, when `reset`
+    /// is true) and applies it in one pass. Replaces the old paged full/delta sync and the
+    /// weekly hard-delete sweep alike (D9) — an `AssetDeleteV1` line removes its row immediately,
+    /// on whichever call first reports it.
+    func syncStream(reset: Bool = false, progress: (@Sendable (Int) -> Void)? = nil) async throws {
         guard !isSyncing else { return }
         isSyncing = true
         defer { isSyncing = false }
 
         let client = try makeClient()
-        // Recorded before the first request so assets changed mid-sync are picked up next time
-        // rather than being skipped.
-        let startedAt = Date()
+        let body: Data
+        do {
+            body = try await client.syncStream(types: [.assets, .assetExifs], reset: reset)
+        } catch ImmichError.unauthorized {
+            session.markExpired()
+            throw ImmichError.unauthorized
+        }
 
-        var page = 1
-        var imported = 0
+        var upserts: [String: Immich.SyncAssetV2] = [:]
+        var exifs: [String: Immich.SyncAssetExifV1] = [:]
+        var deletedIDs: [String] = []
+        // A per-type watermark, not a per-line receipt — acking the last id of a type
+        // acknowledges every line of that type before it too (verified against a live server).
+        var lastAckByType: [String: String] = [:]
 
-        while true {
+        for lineData in body.split(separator: UInt8(ascii: "\n")) where !lineData.isEmpty {
             try Task.checkCancellation()
-            var request = Immich.MetadataSearchRequest()
-            request.page = page
-            request.updatedAfter = updatedAfter
-
-            let result: Immich.SearchPage
-            do {
-                result = try await client.searchAssets(request)
-            } catch ImmichError.unauthorized {
-                session.markExpired()
-                throw ImmichError.unauthorized
+            guard let header = try? JSONDecoder().decode(Immich.SyncLineHeader.self, from: lineData) else {
+                continue
             }
+            lastAckByType[header.type] = header.ack
 
-            let assets = result.assets.items
-            if result.assets.skippedCount > 0 {
-                Log.immich.error("Sync skipped \(result.assets.skippedCount) undecodable assets")
+            switch header.type {
+            case "AssetV2":
+                guard let line = try? JSONDecoder()
+                    .decode(Immich.SyncLine<Immich.SyncAssetV2>.self, from: lineData) else { continue }
+                upserts[line.data.id] = line.data
+            case "AssetExifV1":
+                guard let line = try? JSONDecoder()
+                    .decode(Immich.SyncLine<Immich.SyncAssetExifV1>.self, from: lineData) else { continue }
+                exifs[line.data.assetId] = line.data
+            case "AssetDeleteV1":
+                guard let line = try? JSONDecoder()
+                    .decode(Immich.SyncLine<Immich.SyncAssetDeleteV1>.self, from: lineData) else { continue }
+                deletedIDs.append(line.data.assetId)
+            default:
+                // "SyncCompleteV1" (end-of-batch marker) and anything not requested/handled yet —
+                // degrade gracefully rather than fail the whole batch (see file header comment).
+                continue
             }
-            guard !assets.isEmpty else { break }
-
-            try store(assets)
-            imported += assets.count
-            progress?(imported)
-            changesContinuation.yield()
-
-            guard let next = result.assets.nextPage, let nextPage = Int(next) else { break }
-            page = nextPage
+            progress?(upserts.count)
         }
 
-        try setCursor(Cursor.lastSync, to: Immich.iso8601String(from: startedAt))
-        Log.immich.info("Metadata sync imported \(imported) assets")
-        changesContinuation.yield()
-    }
+        try apply(upserts: upserts, exifs: exifs, deletedIDs: deletedIDs)
 
-    /// Immich reports trashing through `isTrashed`, but a hard delete simply stops appearing.
-    /// A periodic sweep re-pages everything and drops rows the server no longer lists (D9).
-    func reconcileDeletions() async throws {
-        let client = try makeClient()
-        var seen = Set<String>()
-        var page = 1
-
-        while true {
-            try Task.checkCancellation()
-            var request = Immich.MetadataSearchRequest()
-            request.page = page
-            let result = try await client.searchAssets(request)
-            let assets = result.assets.items
-            guard !assets.isEmpty else { break }
-            seen.formUnion(assets.map(\.id))
-            try store(assets)
-            guard let next = result.assets.nextPage, let nextPage = Int(next) else { break }
-            page = nextPage
+        // At most 3 entries (one per requested type), always well under the server's 1000-ack cap.
+        if !lastAckByType.isEmpty {
+            try await client.syncAck(Array(lastAckByType.values))
         }
-
-        let writer = try database.writer()
-        let removed = try await writer.write { db -> Int in
-            let all = try String.fetchAll(db, sql: "SELECT immich_id FROM remote_assets")
-            let stale = all.filter { !seen.contains($0) }
-            guard !stale.isEmpty else { return 0 }
-            let placeholders = databaseQuestionMarks(count: stale.count)
-            try db.execute(sql: "DELETE FROM remote_assets WHERE immich_id IN (\(placeholders))",
-                           arguments: StatementArguments(stale))
-            try db.execute(sql: "UPDATE facet_links SET immich_id = NULL WHERE immich_id IN (\(placeholders))",
-                           arguments: StatementArguments(stale))
-            return stale.count
-        }
-        if removed > 0 { Log.immich.info("Reconcile removed \(removed) stale remote rows") }
-        try setCursor(Cursor.lastFullSweep, to: Immich.iso8601String(from: Date()))
+        try setCursor(Cursor.lastSyncedAt, to: Immich.iso8601String(from: Date()))
+        Log.immich.info("Sync stream applied \(upserts.count) upserts, \(deletedIDs.count) deletes")
         changesContinuation.yield()
     }
 
     // MARK: - Persistence
 
-    private func store(_ assets: [Immich.Asset]) throws {
+    private func apply(upserts: [String: Immich.SyncAssetV2],
+                       exifs: [String: Immich.SyncAssetExifV1],
+                       deletedIDs: [String]) throws {
+        guard !upserts.isEmpty || !exifs.isEmpty || !deletedIDs.isEmpty else { return }
         let writer = try database.writer()
-        let ourDeviceID = session.deviceID
 
         try writer.write { db in
-            for asset in assets {
-                let record = RemoteAssetRecord(asset)
+            for (id, asset) in upserts {
+                guard asset.visibility == .timeline else {
+                    // Matches the old `isVisible: true` search filter (D9): archived, hidden and
+                    // locked assets never appeared in the grid, so one that turns non-timeline is
+                    // dropped rather than kept in a state nothing reads.
+                    try db.execute(sql: "DELETE FROM remote_assets WHERE immich_id = ?", arguments: [id])
+                    continue
+                }
+
+                var record = try RemoteAssetRecord.filter(key: id).fetchOne(db)
+                    ?? RemoteAssetRecord(placeholderID: id)
+                record.apply(asset)
+                if let exif = exifs[id] { record.apply(exif) }
                 try record.save(db)
 
-                // Our own uploads carry the PhotoKit identifier, so they link immediately
-                // without waiting for a checksum pass (D5).
-                if let deviceAssetID = asset.deviceAssetId,
-                   asset.deviceId == ourDeviceID,
-                   !record.checksumHex.isEmpty {
-                    try FacetLinkRecord(checksumHex: record.checksumHex,
-                                        localIdentifier: deviceAssetID,
-                                        immichID: asset.id).save(db)
-                } else if !record.checksumHex.isEmpty {
-                    // Checksum-only row; M6 fills in the local identifier once computed.
-                    try db.execute(sql: """
-                        INSERT INTO facet_links (checksum_hex, local_identifier, immich_id)
-                        VALUES (?, NULL, ?)
-                        ON CONFLICT(checksum_hex) DO UPDATE SET immich_id = excluded.immich_id
-                        """, arguments: [record.checksumHex, asset.id])
-                }
+                guard !record.checksumHex.isEmpty else { continue }
+                // Checksum-only link; M6 fills in the local identifier once computed. (v3.1.0
+                // never reports `deviceAssetId`/`deviceId` on this DTO, so the immediate-link
+                // fast path from the old `search/metadata` client cannot apply here either — it
+                // was already dead on this server version; see `Immich.Asset`'s own comment.)
+                try db.execute(sql: """
+                    INSERT INTO facet_links (checksum_hex, local_identifier, immich_id)
+                    VALUES (?, NULL, ?)
+                    ON CONFLICT(checksum_hex) DO UPDATE SET immich_id = excluded.immich_id
+                    """, arguments: [record.checksumHex, id])
             }
+
+            // EXIF lines for assets not touched by an upsert this batch: merge onto whatever is
+            // already cached, if anything. An asset this device has never synced has nowhere to
+            // attach the EXIF yet — it arrives paired with its asset on a future `reset` sync.
+            for (id, exif) in exifs where upserts[id] == nil {
+                guard var record = try RemoteAssetRecord.filter(key: id).fetchOne(db) else { continue }
+                record.apply(exif)
+                try record.save(db)
+            }
+
+            guard !deletedIDs.isEmpty else { return }
+            let placeholders = databaseQuestionMarks(count: deletedIDs.count)
+            try db.execute(sql: "DELETE FROM remote_assets WHERE immich_id IN (\(placeholders))",
+                           arguments: StatementArguments(deletedIDs))
+            try db.execute(sql: "UPDATE facet_links SET immich_id = NULL WHERE immich_id IN (\(placeholders))",
+                           arguments: StatementArguments(deletedIDs))
         }
     }
 
@@ -252,13 +246,6 @@ actor RemoteLibraryService {
                   AND r.is_trashed = 0
                 """)
         }
-    }
-
-    /// True when the periodic hard-delete sweep is due (D9).
-    func needsDeletionSweep(interval: TimeInterval = 7 * 24 * 3600) -> Bool {
-        guard let raw = try? getCursor(Cursor.lastFullSweep),
-              let last = Immich.parseDate(raw) else { return true }
-        return Date().timeIntervalSince(last) > interval
     }
 
     /// The Immich id paired with a local asset, when one is known.
@@ -394,7 +381,7 @@ actor RemoteLibraryService {
     }
 
     func lastSyncDate() -> Date? {
-        guard let cursor = try? getCursor(Cursor.lastSync) else { return nil }
+        guard let cursor = try? getCursor(Cursor.lastSyncedAt) else { return nil }
         return Immich.parseDate(cursor)
     }
 }

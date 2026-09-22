@@ -196,6 +196,209 @@ final class ImmichTests: XCTestCase {
         XCTAssertFalse(record.stub.hasLocal)
     }
 
+    // MARK: - Sync stream (D9)
+    //
+    // Verified against a real v3.1.0 server: `sync/stream` reports upserts and explicit delete
+    // events against a cursor Immich tracks server-side, replacing the old paged full/delta sync
+    // and its weekly hard-delete sweep. Two easy-to-conflate namings, both pinned below: the
+    // *request* type is plural ("AssetsV2"), the *response* line's `type` is singular ("AssetV2").
+
+    func testSyncLineHeaderRoutesByType() throws {
+        let assetLine = """
+        {"type":"AssetV2","data":{"id":"a1"},"ack":"AssetV2|01a"}
+        """
+        let header = try JSONDecoder().decode(Immich.SyncLineHeader.self, from: Data(assetLine.utf8))
+        XCTAssertEqual(header.type, "AssetV2")
+        XCTAssertEqual(header.ack, "AssetV2|01a")
+    }
+
+    func testSyncAssetV2DecodesRealServerShape() throws {
+        // One line as returned by a live server, duration in milliseconds and a base64 checksum.
+        let json = """
+        {"id":"a1","ownerId":"o1","originalFileName":"IMG_1.HEIC","thumbhash":"abc",
+         "checksum":"41ipRRJcK31MhPDdCW6B8j/1JJo=","fileCreatedAt":"2026-08-25T08:16:42.153Z",
+         "fileModifiedAt":"2026-08-25T08:17:18.000Z","createdAt":"2026-08-25T09:45:32.101Z",
+         "localDateTime":"2026-08-25T18:16:42.153Z","duration":4000,"type":"VIDEO",
+         "deletedAt":null,"isFavorite":false,"visibility":"timeline","livePhotoVideoId":null,
+         "stackId":null,"libraryId":null,"width":3024,"height":4032,"isEdited":false}
+        """
+        let asset = try JSONDecoder().decode(Immich.SyncAssetV2.self, from: Data(json.utf8))
+        XCTAssertEqual(asset.id, "a1")
+        XCTAssertEqual(asset.durationSeconds, 4, accuracy: 0.001, "duration is milliseconds, not seconds")
+        XCTAssertEqual(asset.checksumHex, "e358a945125c2b7d4c84f0dd096e81f23ff5249a")
+        XCTAssertEqual(asset.visibility, .timeline)
+        XCTAssertNil(asset.deletedAt)
+    }
+
+    func testSyncAssetV2DecodesDeletedAtAndNonTimelineVisibility() throws {
+        let json = """
+        {"id":"a1","originalFileName":"x.jpg","checksum":"c1","fileCreatedAt":null,
+         "fileModifiedAt":null,"localDateTime":null,"duration":null,"type":"IMAGE",
+         "deletedAt":"2026-09-22T22:15:53.441Z","visibility":"archive","livePhotoVideoId":null,
+         "width":null,"height":null}
+        """
+        let asset = try JSONDecoder().decode(Immich.SyncAssetV2.self, from: Data(json.utf8))
+        XCTAssertNotNil(asset.deletedAt)
+        XCTAssertEqual(asset.visibility, .archive)
+        XCTAssertEqual(asset.durationSeconds, 0)
+    }
+
+    func testSyncAssetExifV1Decodes() throws {
+        let json = """
+        {"assetId":"a1","description":null,"exifImageWidth":4000,"exifImageHeight":3000,
+         "fileSizeInByte":1234,"orientation":"1","dateTimeOriginal":"2026-08-25T08:16:42.000Z",
+         "modifyDate":null,"timeZone":null,"latitude":48.85,"longitude":2.29,
+         "projectionType":null,"city":"Paris","state":null,"country":"France","make":"Immich",
+         "model":"Cam","lensModel":null,"fNumber":1.8,"focalLength":24,"iso":100,
+         "exposureTime":"1/125","profileDescription":null,"rating":null,"fps":null}
+        """
+        let exif = try JSONDecoder().decode(Immich.SyncAssetExifV1.self, from: Data(json.utf8))
+        XCTAssertEqual(exif.assetId, "a1")
+        XCTAssertEqual(exif.latitude ?? 0, 48.85, accuracy: 0.0001)
+        XCTAssertEqual(exif.city, "Paris")
+        XCTAssertEqual(exif.iso, 100)
+    }
+
+    func testSyncAssetDeleteV1Decodes() throws {
+        let json = #"{"assetId":"deleted-1"}"#
+        let delete = try JSONDecoder().decode(Immich.SyncAssetDeleteV1.self, from: Data(json.utf8))
+        XCTAssertEqual(delete.assetId, "deleted-1")
+    }
+
+    /// The request names are plural ("AssetsV2"/"AssetExifsV1") though the lines that come back
+    /// are singular ("AssetV2"/"AssetExifV1") — conflating them means requesting a type the
+    /// server rejects.
+    func testSyncRequestTypeRawValuesArePlural() {
+        XCTAssertEqual(Immich.SyncRequestType.assets.rawValue, "AssetsV2")
+        XCTAssertEqual(Immich.SyncRequestType.assetExifs.rawValue, "AssetExifsV1")
+    }
+
+    func testSyncStreamPostsTypesAndResetFlag() async throws {
+        let recorder = RequestRecorder()
+        let client = ImmichClient(baseURL: URL(string: "https://s.example.com")!,
+                                  session: StubURLProtocol.makeSession(recorder),
+                                  tokenProvider: { "tok" })
+
+        await recorder.stub(path: "/api/sync/stream", json: "")
+        _ = try await client.syncStream(types: [.assets, .assetExifs], reset: true)
+
+        let request = await recorder.lastRequest
+        XCTAssertEqual(request?.httpMethod, "POST")
+        XCTAssertEqual(request?.url?.path, "/api/sync/stream")
+        XCTAssertEqual(request?.value(forHTTPHeaderField: "Authorization"), "Bearer tok")
+
+        let capturedBody = await recorder.lastBody
+        let body = try XCTUnwrap(capturedBody)
+        let decoded = try JSONDecoder().decode(DecodedSyncStreamRequest.self, from: body)
+        XCTAssertEqual(decoded.types, ["AssetsV2", "AssetExifsV1"])
+        XCTAssertTrue(decoded.reset)
+    }
+
+    func testSyncAckPostsAckIDs() async throws {
+        let recorder = RequestRecorder()
+        let client = ImmichClient(baseURL: URL(string: "https://s.example.com")!,
+                                  session: StubURLProtocol.makeSession(recorder),
+                                  tokenProvider: { "tok" })
+
+        await recorder.stub(path: "/api/sync/ack", json: "", status: 204)
+        try await client.syncAck(["AssetV2|01a", "AssetExifV1|01b"])
+
+        let request = await recorder.lastRequest
+        XCTAssertEqual(request?.httpMethod, "POST")
+        XCTAssertEqual(request?.url?.path, "/api/sync/ack")
+        let capturedBody = await recorder.lastBody
+        let body = try XCTUnwrap(capturedBody)
+        let decoded = try JSONDecoder().decode(DecodedSyncAck.self, from: body)
+        XCTAssertEqual(decoded.acks, ["AssetV2|01a", "AssetExifV1|01b"])
+    }
+
+    func testSyncAckSkipsRequestWhenEmpty() async throws {
+        let recorder = RequestRecorder()
+        let client = ImmichClient(baseURL: URL(string: "https://s.example.com")!,
+                                  session: StubURLProtocol.makeSession(recorder),
+                                  tokenProvider: { "tok" })
+        try await client.syncAck([])
+        let request = await recorder.lastRequest
+        XCTAssertNil(request, "an empty ack batch must not make a request")
+    }
+
+    private struct DecodedSyncStreamRequest: Decodable { let types: [String]; let reset: Bool }
+    private struct DecodedSyncAck: Decodable { let acks: [String] }
+
+    // MARK: - RemoteAssetRecord merge (D9)
+    //
+    // An `AssetV2` line and its `AssetExifV1` line are independent and may arrive in either
+    // order, or not both in the same batch — `apply` must overlay, never clobber.
+
+    func testApplyAssetPreservesExistingEXIF() throws {
+        var record = RemoteAssetRecord(placeholderID: "a1")
+        record.apply(try decodeSyncAsset(id: "a1", width: 100, height: 200))
+        record.apply(try decodeSyncExif(assetID: "a1", latitude: 48.85, longitude: 2.29))
+        XCTAssertEqual(record.latitude ?? 0, 48.85, accuracy: 0.0001)
+
+        // A later batch's asset-only line (no EXIF this time) must not erase what is cached.
+        record.apply(try decodeSyncAsset(id: "a1", width: 100, height: 200))
+        XCTAssertEqual(record.latitude ?? 0, 48.85, accuracy: 0.0001,
+                       "an asset-only update must not clobber previously-known EXIF")
+    }
+
+    func testApplyExifFillsDimensionsOnlyWhenAssetOmitsThem() throws {
+        var withDims = RemoteAssetRecord(placeholderID: "a1")
+        withDims.apply(try decodeSyncAsset(id: "a1", width: 100, height: 200))
+        withDims.apply(try decodeSyncExif(assetID: "a1", exifWidth: 9999, exifHeight: 9999))
+        XCTAssertEqual(withDims.width, 100, "top-level asset dimensions take priority over EXIF")
+
+        var withoutDims = RemoteAssetRecord(placeholderID: "a2")
+        withoutDims.apply(try decodeSyncAsset(id: "a2", width: nil, height: nil))
+        withoutDims.apply(try decodeSyncExif(assetID: "a2", exifWidth: 640, exifHeight: 480))
+        XCTAssertEqual(withoutDims.width, 640, "EXIF fills in dimensions the asset line omitted")
+    }
+
+    func testApplyAssetMarksTrashedFromDeletedAt() throws {
+        var record = RemoteAssetRecord(placeholderID: "a1")
+        record.apply(try decodeSyncAsset(id: "a1", deletedAt: "2026-09-22T22:15:53.441Z"))
+        XCTAssertTrue(record.isTrashed)
+    }
+
+    /// `jsonLiteral(_:)` renders a value as JSON source text ("null" for nil, quoted for a
+    /// string) — kept as a plain function rather than inline in the interpolations below, which
+    /// otherwise crashes the type checker ("failed to produce diagnostic for expression").
+    private func jsonLiteral(_ value: Int?) -> String { value.map { "\($0)" } ?? "null" }
+    private func jsonLiteral(_ value: Double?) -> String { value.map { "\($0)" } ?? "null" }
+    private func jsonLiteral(_ value: String?) -> String { value.map { "\"\($0)\"" } ?? "null" }
+
+    private func decodeSyncAsset(id: String, width: Int? = 100, height: Int? = 100,
+                                 deletedAt: String? = nil) throws -> Immich.SyncAssetV2 {
+        let widthLiteral = jsonLiteral(width)
+        let heightLiteral = jsonLiteral(height)
+        let deletedAtLiteral = jsonLiteral(deletedAt)
+        let json = """
+        {"id":"\(id)","originalFileName":"x.jpg","checksum":"c1",
+         "fileCreatedAt":"2026-08-18T10:00:00.000Z","fileModifiedAt":null,
+         "localDateTime":"2026-08-18T10:00:00.000Z","duration":null,"type":"IMAGE",
+         "deletedAt":\(deletedAtLiteral),"visibility":"timeline",
+         "livePhotoVideoId":null,"width":\(widthLiteral),"height":\(heightLiteral)}
+        """
+        return try JSONDecoder().decode(Immich.SyncAssetV2.self, from: Data(json.utf8))
+    }
+
+    private func decodeSyncExif(assetID: String, exifWidth: Int? = nil, exifHeight: Int? = nil,
+                                latitude: Double? = nil, longitude: Double? = nil) throws -> Immich.SyncAssetExifV1 {
+        let widthLiteral = jsonLiteral(exifWidth)
+        let heightLiteral = jsonLiteral(exifHeight)
+        let latitudeLiteral = jsonLiteral(latitude)
+        let longitudeLiteral = jsonLiteral(longitude)
+        let json = """
+        {"assetId":"\(assetID)","description":null,
+         "exifImageWidth":\(widthLiteral),"exifImageHeight":\(heightLiteral),
+         "fileSizeInByte":null,"dateTimeOriginal":null,
+         "latitude":\(latitudeLiteral),"longitude":\(longitudeLiteral),
+         "city":null,"state":null,"country":null,"make":null,"model":null,"lensModel":null,
+         "fNumber":null,"focalLength":null,"iso":null,"exposureTime":null}
+        """
+        return try JSONDecoder().decode(Immich.SyncAssetExifV1.self, from: Data(json.utf8))
+    }
+
     // MARK: - Client contracts
 
     func testLoginPostsCredentialsToExpectedPath() async throws {

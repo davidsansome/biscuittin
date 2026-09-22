@@ -62,7 +62,7 @@ final class StartupSequencer: ObservableObject {
             // Publish an authoritative index anyway: a configured server may still have photos
             // to show, and a stale boot cache must stop showing local ones we can't read.
             await timelineStore.startLive()
-            await runRemoteDeltaSync()
+            await runRemoteSync()
             return
         }
 
@@ -70,7 +70,7 @@ final class StartupSequencer: ObservableObject {
         await timelineStore.startLive()
         phase = .ready
 
-        await runRemoteDeltaSync()
+        await runRemoteSync()
 
         // Upload sync runs last: it is the lowest-priority work and must never delay the
         // grid or the metadata refresh (§14 P6).
@@ -85,19 +85,17 @@ final class StartupSequencer: ObservableObject {
 
     /// Catches up with the server after the first frame. Failures are logged, never surfaced
     /// as a blocking error — the grid is already usable from cached metadata (§15 offline).
-    private func runRemoteDeltaSync() async {
+    ///
+    /// `syncStream` reports hard deletes as explicit events in the same call (D9), so unlike the
+    /// old paged delta sync this is the whole catch-up — no separate reconciliation sweep needed.
+    private func runRemoteSync() async {
         guard session.isConfigured else { return }
         do {
-            try await remoteLibrary.deltaSync()
-            // Hard deletes on the server simply stop appearing, so a periodic full sweep is
-            // what removes their rows (D9).
-            if await remoteLibrary.needsDeletionSweep() {
-                try await remoteLibrary.reconcileDeletions()
-            }
+            try await remoteLibrary.syncStream(reset: false)
         } catch is CancellationError {
             return
         } catch {
-            Log.immich.error("Delta sync failed: \(error.localizedDescription, privacy: .public)")
+            Log.immich.error("Sync failed: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -105,9 +103,17 @@ final class StartupSequencer: ObservableObject {
     func sceneDidBecomeActive() {
         guard hasStarted else { return }
         Task {
-            await runRemoteDeltaSync()
+            await runRemoteSync()
             await syncEngine.kick()
         }
+    }
+
+    /// Pull-to-refresh on the grid (D9). Cheap enough to call directly now that a sync is a
+    /// bounded delta fetch rather than a full page-through of the library.
+    func pullToRefresh() async {
+        guard hasStarted else { return }
+        await runRemoteSync()
+        await timelineStore.refresh()
     }
 
     /// Re-checks authorization after the user returns from the Settings app.

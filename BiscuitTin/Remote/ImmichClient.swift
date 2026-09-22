@@ -59,6 +59,36 @@ actor ImmichClient {
         try await send(path: "/api/assets/\(id)", method: "GET")
     }
 
+    // MARK: - Sync (D9)
+
+    /// Raw NDJSON body of a `sync/stream` batch — one line per change since the cursor Immich
+    /// tracks server-side for this access token, or the whole history when `reset` is true.
+    /// Returned undecoded: `RemoteLibraryService` routes each line by its own `type` field.
+    func syncStream(types: [Immich.SyncRequestType], reset: Bool) async throws -> Data {
+        var request = try makeRequest(path: "/api/sync/stream", method: "POST",
+                                      body: Immich.SyncStreamRequest(types: types, reset: reset),
+                                      timeout: Self.binaryTimeout)
+        if let token = await tokenProvider() {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        return try await dataForRequest(request)
+    }
+
+    /// Advances the server-side cursor so acknowledged lines are not sent again. At most one ack
+    /// per type is ever needed — ack ids are a per-type watermark, not a per-line receipt
+    /// (verified against a real server: acking only the last id of a batch advanced the cursor
+    /// past every line before it).
+    func syncAck(_ acks: [String]) async throws {
+        guard !acks.isEmpty else { return }
+        var request = try makeRequest(path: "/api/sync/ack", method: "POST",
+                                      body: Immich.SyncAckRequest(acks: acks),
+                                      timeout: Self.metadataTimeout)
+        if let token = await tokenProvider() {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        _ = try await dataForRequest(request)
+    }
+
     // MARK: - Binary
 
     func thumbnailData(id: String, size: ThumbnailSize) async throws -> Data {

@@ -123,11 +123,11 @@ final class SettingsViewModel: ObservableObject {
                 self.serverURLText = url.absoluteString
                 self.statusMessage = "Downloading library details…"
 
-                try await self.remoteLibrary.fullSync { count in
+                try await self.remoteLibrary.syncStream(reset: true) { count in
                     Task { @MainActor [weak self] in self?.syncedCount = count }
                 }
 
-                // No explicit timeline refresh here. `fullSync` already yields on the remote
+                // No explicit timeline refresh here. `syncStream` already yields on the remote
                 // change stream, and `TimelineStore` coalesces those into one rebuild. Calling
                 // `refresh()` as well raced that delivery — the stream's yield arrived after the
                 // refresh had run, re-arming the coalescer and costing a second full rebuild of
@@ -253,7 +253,7 @@ final class SettingsViewModel: ObservableObject {
             self.isWorking = true
             self.statusMessage = "Refreshing…"
             do {
-                try await self.remoteLibrary.deltaSync()
+                try await self.remoteLibrary.syncStream(reset: false)
                 await self.timelineStore.refresh()
                 self.lastSyncDate = await self.remoteLibrary.lastSyncDate()
             } catch {

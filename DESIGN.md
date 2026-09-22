@@ -82,7 +82,7 @@ downstream assumes them as written.
 | **D6** | Timeline construction | **In-memory merged index** of lightweight `AssetStub` structs (~56 bytes each) sorted by capture date desc, bucketed on demand by day/week/month, published as immutable snapshots. Two additions for performance: **(a)** the index is **persisted as a boot cache** and loaded before anything else at launch (D19); **(b)** library/sync changes are applied **incrementally** to the index, not by full rebuild (D20) — full rebuild remains as the reconciliation fallback. | 200k stubs ≈ 12 MB — acceptable. If profiling shows problems at extreme sizes, the `TimelineStore` API is designed so a windowed implementation can replace the in-memory one without touching the UI. |
 | **D7** | Immich auth | `POST /api/auth/login` with email + password → **access token stored in Keychain**. The password itself is never persisted. Requests use `Authorization: Bearer <token>`. | Matches requirement 13. An API-key field is a cheap future addition (`x-api-key` header) but is out of v1 scope. |
 | **D8** | Immich API surface & versioning | Target **Immich v3.1.0** (current release, confirmed at review); require **server ≥ v3.0** via `GET /api/server/about` at login, failing settings validation with a clear message on older servers. | Implementers **must validate every endpoint path, field, and multipart shape against the v3.1.0 OpenAPI spec** — Immich serves it at `/api/docs` on the target server. The endpoint tables in §7 are the contract to verify, not a substitute for the spec. |
-| **D9** | Remote metadata sync strategy | Initial **full sync** by paging `POST /api/search/metadata` (order desc, `withExif: true`, page size 1000) into SQLite; **delta sync** on foreground/app-start using `updatedAfter` cursor; deletions reconciled by a periodic full-ID sweep — v1 does the sweep weekly or on pull-to-refresh. | If v3.1.0's dedicated `/api/sync/*` delta endpoints prove stable during M5 implementation, they may be used instead — the choice is encapsulated behind `RemoteLibraryService` and changes nothing else. |
+| **D9** | Remote metadata sync strategy | Both full and incremental sync go through **`POST /api/sync/stream`** (`types: [AssetsV2, AssetExifsV1]`), whose cursor Immich tracks server-side per access token: `reset: true` replays the whole library (first sign-in), `reset: false` replays only what changed (foreground, pull-to-refresh, Settings "Refresh Now"). Hard deletes arrive as explicit `AssetDeleteV1` lines in that same stream, so there is **no separate reconciliation sweep** — a delete is visible on the very next sync, not gated behind a weekly cursor. Acks are a per-type watermark (`POST /api/sync/ack`), so at most 3 are ever sent regardless of library size. | Superseded the original paged-`search/metadata` design (below) once the dedicated sync endpoints were confirmed stable against a real v3.1.0 server — see Implementation Log, 2026-09-23. `RemoteLibraryService.syncStream` is still the sole point of contact, so nothing above it changed. Original v1 design, kept for context: full sync paged `search/metadata` (`updatedAfter` cursor for delta), with deletions caught only by a periodic full-ID sweep — weekly, or in principle on pull-to-refresh, though no such control was ever wired up, so in practice a hard delete could sit unsynced for up to 7 days. |
 | **D10** | Rotation architecture | Rotation is a **per-facet physical operation dispatched by `MediaKind` to a per-kind strategy** behind one `AssetRotator` protocol. **v1 ships the image strategy**; the video and Live Photo strategies ship in **M9**, but their approach is decided now: **videos rotate losslessly** by rewriting the track transform (remux via `AVMutableMovie`, no re-encode) — locally written as a PhotoKit content-editing output, remotely as download → remux → `PUT /api/assets/{id}/original`; **Live Photos rotate via `PHLivePhotoEditingContext`** (keeps still + paired video consistent) locally, with the remote still replaced like an image. Images: local → PhotoKit content edit (Core Image re-encode); remote → download, rotate pixels, replace-original. Both facets are always updated; remote failure → partial-success toast + queued retry. Until M9, non-image rotations are skipped with a reported count. | Immich has no server-side rotate. Pixel rotation (images) keeps Immich thumbnails correct; transform-remux (video) avoids re-encoding multi-GB files and is lossless. The strategy protocol is the day-one commitment; per-kind implementations are additive. |
 | **D11** | Delete semantics | The delete button (grid multi-select and viewer) **always deletes everywhere**: local facet via `PHAssetChangeRequest.deleteAssets` (iOS shows its own system confirmation) and remote facet via `DELETE /api/assets` (Immich moves to trash — recoverable server-side). Mixed-facet and remote-only deletes get **one app confirmation dialog** stating exactly what will happen. Local-only deletion is **never** offered through the delete button — it exists only as the separate "Free up space" feature (D18). | Confirmed at review: delete means delete, everywhere; freeing device space is a distinct, clearly-labeled operation. |
 | **D12** | Upload sync mechanics | `BGProcessingTask` + **background `URLSession`** upload tasks; dedup before upload via `POST /api/assets/bulk-upload-check` with SHA-1 checksums; checksums computed streaming and cached in SQLite. Sync also runs opportunistically while the app is foregrounded. Videos upload through the same pipeline. | Background URLSession survives suspension; bulk-upload-check avoids re-uploading assets that already exist server-side (critical for first-run against an existing library). |
@@ -348,6 +348,11 @@ actor ImmichClient {
     func searchAssets(_ req: MetadataSearchRequest) async throws -> SearchPage  // POST /api/search/metadata
     func assetInfo(id: String) async throws -> AssetResponseDTO                 // GET  /api/assets/{id}
 
+    // Sync (D9) — what RemoteLibraryService.syncStream actually drives; searchAssets above is
+    // no longer on the sync path (kept as a general-purpose, independently-tested primitive).
+    func syncStream(types: [SyncRequestType], reset: Bool) async throws -> Data // POST /api/sync/stream (NDJSON)
+    func syncAck(_ acks: [String]) async throws                                 // POST /api/sync/ack
+
     // Binary
     func thumbnailData(id: String, size: ThumbnailSize) async throws -> Data    // GET  /api/assets/{id}/thumbnail?size=
     func originalData(id: String) async throws -> (Data, filename: String)      // GET  /api/assets/{id}/original
@@ -386,18 +391,17 @@ Notes for implementers:
 
 ```swift
 actor RemoteLibraryService {
-    var isConfigured: Bool               // has base URL + token
-    func fullSync() async throws         // page search/metadata → upsert remote_assets
-    func deltaSync() async throws        // updatedAfter cursor
-    func reconcileDeletions() async throws  // weekly / pull-to-refresh (D9)
-    var changes: AsyncStream<RemoteChangeBatch>  // upserted/removed IDs → TimelineStore.applyChange
+    var isConfigured: Bool                              // has base URL + token
+    func syncStream(reset: Bool) async throws           // sync/stream + apply + ack (D9)
+    var changes: AsyncStream<Void>                       // a batch committed → TimelineStore re-merges
 }
 ```
 
-Runs delta sync on: app foreground (after first frame, per D19), settings save,
-pull-to-refresh. Persists `last_sync_cursor` in the kv table. Change batches carry
-the affected stub data so `TimelineStore` can apply them incrementally without
-re-querying.
+`reset: true` on first sign-in (replays the whole library); `reset: false` everywhere else — app
+foreground (after first frame, per D19), Settings "Refresh Now", and pull-to-refresh on the grid.
+The cursor lives server-side against the access token; the only local state is `last_synced_at`
+in the kv table, kept purely for the Settings display. Upserts and hard-delete events arrive in
+the same call, so there is no separate reconciliation step to schedule.
 
 ### 7.3 GRDB schema
 
@@ -1198,6 +1202,42 @@ targets. The grid below is how photos are opened.
 
 ## 21. Implementation Log
 
+
+### Hard deletes could sit unsynced for a week (2026-09-23)
+
+Found by driving remote sync against a real server rather than trusting the design: signed in,
+let the app sync, deleted an asset server-side (`DELETE /api/assets`, `force: true`), then tapped
+"Refresh Now" twice. The "Last refreshed" timestamp updated each time — the sync genuinely ran —
+but the deleted photo never left the grid. Direct inspection of `remote_assets` confirmed it: the
+row stayed at `is_trashed = 0`, and the table held one more row than the server's own asset count,
+unchanged across both refreshes.
+
+Root cause: `deltaSync()` replayed `search/metadata`, which simply stops listing a hard-deleted
+asset rather than reporting its removal — there is nothing in that response to notice. The actual
+fix, `reconcileDeletions()` (a full-ID sweep), was only ever invoked from `StartupSequencer`
+behind a 7-day cursor (D9's "weekly" sweep). D9 also said the sweep should run "on pull-to-refresh"
+— but no `UIRefreshControl` existed anywhere in `GridViewController`, so that half of the design
+was never built. Net effect: a server-side hard delete would not disappear from the app until a
+week had passed, and nothing the user could tap made it happen sooner.
+
+The fix replaces the mechanism rather than patching the trigger. Immich v3.1.0 exposes
+`POST /api/sync/stream` (stable since API v2) — verified live: hard-deleting an asset and calling
+`sync/stream` again on the same cursor returned an explicit `AssetDeleteV1` line for it, the very
+next call, no sweep involved. `RemoteLibraryService.syncStream(reset:)` now replaces `fullSync`,
+`deltaSync` and `reconcileDeletions` outright: `reset: true` on first sign-in, `reset: false`
+everywhere else (foreground, Settings "Refresh Now", and a newly-added pull-to-refresh on the
+grid — cheap enough to offer directly now that a sync is a bounded delta, not a full page-through).
+
+Two easy-to-conflate namings, both pinned in `ImmichTests`: the sync *request* type is plural
+("AssetsV2"/"AssetExifsV1"); each returned *line*'s `type` is singular ("AssetV2"/"AssetExifV1").
+EXIF arrives as its own line (`AssetExifV1`), independent of and interleaved with the asset line
+it describes — `RemoteAssetRecord.apply(_:)` overlays each onto whatever is already cached rather
+than reconstructing the row, or an asset-only line on a later sync would silently erase EXIF/GPS
+the previous sync had already stored.
+
+Re-verified end to end against the real server after the change: two separate hard deletes, one
+picked up by pull-to-refresh and one by "Refresh Now", both removed from `remote_assets` on the
+very next call, local row count landing exactly on the server's own asset count each time.
 
 ### Zoom stopped short of a photo's own pixels (2026-09-16)
 
