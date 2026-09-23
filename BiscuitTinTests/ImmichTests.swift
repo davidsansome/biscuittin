@@ -525,6 +525,9 @@ final class ImmichTests: XCTestCase {
 
         let request = await recorder.lastRequest
         XCTAssertEqual(request?.httpMethod, "DELETE")
+        // A stock server answers an unauthenticated DELETE with 401, which the caller reads
+        // as an expired session.
+        XCTAssertEqual(request?.value(forHTTPHeaderField: "Authorization"), "Bearer t")
         let capturedBody = await recorder.lastBody
         let body = try XCTUnwrap(capturedBody)
         let decoded = try JSONDecoder().decode(DecodedDelete.self, from: body)

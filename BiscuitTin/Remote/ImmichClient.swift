@@ -126,10 +126,11 @@ actor ImmichClient {
     func deleteAssets(ids: [String], force: Bool = false) async throws {
         guard !ids.isEmpty else { return }
         _ = try await dataForRequest(
-            makeRequest(path: "/api/assets",
-                        method: "DELETE",
-                        body: Immich.DeleteRequest(ids: ids, force: force),
-                        timeout: Self.metadataTimeout))
+            authorize(try makeRequest(path: "/api/assets",
+                                      method: "DELETE",
+                                      body: Immich.DeleteRequest(ids: ids, force: force),
+                                      timeout: Self.metadataTimeout),
+                      token: await tokenProvider()))
     }
 
     func bulkUploadCheck(_ items: [Immich.BulkUploadCheckItem]) async throws
