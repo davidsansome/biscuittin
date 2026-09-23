@@ -1933,6 +1933,42 @@ disabled and changing that needs admin access; the mock follows the server's sou
 AGENTS.md a mock cannot falsify its own assumptions. Try it against a real Authelia/Authentik/
 Keycloak setup before relying on it.
 
+### D14 deviation: `NSAllowsArbitraryLoads` unconditionally
+
+Sign-in to a LAN Immich server over plain HTTP failed on a real device. D14 planned to add
+`NSAllowsArbitraryLoads` only behind a user acknowledgement, but ATS is a static Info.plist
+setting and cannot be toggled at runtime, so the gate can only live in the UI
+(`ImmichAuthSession.isInsecureNonLocal` still drives the warning). `NSAllowsLocalNetworking` was
+removed rather than kept alongside: iOS ignores `NSAllowsArbitraryLoads` when it is present.
+
+### The post-delete freeze: a 70k-item grid snapshot (2026-09-23)
+
+Deleting a photo froze the UI for 4–5 s on an iPhone 13 signed in to a 70,831-asset library.
+A main-thread watchdog measured two consecutive blocks of ~3.1 s; the delete itself (PhotoKit
+~1 s including the system prompt, Immich HTTP ~80 ms) was not the problem.
+
+* **Every grid update rebuilt its diffable snapshot, and that costs ~3 s at this size.** The
+  cost is per `appendItems(_:toSection:)` *call*, not per item: 4,048 day sections took
+  ~2,800 ms, the same 70k items appended in one call 60 ms. `Int` identifiers only reduced it to
+  1,100 ms, and interleaving `appendSections`/`appendItems` did not help. Editing the live
+  snapshot is cheap (`dataSource.snapshot()` ~0 ms, one `deleteItems` ~20 ms), so the grid now
+  patches small deltas into the existing snapshot (`GridViewController.patch`) and verifies the
+  result against the target, falling back to a full build when it differs.
+* **One delete published two snapshots.** `deleteRemote` yields on the remote change stream,
+  whose full rebuild produced an identical index and published it anyway. Rebuilds now publish
+  only when the index or provenance actually changed.
+* **That check could never pass**, because `AssetStub`'s synthesized `==` compared its NaN
+  "no location" coordinates with `==`, and `.nan != .nan`. 7,690 stubs were unequal to
+  themselves, which also violated `Hashable`. Equality and hashing now treat two NaNs as equal.
+
+Result on the same phone: a delete blocks the main thread for ~370 ms (patch ~85 ms, the rest
+UIKit's animated apply), down from ~6.3 s; a new photo arriving costs ~500 ms; and the
+boot-cache→live handover at launch dropped from 3.4 s to 113 ms.
+
+**Still open:** first paint at launch builds the full snapshot from nothing and blocks for ~3 s
+at this library size. Patching cannot help there; building it off the main thread, or a layout
+that does not need one section per day, would.
+
 ### Notes for later milestones
 
 * `GridLayoutProvider` sizes tiles by giving the item `fractionalWidth(1/columns)` and
@@ -1950,11 +1986,3 @@ Keycloak setup before relying on it.
   array there, before `index.replaceAll`.
 * `StartupSequencer.runStartupSequence()` has the M5 (`deltaSync`) and M6 (`SyncEngine.kick`)
   hook points marked in order.
-
-### D14 deviation: `NSAllowsArbitraryLoads` unconditionally
-
-Sign-in to a LAN Immich server over plain HTTP failed on a real device. D14 planned to add
-`NSAllowsArbitraryLoads` only behind a user acknowledgement, but ATS is a static Info.plist
-setting and cannot be toggled at runtime, so the gate can only live in the UI
-(`ImmichAuthSession.isInsecureNonLocal` still drives the warning). `NSAllowsLocalNetworking` was
-removed rather than kept alongside: iOS ignores `NSAllowsArbitraryLoads` when it is present.

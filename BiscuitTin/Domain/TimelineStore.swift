@@ -167,6 +167,9 @@ actor TimelineStore {
         // Remote metadata is read first: it is a SQLite query on this actor, and doing it
         // before the PhotoKit enumeration keeps the merge a single pass.
         let remote = await loadRemoteMergeData()
+        // Taken after the suspension: another rebuild can run on this actor while it waits.
+        let previousIndex = index
+        let previousProvenance = provenance
 
         Signposts.interval(Signposts.indexBuild) {
             var localStubs = [AssetStub]()
@@ -204,6 +207,13 @@ actor TimelineStore {
         }
 
         Log.timeline.info("Live index built: \(self.index.count) items")
+
+        // Most rebuilds are reconciliation that finds nothing new: a delete already spliced in,
+        // a sync page with no visible change. Every emission costs the grid main-thread work
+        // proportional to the library, so an identical index is not re-published.
+        guard index != previousIndex || provenance != previousProvenance
+                || !pendingReconfiguredIDs.isEmpty else { return }
+
         emitNow()
         scheduleBootCacheSave()
     }

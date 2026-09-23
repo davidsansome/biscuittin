@@ -62,6 +62,40 @@ struct AssetStub: Hashable {
     let latitude: Float
     let longitude: Float
 
+    /// Hand-written because the synthesized version compares coordinates with `==`, and
+    /// `.nan != .nan`: every stub without a location was unequal to itself, which made every
+    /// `TimelineIndex` comparison report a change and broke the `Hashable` contract.
+    static func == (lhs: AssetStub, rhs: AssetStub) -> Bool {
+        lhs.id == rhs.id
+            && lhs.captureDate == rhs.captureDate
+            && lhs.hasLocal == rhs.hasLocal
+            && lhs.hasRemote == rhs.hasRemote
+            && lhs.kind == rhs.kind
+            && lhs.durationSeconds == rhs.durationSeconds
+            && lhs.pixelWidth == rhs.pixelWidth
+            && lhs.pixelHeight == rhs.pixelHeight
+            && Self.sameCoordinate(lhs.latitude, rhs.latitude)
+            && Self.sameCoordinate(lhs.longitude, rhs.longitude)
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(captureDate)
+        hasher.combine(hasLocal)
+        hasher.combine(hasRemote)
+        hasher.combine(kind)
+        hasher.combine(durationSeconds)
+        hasher.combine(pixelWidth)
+        hasher.combine(pixelHeight)
+        for value in [latitude, longitude] {
+            if value.isNaN { hasher.combine(0 as UInt8) } else { hasher.combine(value) }
+        }
+    }
+
+    private static func sameCoordinate(_ a: Float, _ b: Float) -> Bool {
+        a == b || (a.isNaN && b.isNaN)
+    }
+
     var isRemoteOnly: Bool { hasRemote && !hasLocal }
 
     var hasCoordinate: Bool { !latitude.isNaN && !longitude.isNaN }

@@ -155,6 +155,26 @@ final class TimelineIndexTests: XCTestCase {
         XCTAssertEqual(remote.immichID, "ABC/L0/001")
         XCTAssertNil(remote.localIdentifier)
     }
+
+    // MARK: - Equality
+
+    /// "No location" is encoded as NaN, and NaN is unequal to itself. A stub must still equal
+    /// itself, or every rebuild looks like a change and republishes the whole timeline.
+    func testStubsWithoutLocationAreEqual() {
+        let a = stub("a", 1)
+        XCTAssertTrue(a.latitude.isNaN)
+        XCTAssertEqual(a, stub("a", 1))
+        XCTAssertEqual(a.hashValue, stub("a", 1).hashValue)
+        XCTAssertEqual(TimelineIndex([a, stub("b", 2)]), TimelineIndex([stub("a", 1), stub("b", 2)]))
+    }
+
+    func testLocationStillDistinguishesStubs() {
+        let a = stub("a", 1)
+        let located = a.withCoordinate(latitude: 51.5, longitude: -0.1)
+        XCTAssertNotEqual(a, located)
+        XCTAssertEqual(located, a.withCoordinate(latitude: 51.5, longitude: -0.1))
+        XCTAssertNotEqual(located, a.withCoordinate(latitude: 51.5, longitude: .nan))
+    }
 }
 
 // MARK: - Merge visibility after Free Up Space (D18)

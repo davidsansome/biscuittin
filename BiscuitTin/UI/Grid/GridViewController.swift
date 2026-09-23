@@ -630,21 +630,25 @@ final class GridViewController: UIViewController {
     private func applyDisplayedSnapshot(reloading: Bool) {
         let current = displayed
 
-        var snapshot = Snapshot()
-        snapshot.appendSections(current.buckets.map(\.id))
-        for bucket in current.buckets {
-            snapshot.appendItems(bucket.items.map(\.id), toSection: bucket.id)
+        var snapshot: Snapshot
+        var changed = true
+        if !reloading, let patch = Self.patch(dataSource.snapshot(), to: current) {
+            snapshot = patch.snapshot
+            changed = patch.changed
+        } else {
+            snapshot = Self.fullSnapshot(of: current)
         }
 
         // Content-only changes keep their identifiers, so the diff misses them entirely.
         let reconfigurable = current.reconfiguredIDs.filter { snapshot.indexOfItem($0) != nil }
         if !reconfigurable.isEmpty {
             snapshot.reconfigureItems(reconfigurable)
+            changed = true
         }
 
         if reloading {
             dataSource.applySnapshotUsingReloadData(snapshot)
-        } else {
+        } else if changed {
             dataSource.apply(snapshot, animatingDifferences: true)
         }
 
@@ -652,6 +656,90 @@ final class GridViewController: UIViewController {
         selection.retain(only: Set(current.buckets.flatMap { $0.items.map(\.id) }))
         updateStatusViews()
         updateScrubberVisibility()
+    }
+
+    static func fullSnapshot(of timeline: TimelineSnapshot) -> NSDiffableDataSourceSnapshot<String, AssetID> {
+        var snapshot = NSDiffableDataSourceSnapshot<String, AssetID>()
+        snapshot.appendSections(timeline.buckets.map(\.id))
+        for bucket in timeline.buckets {
+            snapshot.appendItems(bucket.items.map(\.id), toSection: bucket.id)
+        }
+        return snapshot
+    }
+
+    /// Above this many inserted plus removed items, a fresh snapshot is built instead.
+    static let maxPatchedChanges = 500
+
+    /// Edits `snapshot` into one matching `target`, rather than building a new one.
+    ///
+    /// Building a snapshot with thousands of sections is dominated by a per-call cost in
+    /// `appendItems(_:toSection:)`: ~3 s for 70k photos in 4k day sections on an iPhone 13, all
+    /// on the main thread, where the same items appended in a single call take 60 ms. Deleting
+    /// one item from the existing snapshot takes ~20 ms.
+    ///
+    /// Returns nil when the result does not reproduce `target` exactly (an item moved between
+    /// days, sections reordered), so correctness never rests on the delta logic being complete.
+    static func patch(_ original: NSDiffableDataSourceSnapshot<String, AssetID>,
+                      to target: TimelineSnapshot)
+        -> (snapshot: NSDiffableDataSourceSnapshot<String, AssetID>, changed: Bool)? {
+        var snapshot = original
+        guard snapshot.numberOfItems > 0 else { return nil }
+
+        let sectionIDs = target.buckets.map(\.id)
+        let itemIDs = target.buckets.flatMap { $0.items.map(\.id) }
+
+        let oldItemIDs = snapshot.itemIdentifiers
+        let oldItemSet = Set(oldItemIDs)
+        let newItemSet = Set(itemIDs)
+        let removed = oldItemIDs.filter { !newItemSet.contains($0) }
+        let inserted = Set(itemIDs.filter { !oldItemSet.contains($0) })
+        guard removed.count + inserted.count <= maxPatchedChanges else { return nil }
+
+        let newSectionSet = Set(sectionIDs)
+        let removedSections = snapshot.sectionIdentifiers.filter { !newSectionSet.contains($0) }
+        var presentSections = Set(snapshot.sectionIdentifiers)
+        let insertsSections = sectionIDs.contains { !presentSections.contains($0) }
+
+        if !removed.isEmpty { snapshot.deleteItems(removed) }
+        if !removedSections.isEmpty { snapshot.deleteSections(removedSections) }
+
+        if insertsSections {
+            // In target order, so each section's predecessor is already in place.
+            for (i, id) in sectionIDs.enumerated() where !presentSections.contains(id) {
+                if i > 0 {
+                    snapshot.insertSections([id], afterSection: sectionIDs[i - 1])
+                } else if let first = snapshot.sectionIdentifiers.first {
+                    snapshot.insertSections([id], beforeSection: first)
+                } else {
+                    snapshot.appendSections([id])
+                }
+                presentSections.insert(id)
+            }
+        }
+
+        if !inserted.isEmpty {
+            // Also in target order: an item's predecessor in its bucket is either an existing
+            // item or one inserted on an earlier iteration.
+            for bucket in target.buckets {
+                for (j, stub) in bucket.items.enumerated() where inserted.contains(stub.id) {
+                    if j > 0 {
+                        snapshot.insertItems([stub.id], afterItem: bucket.items[j - 1].id)
+                    } else if let first = snapshot.itemIdentifiers(inSection: bucket.id).first {
+                        snapshot.insertItems([stub.id], beforeItem: first)
+                    } else {
+                        snapshot.appendItems([stub.id], toSection: bucket.id)
+                    }
+                }
+            }
+        }
+
+        guard snapshot.sectionIdentifiers == sectionIDs,
+              snapshot.itemIdentifiers == itemIDs,
+              target.buckets.allSatisfy({ snapshot.numberOfItems(inSection: $0.id) == $0.items.count })
+        else { return nil }
+
+        let changed = !removed.isEmpty || !inserted.isEmpty || !removedSections.isEmpty || insertsSections
+        return (snapshot, changed)
     }
 
     private func stub(at indexPath: IndexPath, expecting id: AssetID) -> AssetStub? {
