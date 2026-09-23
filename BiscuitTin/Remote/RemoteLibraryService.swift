@@ -73,7 +73,7 @@ actor RemoteLibraryService {
         self.exporter = exporter
         self.registry = registry
         self.clientFactory = clientFactory ?? { url in
-            ImmichClient(baseURL: url, tokenProvider: { session.token })
+            ImmichClient(baseURL: url, credentialProvider: { session.credential })
         }
         let (stream, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
         changes = stream
@@ -85,7 +85,7 @@ actor RemoteLibraryService {
     nonisolated var isConfigured: Bool { session.isConfigured }
 
     private func makeClient() throws -> ImmichClient {
-        guard let baseURL = session.baseURL, session.token != nil else {
+        guard let baseURL = session.baseURL, session.credential != nil else {
             throw ImmichError.notConfigured
         }
         return clientFactory(baseURL)

@@ -4,7 +4,7 @@ import CryptoKit
 /// Typed HTTP client for the Immich API (DESIGN.md §7.1).
 ///
 /// Deliberately storage-free: it holds no cache, no database and no credentials of its own —
-/// the token arrives through `tokenProvider`. That keeps it trivially testable with a stubbed
+/// the credential arrives through `credentialProvider`. That keeps it trivially testable with a stubbed
 /// `URLProtocol`, which is how the endpoint contracts are pinned in `ImmichClientTests`.
 ///
 /// Every call runs off the main actor with an explicit timeout and honours task cancellation
@@ -17,17 +17,24 @@ actor ImmichClient {
 
     private let baseURL: URL
     private let session: URLSession
-    private let tokenProvider: @Sendable () async -> String?
+    private let credentialProvider: @Sendable () async -> ImmichCredential?
 
     private static let metadataTimeout: TimeInterval = 10
     private static let binaryTimeout: TimeInterval = 60
 
     init(baseURL: URL,
          session: URLSession = .shared,
-         tokenProvider: @escaping @Sendable () async -> String?) {
+         credentialProvider: @escaping @Sendable () async -> ImmichCredential?) {
         self.baseURL = baseURL
         self.session = session
-        self.tokenProvider = tokenProvider
+        self.credentialProvider = credentialProvider
+    }
+
+    init(baseURL: URL,
+         session: URLSession = .shared,
+         tokenProvider: @escaping @Sendable () async -> String?) {
+        self.init(baseURL: baseURL, session: session,
+                  credentialProvider: { await tokenProvider().map(ImmichCredential.accessToken) })
     }
 
     // MARK: - Auth and server
@@ -36,6 +43,46 @@ actor ImmichClient {
         try await send(path: "/api/auth/login",
                        method: "POST",
                        body: Immich.LoginRequest(email: email, password: password),
+                       authenticated: false)
+    }
+
+    // Unauthenticated, so a server can be identified and checked before any credentials exist.
+    // `server/about` is not among them — see below.
+
+    func ping() async throws -> Immich.ServerPing {
+        try await send(path: "/api/server/ping", method: "GET", authenticated: false)
+    }
+
+    func serverVersion() async throws -> Immich.ServerVersion {
+        try await send(path: "/api/server/version", method: "GET", authenticated: false)
+    }
+
+    func serverFeatures() async throws -> Immich.ServerFeatures {
+        try await send(path: "/api/server/features", method: "GET", authenticated: false)
+    }
+
+    func serverConfig() async throws -> Immich.ServerConfig {
+        try await send(path: "/api/server/config", method: "GET", authenticated: false)
+    }
+
+    /// Starts an OAuth login. The server builds the identity provider's authorization URL
+    /// around the state and PKCE challenge supplied here, so the matching verifier never
+    /// leaves this device until the callback.
+    func oauthAuthorize(redirectURI: String, state: String,
+                        codeChallenge: String) async throws -> Immich.OAuthAuthorizeResponse {
+        try await send(path: "/api/oauth/authorize",
+                       method: "POST",
+                       body: Immich.OAuthAuthorizeRequest(redirectUri: redirectURI, state: state,
+                                                          codeChallenge: codeChallenge),
+                       authenticated: false)
+    }
+
+    func oauthCallback(url: URL, state: String,
+                       codeVerifier: String) async throws -> Immich.LoginResponse {
+        try await send(path: "/api/oauth/callback",
+                       method: "POST",
+                       body: Immich.OAuthCallbackRequest(url: url.absoluteString, state: state,
+                                                         codeVerifier: codeVerifier),
                        authenticated: false)
     }
 
@@ -68,9 +115,7 @@ actor ImmichClient {
         var request = try makeRequest(path: "/api/sync/stream", method: "POST",
                                       body: Immich.SyncStreamRequest(types: types, reset: reset),
                                       timeout: Self.binaryTimeout)
-        if let token = await tokenProvider() {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
+        await applyCredential(to: &request)
         return try await dataForRequest(request)
     }
 
@@ -83,9 +128,7 @@ actor ImmichClient {
         var request = try makeRequest(path: "/api/sync/ack", method: "POST",
                                       body: Immich.SyncAckRequest(acks: acks),
                                       timeout: Self.metadataTimeout)
-        if let token = await tokenProvider() {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
+        await applyCredential(to: &request)
         _ = try await dataForRequest(request)
     }
 
@@ -105,16 +148,14 @@ actor ImmichClient {
         var request = try makeRequest(path: "/api/assets/\(id)/video/playback",
                                       method: "GET",
                                       timeout: Self.binaryTimeout)
-        if let token = await tokenProvider() {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
+        await applyCredential(to: &request)
         return request
     }
 
     /// Headers `AVURLAsset` needs to authenticate its own range requests.
     func playbackHeaders() async -> [String: String] {
-        guard let token = await tokenProvider() else { return [:] }
-        return ["Authorization": "Bearer \(token)"]
+        guard let credential = await credentialProvider() else { return [:] }
+        return [credential.headerField: credential.headerValue]
     }
 
     func playbackURL(id: String) -> URL {
@@ -125,12 +166,12 @@ actor ImmichClient {
 
     func deleteAssets(ids: [String], force: Bool = false) async throws {
         guard !ids.isEmpty else { return }
-        _ = try await dataForRequest(
-            authorize(try makeRequest(path: "/api/assets",
+        var request = try makeRequest(path: "/api/assets",
                                       method: "DELETE",
                                       body: Immich.DeleteRequest(ids: ids, force: force),
-                                      timeout: Self.metadataTimeout),
-                      token: await tokenProvider()))
+                                      timeout: Self.metadataTimeout)
+        await applyCredential(to: &request)
+        _ = try await dataForRequest(request)
     }
 
     func bulkUploadCheck(_ items: [Immich.BulkUploadCheckItem]) async throws
@@ -152,9 +193,7 @@ actor ImmichClient {
                            isFavorite: Bool = false) async throws -> (URLRequest, URL) {
         var request = try makeRequest(path: "/api/assets", method: "POST",
                                       timeout: Self.binaryTimeout)
-        if let token = await tokenProvider() {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
+        await applyCredential(to: &request)
         request.setValue(checksumHex, forHTTPHeaderField: "x-immich-checksum")
 
         let boundary = "BiscuitTin-\(UUID().uuidString)"
@@ -193,9 +232,7 @@ actor ImmichClient {
 
         var request = try makeRequest(path: "/api/assets", method: "POST",
                                       timeout: Self.binaryTimeout)
-        if let token = await tokenProvider() {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
+        await applyCredential(to: &request)
         request.setValue(checksum, forHTTPHeaderField: "x-immich-checksum")
 
         let boundary = "BiscuitTin-\(UUID().uuidString)"
@@ -238,18 +275,17 @@ actor ImmichClient {
     /// "now" and jumping it to the top of the timeline. Setting it explicitly covers every kind.
     func updateCaptureDate(id: String, to date: Date) async throws {
         struct Update: Encodable { let dateTimeOriginal: String }
-        _ = try await dataForRequest(
-            authorize(try makeRequest(path: "/api/assets/\(id)",
+        var request = try makeRequest(path: "/api/assets/\(id)",
                                       method: "PUT",
                                       body: Update(dateTimeOriginal: Immich.iso8601String(from: date)),
-                                      timeout: Self.metadataTimeout),
-                      token: await tokenProvider()))
+                                      timeout: Self.metadataTimeout)
+        await applyCredential(to: &request)
+        _ = try await dataForRequest(request)
     }
 
-    private nonisolated func authorize(_ request: URLRequest, token: String?) -> URLRequest {
-        var request = request
-        if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
-        return request
+    private func applyCredential(to request: inout URLRequest) async {
+        guard let credential = await credentialProvider() else { return }
+        request.setValue(credential.headerValue, forHTTPHeaderField: credential.headerField)
     }
 
     /// Streaming SHA-1, so a large original never has to sit in memory.
@@ -297,9 +333,7 @@ actor ImmichClient {
                                            method: String,
                                            authenticated: Bool = true) async throws -> Response {
         var request = try makeRequest(path: path, method: method, timeout: Self.metadataTimeout)
-        if authenticated, let token = await tokenProvider() {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
+        if authenticated { await applyCredential(to: &request) }
         return try decode(try await dataForRequest(request))
     }
 
@@ -309,18 +343,14 @@ actor ImmichClient {
                                                             authenticated: Bool = true) async throws -> Response {
         var request = try makeRequest(path: path, method: method, body: body,
                                       timeout: Self.metadataTimeout)
-        if authenticated, let token = await tokenProvider() {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
+        if authenticated { await applyCredential(to: &request) }
         return try decode(try await dataForRequest(request))
     }
 
     private func data(path: String, query: [URLQueryItem] = []) async throws -> Data {
         var request = try makeRequest(path: path, method: "GET", query: query,
                                       timeout: Self.binaryTimeout)
-        if let token = await tokenProvider() {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
+        await applyCredential(to: &request)
         return try await dataForRequest(request)
     }
 
@@ -333,6 +363,13 @@ actor ImmichClient {
                 return data
             case 401, 403:
                 throw ImmichError.unauthorized
+            case 400:
+                // Immich explains a 400 in `message` ("OAuth is not enabled"), which is the only
+                // actionable part of the response.
+                if let message = try? JSONDecoder().decode(Immich.ErrorBody.self, from: data).message {
+                    throw ImmichError.rejected(message)
+                }
+                throw ImmichError.http(status: 400)
             default:
                 throw ImmichError.http(status: http.statusCode)
             }

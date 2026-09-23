@@ -4,6 +4,7 @@ import Foundation
 ///
 /// The password is used once, to exchange for a token, and is never persisted. Because of that
 /// a 401 cannot be recovered silently — it surfaces as `.expired`, and the user signs in again.
+/// An API key, when the user chose one instead, is stored in the token's Keychain slot.
 final class ImmichAuthSession: @unchecked Sendable {
 
     enum State: Equatable {
@@ -21,6 +22,9 @@ final class ImmichAuthSession: @unchecked Sendable {
         static let email = "immich.email"
         static let serverVersion = "immich.serverVersion"
         static let deviceID = "immich.deviceId"
+        /// Absent for a session token, which is what every install before API keys stored.
+        static let credentialKind = "immich.credentialKind"
+        static let apiKeyKind = "apiKey"
     }
 
     private let defaults: UserDefaults
@@ -58,7 +62,13 @@ final class ImmichAuthSession: @unchecked Sendable {
 
     var email: String? { defaults.string(forKey: Key.email) }
 
-    var token: String? { Keychain.get(Key.token) }
+    var credential: ImmichCredential? {
+        guard let secret = Keychain.get(Key.token) else { return nil }
+        return defaults.string(forKey: Key.credentialKind) == Key.apiKeyKind
+            ? .apiKey(secret) : .accessToken(secret)
+    }
+
+    var usesAPIKey: Bool { defaults.string(forKey: Key.credentialKind) == Key.apiKeyKind }
 
     /// Stable per-install identifier sent with uploads, so our own uploads link back to their
     /// local asset without waiting for a checksum pass (D5).
@@ -71,40 +81,102 @@ final class ImmichAuthSession: @unchecked Sendable {
 
     // MARK: - Sign in / out
 
-    /// Exchanges credentials for a token, then validates the server version with it.
-    ///
-    /// The order matters: `/api/server/about` requires authentication on a stock Immich
-    /// deployment (verified against v3.1.0 — 401 without a token, 200 with one). Checking the
-    /// version first therefore failed before the password was ever sent, and the 401 surfaced
-    /// as "session expired" on a screen where no session existed yet.
-    func signIn(baseURL: URL, email: String, password: String) async throws {
-        let anonymous = ImmichClient(baseURL: baseURL, tokenProvider: { nil })
-
+    /// Password login. The server has already been identified and version-checked by
+    /// `ImmichServerProbe`, from public endpoints — `/api/server/about` needs a token, which is
+    /// why the gate used to run only after the password had been sent.
+    func signIn(server: ImmichServerInfo, email: String, password: String) async throws {
+        let client = ImmichClient(baseURL: server.baseURL, credentialProvider: { nil })
         let response: Immich.LoginResponse
         do {
-            response = try await anonymous.login(email: email, password: password)
+            response = try await client.login(email: email, password: password)
         } catch ImmichError.unauthorized {
             // A 401 from the login endpoint itself means the credentials are wrong, which is a
             // different thing from an expired token.
             throw ImmichError.invalidCredentials
         }
+        store(.accessToken(response.accessToken), email: response.userEmail ?? email,
+              server: server)
+    }
 
-        // Now that a token exists, the version gate can actually run (D8).
-        let token = response.accessToken
-        let authenticated = ImmichClient(baseURL: baseURL, tokenProvider: { token })
-        let about = try await authenticated.serverAbout()
-        try Self.validate(version: about.version)
+    /// API-key login. There is nothing to exchange; the key is checked by using it.
+    func signIn(server: ImmichServerInfo, apiKey: String) async throws {
+        let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let client = ImmichClient(baseURL: server.baseURL, credentialProvider: { .apiKey(key) })
+        let user: Immich.UserResponse
+        do {
+            user = try await client.me()
+        } catch ImmichError.unauthorized {
+            // 401 for an unknown key, 403 for one lacking `user.read`; the fix is the same.
+            throw ImmichError.invalidAPIKey
+        }
+        store(.apiKey(key), email: user.email ?? user.name ?? "API key", server: server)
+    }
 
-        Keychain.set(response.accessToken, for: Key.token)
-        defaults.set(baseURL.absoluteString, forKey: Key.baseURL)
-        defaults.set(response.userEmail ?? email, forKey: Key.email)
-        defaults.set(about.version, forKey: Key.serverVersion)
+    /// First leg of OAuth: asks the server for the identity provider's URL, bound to a fresh
+    /// state and PKCE challenge.
+    func beginOAuth(server: ImmichServerInfo) async throws -> OAuthAttempt {
+        let pkce = OAuthPKCE()
+        let client = ImmichClient(baseURL: server.baseURL, credentialProvider: { nil })
+        let response = try await client.oauthAuthorize(redirectURI: OAuthAttempt.redirectURI,
+                                                       state: pkce.state,
+                                                       codeChallenge: pkce.codeChallenge)
+        guard let url = URL(string: response.url) else { throw ImmichError.invalidURL }
+        return OAuthAttempt(authorizationURL: url, state: pkce.state, codeVerifier: pkce.codeVerifier)
+    }
 
-        updateState(.signedIn(email: response.userEmail ?? email, serverVersion: about.version))
+    /// Second leg: hands the provider's redirect back to the server, which exchanges the code.
+    func completeOAuth(server: ImmichServerInfo, attempt: OAuthAttempt, callbackURL: URL) async throws {
+        let parameters = Self.formDecodedQuery(of: callbackURL)
+        if let error = parameters["error"] {
+            throw ImmichError.oauthFailed(parameters["error_description"] ?? error)
+        }
+        // Checked here as well as by the server, so a mismatched redirect never reaches it.
+        guard parameters["state"] == attempt.state else {
+            throw ImmichError.oauthFailed(nil)
+        }
+
+        let client = ImmichClient(baseURL: server.baseURL, credentialProvider: { nil })
+        let response: Immich.LoginResponse
+        do {
+            response = try await client.oauthCallback(url: callbackURL, state: attempt.state,
+                                                      codeVerifier: attempt.codeVerifier)
+        } catch let ImmichError.rejected(message) {
+            throw ImmichError.oauthFailed(message)
+        }
+        store(.accessToken(response.accessToken), email: response.userEmail ?? "", server: server)
+    }
+
+    /// OAuth redirects are form-encoded (RFC 6749 §4.1.2.1), where `+` is a space.
+    /// `URLComponents` decodes by RFC 3986, which leaves `+` alone, so a provider's
+    /// "User+declined" would otherwise reach the screen verbatim.
+    static func formDecodedQuery(of url: URL) -> [String: String] {
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedQueryItems ?? []
+        var result: [String: String] = [:]
+        for item in items {
+            guard let raw = item.value else { continue }
+            result[item.name] = raw.replacingOccurrences(of: "+", with: "%20").removingPercentEncoding
+        }
+        return result
+    }
+
+    private func store(_ credential: ImmichCredential, email: String, server: ImmichServerInfo) {
+        switch credential {
+        case let .accessToken(token):
+            Keychain.set(token, for: Key.token)
+            defaults.removeObject(forKey: Key.credentialKind)
+        case let .apiKey(key):
+            Keychain.set(key, for: Key.token)
+            defaults.set(Key.apiKeyKind, forKey: Key.credentialKind)
+        }
+        defaults.set(server.baseURL.absoluteString, forKey: Key.baseURL)
+        defaults.set(email, forKey: Key.email)
+        defaults.set(server.version.description, forKey: Key.serverVersion)
+        updateState(.signedIn(email: email, serverVersion: server.version.description))
     }
 
     func signOut() {
         Keychain.remove(Key.token)
+        defaults.removeObject(forKey: Key.credentialKind)
         defaults.removeObject(forKey: Key.email)
         defaults.removeObject(forKey: Key.serverVersion)
         // The base URL is kept so the settings form stays pre-filled for the next sign-in.

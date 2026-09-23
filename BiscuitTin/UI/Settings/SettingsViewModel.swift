@@ -7,9 +7,9 @@ import Foundation
 @MainActor
 final class SettingsViewModel: ObservableObject {
 
-    @Published var serverURLText: String
-    @Published var email: String
-    @Published var password: String = ""
+    @Published private(set) var serverURL: URL?
+    @Published private(set) var email: String
+    @Published var showsSignInFlow = false
 
     @Published private(set) var state: ImmichAuthSession.State
     @Published private(set) var isWorking = false
@@ -17,7 +17,6 @@ final class SettingsViewModel: ObservableObject {
     @Published private(set) var errorMessage: String?
     @Published private(set) var syncedCount: Int?
     @Published private(set) var lastSyncDate: Date?
-    @Published var showsInsecureWarning = false
 
     private let session: ImmichAuthSession
     private let remoteLibrary: RemoteLibraryService
@@ -26,6 +25,7 @@ final class SettingsViewModel: ObservableObject {
     private let syncEngine: SyncEngine
     private let photoActions: PhotoActionService
     private let settings: AppSettings
+    private let localLibrary: LocalLibraryService
     let backupStatus: BackupStatusStore
     private var signInTask: Task<Void, Never>?
 
@@ -48,7 +48,8 @@ final class SettingsViewModel: ObservableObject {
          syncEngine: SyncEngine,
          settings: AppSettings,
          backupStatus: BackupStatusStore,
-         photoActions: PhotoActionService) {
+         photoActions: PhotoActionService,
+         localLibrary: LocalLibraryService) {
         self.session = session
         self.remoteLibrary = remoteLibrary
         self.timelineStore = timelineStore
@@ -57,9 +58,10 @@ final class SettingsViewModel: ObservableObject {
         self.photoActions = photoActions
         self.settings = settings
         self.backupStatus = backupStatus
+        self.localLibrary = localLibrary
         self.syncEnabled = settings.syncEnabled
         self.syncScope = settings.syncScope
-        self.serverURLText = session.baseURL?.absoluteString ?? ""
+        self.serverURL = session.baseURL
         self.email = session.email ?? ""
         self.state = session.state
         // The cursor lives in SQLite behind an actor, so it is read after init rather than
@@ -80,49 +82,41 @@ final class SettingsViewModel: ObservableObject {
         return nil
     }
 
-    var canSignIn: Bool {
-        !isWorking && !serverURLText.isEmpty && !email.isEmpty && !password.isEmpty
+    var isExpired: Bool { state == .expired }
+
+    var accountDescription: String {
+        session.usesAPIKey ? "\(email) (API key)" : email
     }
 
     // MARK: - Actions
 
-    func signIn() {
-        guard let url = ImmichAuthSession.normalizeServerURL(serverURLText) else {
-            errorMessage = ImmichError.invalidURL.localizedDescription
-            return
-        }
-        // Plain HTTP off the local network needs explicit acknowledgement (D14).
-        if ImmichAuthSession.isInsecureNonLocal(url), !showsInsecureWarning {
-            showsInsecureWarning = true
-            return
-        }
-        performSignIn(url: url)
+    func makeSignInFlowModel() -> SignInFlowModel {
+        SignInFlowModel(
+            session: session,
+            asksForBackupScope: !settings.hasChosenSyncScope,
+            countLocalItems: { [localLibrary] in
+                // PHFetchResult.count is a query, not free on a large library.
+                await Task.detached { localLibrary.fetchAllAssets().count }.value
+            },
+            onSignedIn: { [weak self] in self?.didSignIn() },
+            onBackupChosen: { [weak self] scope in
+                if let scope { self?.chooseScope(scope) } else { self?.cancelScopePrompt() }
+            })
     }
 
-    func confirmInsecureAndSignIn() {
-        showsInsecureWarning = false
-        guard let url = ImmichAuthSession.normalizeServerURL(serverURLText) else { return }
-        performSignIn(url: url)
-    }
-
-    private func performSignIn(url: URL) {
+    /// The flow has stored a credential; catalogue the library while the user carries on.
+    private func didSignIn() {
+        state = session.state
+        serverURL = session.baseURL
+        email = session.email ?? ""
         errorMessage = nil
-        statusMessage = "Connecting…"
+        statusMessage = "Downloading library details…"
         isWorking = true
-        let credentials = (email: email, password: password)
 
         signInTask?.cancel()
         signInTask = Task { [weak self] in
             guard let self else { return }
             do {
-                try await self.session.signIn(baseURL: url,
-                                              email: credentials.email,
-                                              password: credentials.password)
-                self.password = ""
-                self.state = self.session.state
-                self.serverURLText = url.absoluteString
-                self.statusMessage = "Downloading library details…"
-
                 try await self.remoteLibrary.syncStream(reset: true) { count in
                     Task { @MainActor [weak self] in self?.syncedCount = count }
                 }
@@ -133,18 +127,14 @@ final class SettingsViewModel: ObservableObject {
                 // refresh had run, re-arming the coalescer and costing a second full rebuild of
                 // the whole library for no change in the result.
                 self.lastSyncDate = await self.remoteLibrary.lastSyncDate()
-                self.statusMessage = nil
-                self.isWorking = false
             } catch is CancellationError {
-                self.isWorking = false
-                self.statusMessage = nil
             } catch {
                 self.state = self.session.state
                 self.errorMessage = (error as? LocalizedError)?.errorDescription
                     ?? error.localizedDescription
-                self.statusMessage = nil
-                self.isWorking = false
             }
+            self.statusMessage = nil
+            self.isWorking = false
         }
     }
 
@@ -157,7 +147,6 @@ final class SettingsViewModel: ObservableObject {
     func signOut() {
         session.signOut()
         state = session.state
-        password = ""
         syncedCount = nil
         Task { await timelineStore.refresh() }
     }
@@ -172,7 +161,7 @@ final class SettingsViewModel: ObservableObject {
             try? await self.remoteLibrary.wipeCache()
             self.imageCache.clearCache()
             await self.timelineStore.refresh()
-            self.serverURLText = ""
+            self.serverURL = nil
             self.syncedCount = nil
             self.lastSyncDate = nil
             self.isWorking = false
@@ -257,6 +246,8 @@ final class SettingsViewModel: ObservableObject {
                 await self.timelineStore.refresh()
                 self.lastSyncDate = await self.remoteLibrary.lastSyncDate()
             } catch {
+                // A 401 has already marked the session expired; show the re-sign-in row.
+                self.state = self.session.state
                 self.errorMessage = (error as? LocalizedError)?.errorDescription
                     ?? error.localizedDescription
             }

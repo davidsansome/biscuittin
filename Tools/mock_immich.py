@@ -1,10 +1,24 @@
 #!/usr/bin/env python3
-"""Minimal mock Immich server for verifying the Biscuit Tin read path end to end.
+"""Minimal mock Immich server for verifying Biscuit Tin end to end.
 
-Serves only the endpoints M5 uses: server/about, auth/login, users/me,
-search/metadata and asset thumbnails. Assets are synthetic, with solid-colour
-PNG thumbnails so remote tiles are visually distinguishable from local ones.
+Mirrors a real v3.1.0 server's conventions where they have been checked: the
+public server/ping|version|features|config endpoints, `.well-known/immich`,
+server/about requiring auth, login rejecting a wrong password with 401, and
+API keys in `x-api-key`. Assets are synthetic, with solid-colour PNG thumbnails
+so remote tiles are visually distinguishable from local ones. `sync/stream`
+answers with no changes; the asset stream itself is not modelled.
+
+OAuth is off by default, as on a stock server. `--oauth` turns it on and serves
+a stand-in identity provider at /mock-idp/authorize that redirects to the
+app.immich callback, checking state and the PKCE S256 challenge on the way back
+exactly as the real server does. `--no-password-login` and `--oauth-auto-launch`
+mirror the matching admin settings.
+
+Test credentials: MOCK_EMAIL / MOCK_PASSWORD, or API key MOCK_API_KEY.
 """
+
+import argparse
+import secrets
 
 import base64
 import hashlib
@@ -13,10 +27,26 @@ import struct
 import zlib
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlencode, urlparse
 
 PORT = 4567
 TOKEN = "mock-access-token"
 SERVER_VERSION = "v3.1.0"
+MOCK_EMAIL = "dave@example.com"
+MOCK_PASSWORD = "biscuit"
+MOCK_API_KEY = "mock-api-key"
+# Rejects every credential, as a server does once a session has been revoked.
+EXPIRE_SESSIONS = False
+FEATURES = {"oauth": False, "oauthAutoLaunch": False, "passwordLogin": True}
+# code -> (state, code_challenge), issued by the stand-in identity provider
+OAUTH_CODES = {}
+# state -> code_challenge, recorded by /api/oauth/authorize
+OAUTH_PENDING = {}
+
+LOGIN_RESPONSE = {
+    "accessToken": TOKEN, "userId": "user-1", "userEmail": MOCK_EMAIL, "name": "Dave",
+    "profileImagePath": "", "isAdmin": False, "shouldChangePassword": False, "isOnboarded": True,
+}
 
 # Vivid, saturated colours that stand out against the generated local library.
 COLOURS = [
@@ -119,15 +149,61 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _authorized(self):
-        return self.headers.get("Authorization") == f"Bearer {TOKEN}"
+        if EXPIRE_SESSIONS:
+            return False
+        return (self.headers.get("Authorization") == f"Bearer {TOKEN}"
+                or self.headers.get("x-api-key") == MOCK_API_KEY)
 
     def do_GET(self):
         path = self.path.split("?")[0]
         REQUEST_LOG.append(("GET", path))
         print(f"GET  {self.path}", flush=True)
 
+        if path == "/api/server/ping":
+            return self._send(200, {"res": "pong"})
+
+        if path == "/api/server/version":
+            major, minor, patch = (int(p) for p in SERVER_VERSION.lstrip("v").split("."))
+            return self._send(200, {"major": major, "minor": minor, "patch": patch,
+                                    "prerelease": None})
+
+        if path == "/api/server/features":
+            return self._send(200, {"smartSearch": True, "facialRecognition": True,
+                                    "duplicateDetection": True, "map": False,
+                                    "reverseGeocoding": True, "importFaces": False,
+                                    "sidecar": True, "search": True, "trash": True, "ocr": True,
+                                    "configFile": False, "email": False,
+                                    "realtimeTranscoding": False, **FEATURES})
+
+        if path == "/api/server/config":
+            return self._send(200, {"loginPageMessage": "", "trashDays": 30,
+                                    "userDeleteDelay": 7, "oauthButtonText": "Login with OAuth",
+                                    "isInitialized": True, "isOnboarded": True,
+                                    "externalDomain": "", "publicUsers": True,
+                                    "maintenanceMode": False, "minFaces": 3})
+
+        if path == "/.well-known/immich":
+            return self._send(200, {"api": {"endpoint": "/api"}})
+
         if path == "/api/server/about":
+            # Authenticated on a real server: 401 without a token.
+            if not self._authorized():
+                return self._send(401, {"message": "Authentication required"})
             return self._send(200, {"version": SERVER_VERSION, "versionUrl": ""})
+
+        if path == "/mock-idp/authorize":
+            query = parse_qs(urlparse(self.path).query)
+            code = secrets.token_urlsafe(12)
+            state = query.get("state", [""])[0]
+            OAUTH_CODES[code] = (state, query.get("code_challenge", [""])[0])
+            target = f"{query['redirect_uri'][0]}?code={code}&state={state}"
+            page = (f"<html><body style='font:20px -apple-system;padding:40px'>"
+                    f"<h2>Mock identity provider</h2>"
+                    f"<p><a id='approve' href='{target}'>Approve sign-in</a></p>"
+                    f"<p><a href='{query['redirect_uri'][0]}?error=access_denied"
+                    f"&error_description=User+declined&state={state}'>Decline</a></p>"
+                    f"</body></html>").encode()
+            return self._send(200, page, content_type="text/html")
 
         if path == "/api/users/me":
             if not self._authorized():
@@ -155,12 +231,51 @@ class Handler(BaseHTTPRequestHandler):
         print(f"POST {path}  body={raw[:120]!r}", flush=True)
 
         if path == "/api/auth/login":
-            return self._send(200, {
-                "accessToken": TOKEN,
-                "userId": "user-1",
-                "userEmail": "dave@example.com",
-                "name": "Dave",
-            })
+            if not FEATURES["passwordLogin"]:
+                return self._send(401, {"message": "Login with username and password is disabled."})
+            body = json.loads(raw or b"{}")
+            if body.get("email") != MOCK_EMAIL or body.get("password") != MOCK_PASSWORD:
+                return self._send(401, {"message": "Incorrect email or password"})
+            return self._send(201, LOGIN_RESPONSE)
+
+        if path == "/api/oauth/authorize":
+            if not FEATURES["oauth"]:
+                return self._send(400, {"message": "OAuth is not enabled"})
+            body = json.loads(raw or b"{}")
+            OAUTH_PENDING[body.get("state")] = body.get("codeChallenge")
+            host = self.headers.get("Host", f"127.0.0.1:{PORT}")
+            query = urlencode({"redirect_uri": body["redirectUri"], "state": body.get("state", ""),
+                               "code_challenge": body.get("codeChallenge", ""),
+                               "code_challenge_method": "S256"})
+            return self._send(201, {"url": f"http://{host}/mock-idp/authorize?{query}"})
+
+        if path == "/api/oauth/callback":
+            if not FEATURES["oauth"]:
+                return self._send(400, {"message": "OAuth is not enabled"})
+            body = json.loads(raw or b"{}")
+            query = parse_qs(urlparse(body.get("url", "")).query)
+            code = query.get("code", [""])[0]
+            issued = OAUTH_CODES.pop(code, None)
+            if not body.get("state") or not body.get("codeVerifier"):
+                return self._send(400, {"message": "OAuth state is missing"})
+            verifier_hash = base64.urlsafe_b64encode(
+                hashlib.sha256(body["codeVerifier"].encode()).digest()).rstrip(b"=").decode()
+            if (issued is None or issued[0] != body["state"]
+                    or issued[1] != verifier_hash):
+                print("  OAuth callback rejected: state or PKCE mismatch", flush=True)
+                return self._send(400, {"message": "OAuth login failed"})
+            print("  OAuth callback accepted: state and PKCE verified", flush=True)
+            return self._send(201, LOGIN_RESPONSE)
+
+        if path == "/api/sync/stream":
+            if not self._authorized():
+                return self._send(401, {"message": "Authentication required"})
+            return self._send(200, b"", content_type="application/jsonlines+json")
+
+        if path == "/api/sync/ack":
+            if not self._authorized():
+                return self._send(401, {"message": "Authentication required"})
+            return self._send(204, b"", content_type="application/json")
 
         if path == "/api/assets/bulk-upload-check":
             if not self._authorized():
@@ -211,10 +326,23 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         REQUEST_LOG.append(("DELETE", self.path))
         print(f"DELETE {self.path}", flush=True)
-        return self._send(204, {})
+        if not self._authorized():
+            return self._send(401, {"message": "Authentication required"})
+        return self._send(204, b"", content_type="application/json")
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--oauth", action="store_true", help="enable OAuth login")
+    parser.add_argument("--oauth-auto-launch", action="store_true")
+    parser.add_argument("--no-password-login", action="store_true")
+    parser.add_argument("--expire-sessions", action="store_true",
+                        help="reject every credential, to exercise re-sign-in")
+    args = parser.parse_args()
+    EXPIRE_SESSIONS = args.expire_sessions
+    FEATURES.update(oauth=args.oauth, oauthAutoLaunch=args.oauth_auto_launch,
+                    passwordLogin=not args.no_password_login)
+    print(f"Features: {FEATURES}", flush=True)
     print(f"Mock Immich {SERVER_VERSION} on http://127.0.0.1:{PORT} "
           f"({len(ASSETS)} assets)", flush=True)
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

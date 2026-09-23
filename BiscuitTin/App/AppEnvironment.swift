@@ -119,6 +119,7 @@ final class AppEnvironment: ObservableObject {
                           syncEngine: syncEngine,
                           settings: settings,
                           backupStatus: backupStatus,
-                          photoActions: photoActions)
+                          photoActions: photoActions,
+                          localLibrary: localLibrary)
     }
 }

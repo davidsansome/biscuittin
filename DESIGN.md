@@ -80,7 +80,7 @@ downstream assumes them as written.
 | **D4** | Local persistence | **GRDB (SQLite) via SPM** for the remote-asset cache and sync state | We need fast bulk upserts (10k+ rows/sync page), date-bucket GROUP BY queries, and background-thread writes. GRDB is deterministic and testable. Alternative: SwiftData — simpler but weaker for bulk sync workloads and background writing. This is the app's only third-party dependency. |
 | **D5** | Unified asset identity | Every displayed asset is an `Asset` with up to two **facets**: a local facet (PHAsset `localIdentifier`) and a remote facet (Immich asset UUID). Facets are linked by **SHA-1 checksum** (Immich's native checksum), with `(deviceId, deviceAssetId)` as a secondary match. | Checksum is the only identity Immich guarantees across upload paths. The link table is persisted so matching is done once, not per-launch. |
 | **D6** | Timeline construction | **In-memory merged index** of lightweight `AssetStub` structs (~56 bytes each) sorted by capture date desc, bucketed on demand by day/week/month, published as immutable snapshots. Two additions for performance: **(a)** the index is **persisted as a boot cache** and loaded before anything else at launch (D19); **(b)** library/sync changes are applied **incrementally** to the index, not by full rebuild (D20) — full rebuild remains as the reconciliation fallback. | 200k stubs ≈ 12 MB — acceptable. If profiling shows problems at extreme sizes, the `TimelineStore` API is designed so a windowed implementation can replace the in-memory one without touching the UI. |
-| **D7** | Immich auth | `POST /api/auth/login` with email + password → **access token stored in Keychain**. The password itself is never persisted. Requests use `Authorization: Bearer <token>`. | Matches requirement 13. An API-key field is a cheap future addition (`x-api-key` header) but is out of v1 scope. |
+| **D7** | Immich auth | Three ways in, one stored credential: **email + password** (`POST /api/auth/login`), **OAuth** (`POST /api/oauth/authorize` → `ASWebAuthenticationSession` → `POST /api/oauth/callback`, with on-device state + PKCE S256), or a user-created **API key**. The token or key is **stored in Keychain**; the password never is. Requests carry `Authorization: Bearer <token>` or `x-api-key: <key>` via `ImmichCredential`. | Matches requirement 13. OAuth and API keys were added with the sign-in flow (Implementation Log, 2026-09-23): servers with `passwordLogin: false` were otherwise impossible to sign in to. |
 | **D8** | Immich API surface & versioning | Target **Immich v3.1.0** (current release, confirmed at review); require **server ≥ v3.0** via `GET /api/server/about` at login, failing settings validation with a clear message on older servers. | Implementers **must validate every endpoint path, field, and multipart shape against the v3.1.0 OpenAPI spec** — Immich serves it at `/api/docs` on the target server. The endpoint tables in §7 are the contract to verify, not a substitute for the spec. |
 | **D9** | Remote metadata sync strategy | Both full and incremental sync go through **`POST /api/sync/stream`** (`types: [AssetsV2, AssetExifsV1]`), whose cursor Immich tracks server-side per access token: `reset: true` replays the whole library (first sign-in), `reset: false` replays only what changed (foreground, pull-to-refresh, Settings "Refresh Now"). Hard deletes arrive as explicit `AssetDeleteV1` lines in that same stream, so there is **no separate reconciliation sweep** — a delete is visible on the very next sync, not gated behind a weekly cursor. Acks are a per-type watermark (`POST /api/sync/ack`), so at most 3 are ever sent regardless of library size. | Superseded the original paged-`search/metadata` design (below) once the dedicated sync endpoints were confirmed stable against a real v3.1.0 server — see Implementation Log, 2026-09-23. `RemoteLibraryService.syncStream` is still the sole point of contact, so nothing above it changed. Original v1 design, kept for context: full sync paged `search/metadata` (`updatedAfter` cursor for delta), with deletions caught only by a periodic full-ID sweep — weekly, or in principle on pull-to-refresh, though no such control was ever wired up, so in practice a hard delete could sit unsynced for up to 7 days. |
 | **D10** | Rotation architecture | Rotation is a **per-facet physical operation dispatched by `MediaKind` to a per-kind strategy** behind one `AssetRotator` protocol. **v1 ships the image strategy**; the video and Live Photo strategies ship in **M9**, but their approach is decided now: **videos rotate losslessly** by rewriting the track transform (remux via `AVMutableMovie`, no re-encode) — locally written as a PhotoKit content-editing output, remotely as download → remux → `PUT /api/assets/{id}/original`; **Live Photos rotate via `PHLivePhotoEditingContext`** (keeps still + paired video consistent) locally, with the remote still replaced like an image. Images: local → PhotoKit content edit (Core Image re-encode); remote → download, rotate pixels, replace-original. Both facets are always updated; remote failure → partial-success toast + queued retry (D22 — the queue is what actually catches the remote copy up once the server is reachable again, not just a phrase for the toast). Until M9, non-image rotations are skipped with a reported count. | Immich has no server-side rotate. Pixel rotation (images) keeps Immich thumbnails correct; transform-remux (video) avoids re-encoding multi-GB files and is lossless. The strategy protocol is the day-one commitment; per-kind implementations are additive. |
@@ -783,15 +783,25 @@ refresh) resolve — it never waits on I/O to present.
 
 ### 13.4 Settings (req. 13)
 SwiftUI form:
-- **Server**: URL field (validated: scheme+host; http triggers D14 warning), email,
-  password (`SecureField`), Sign In / Sign Out button, status row (server version,
-  user email when connected, "session expired" state).
-- Sign-in flow: `serverAbout` version gate (D8, ≥ v3.0) → `login` → store token
-  (Keychain) + base URL (`UserDefaults`) → trigger initial `fullSync` with
-  progress row → **sync scope prompt** (D17): "Back up all photos & videos" vs
-  "Back up new items only" (also offers "Not now", which leaves sync off).
-  Sign-in runs as a cancellable background task with inline progress; the rest of
-  the app stays fully usable during the initial full sync.
+- **Server**: signed out, a single "Connect to Immich" row (or "Sign In Again" when the
+  session has expired) that opens the sign-in flow below. Signed in, an account card
+  (email, host, server version) with Sign Out.
+- **Sign-in flow** (`UI/Settings/SignIn/`): full screen, optional throughout ("Not Now" on
+  every page before sign-in completes).
+  1. **Server.** One field accepting a hostname, IP or URL. `ImmichServerProbe` tries HTTPS,
+     HTTP, and HTTP on :2283 concurrently, follows `/.well-known/immich`, and checks
+     `server/ping`, `server/version` (D8 gate, ≥ v3.0), `server/features` and
+     `server/config` — all unauthenticated — as the user types. Errors are specific
+     ("not an Immich server", "server too old") and shown in place. The D14 plain-HTTP
+     warning appears here, with the button relabelled "Connect Anyway".
+  2. **Credentials**, shaped by `server/features`: email + password when `passwordLogin`,
+     an OAuth button (labelled with `oauthButtonText`) when `oauth`, and an API-key
+     alternative always. When the admin sets `oauthAutoLaunch`, Continue on page 1 goes
+     straight to the provider.
+  3. **Backup scope** (D17) as cards: all (with the local item count), new only, or just
+     browse. Skipped when a scope was already chosen (e.g. re-signing in after expiry).
+  Sign-in stores the credential, then the initial `syncStream(reset: true)` runs in the
+  settings model with a progress row; the rest of the app stays fully usable meanwhile.
 - **Sync**: toggle (req. 14) — first enable without a chosen scope re-asks the
   scope question. Below the toggle: a scope row showing "All items" or
   "New items only (since 18 Aug 2026)" with an **Upgrade to all items** button
@@ -1881,6 +1891,47 @@ that is slow from work that merely happens later — which is the entire questio
 stall. A temporary main-thread watchdog (a background thread timing how long `DispatchQueue.main`
 takes to service a ping) was used to confirm the UI never hard-blocked for seconds; the worst
 single block was 467 ms, around sign-*out*. It was removed before committing.
+
+### Sign-in flow, OAuth and API keys (2026-09-23)
+
+The settings form's three list cells became a full-screen, three-page flow (§13.4), and D7 grew
+OAuth and API-key sign-in. Every public endpoint and both OAuth DTOs were checked against the
+local v3.1.0 server's `/api/spec.json` and its compiled `auth.service.js`, not assumed.
+
+* **The version gate moved before sign-in.** `server/version` is public (verified: 200 without a
+  token, `{"major":3,"minor":1,"patch":0,"prerelease":null}`), so the D8 gate now runs while
+  the user types the address; `server/about` is no longer needed for sign-in at all.
+* **OAuth reuses Immich's own redirect, `app.immich:///oauth-callback`.** The server
+  special-cases that exact string (swapping in the admin's `mobileRedirectUri` when the
+  mobile override is on), and admins already register it with their provider for the official
+  app. State and the PKCE verifier are generated on the device and sent in the callback body;
+  the server otherwise falls back to cookies.
+* **Auto-launch must start from a settled page.** Starting `ASWebAuthenticationSession` from
+  the credentials page's `onAppear` or `.task`, i.e. during the push, failed with error 2
+  (`presentationContextNotProvided`); the identical call from a button on the settled page
+  succeeded. Auto-launch therefore fires from page 1's Continue tap.
+* **Provider redirects are form-encoded.** A declined sign-in showed "User+declined":
+  `URLComponents` decodes by RFC 3986 and leaves `+` alone, but RFC 6749 redirects use
+  `application/x-www-form-urlencoded`. `formDecodedQuery` decodes them properly.
+* **Only the primary action is pinned above the keyboard.** With the OAuth and API-key
+  alternatives pinned too, the password field sat entirely behind them.
+
+**Found alongside: remote deletes never sent credentials.** `ImmichClient.deleteAssets` built its
+request without an `Authorization` header; the live server answers that with 401 (verified), so
+remote delete and the trash step of remote rotation could not have succeeded. Fixed and pinned
+by a test.
+
+`Tools/mock_immich.py` had drifted from the real server in ways that would hide exactly these
+bugs — unauthenticated `server/about`, any password accepted, no `sync/stream` — and now mirrors
+it, plus a stand-in OAuth provider (`--oauth`, `--no-password-login`, `--oauth-auto-launch`) that
+checks state and the PKCE challenge the way the real server does, and `--expire-sessions` for the
+re-sign-in path. All three methods, cancel/decline, expiry and re-sign-in were driven in the
+simulator against it; probing and the password/API-key rejection paths against the real server.
+
+**Not yet verified:** OAuth against a real identity provider. The local server has OAuth
+disabled and changing that needs admin access; the mock follows the server's source, but per
+AGENTS.md a mock cannot falsify its own assumptions. Try it against a real Authelia/Authentik/
+Keycloak setup before relying on it.
 
 ### Notes for later milestones
 

@@ -230,7 +230,7 @@ actor SyncEngine {
     /// without transferring anything.
     private func dedupeAgainstServer() async throws {
         guard let baseURL = session.baseURL else { throw ImmichError.notConfigured }
-        let client = ImmichClient(baseURL: baseURL, tokenProvider: { [session] in session.token })
+        let client = ImmichClient(baseURL: baseURL, credentialProvider: { [session] in session.credential })
 
         let writer = try database.writer()
         let candidates = try await writer.read { db in
@@ -274,7 +274,7 @@ actor SyncEngine {
     /// Step 4: upload what is left.
     private func uploadPending() async throws {
         guard let baseURL = session.baseURL else { throw ImmichError.notConfigured }
-        let client = ImmichClient(baseURL: baseURL, tokenProvider: { [session] in session.token })
+        let client = ImmichClient(baseURL: baseURL, credentialProvider: { [session] in session.credential })
 
         let writer = try database.writer()
         let pending = try await writer.read { db in

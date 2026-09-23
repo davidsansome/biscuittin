@@ -51,12 +51,8 @@ struct SettingsScreen: View {
                      + "your Immich server.")
             }
             .task { viewModel.refreshSyncStatus() }
-            .alert("Connection isn’t private", isPresented: $viewModel.showsInsecureWarning) {
-                Button("Cancel", role: .cancel) {}
-                Button("Connect anyway") { viewModel.confirmInsecureAndSignIn() }
-            } message: {
-                Text("This server uses http:// and isn’t on your local network, so your "
-                     + "password and photos would be sent unencrypted.")
+            .fullScreenCover(isPresented: $viewModel.showsSignInFlow) {
+                SignInFlowView(model: viewModel.makeSignInFlowModel())
             }
         }
     }
@@ -67,31 +63,29 @@ struct SettingsScreen: View {
     private var serverSection: some View {
         Section {
             if viewModel.isSignedIn {
-                LabeledContent("Server", value: viewModel.serverURLText)
-                LabeledContent("Account", value: viewModel.email)
+                accountRow
             } else {
-                TextField("https://immich.example.com", text: $viewModel.serverURLText)
-                    .textContentType(.URL)
-                    .keyboardType(.URL)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-
-                TextField("Email", text: $viewModel.email)
-                    .textContentType(.emailAddress)
-                    .keyboardType(.emailAddress)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-
-                SecureField("Password", text: $viewModel.password)
-                    .textContentType(.password)
+                Button {
+                    viewModel.showsSignInFlow = true
+                } label: {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(viewModel.isExpired ? "Sign In Again" : "Connect to Immich")
+                                .foregroundStyle(.primary)
+                            if viewModel.isExpired, let url = viewModel.serverURL {
+                                Text("Your session on \(ImmichServerInfo.displayHost(for: url)) has expired.")
+                                    .font(.caption)
+                                    // Plain `.secondary` inside a button is a faded tint.
+                                    .foregroundStyle(Color.secondary)
+                            }
+                        }
+                    } icon: {
+                        Image(systemName: viewModel.isExpired
+                              ? "exclamationmark.arrow.circlepath" : "server.rack")
+                    }
+                }
             }
-        } header: {
-            Text("Immich Server")
-        } footer: {
-            Text("Optional. Biscuit Tin works fully offline with just the photos on this iPhone.")
-        }
 
-        Section {
             if viewModel.isWorking {
                 HStack {
                     ProgressView()
@@ -108,11 +102,34 @@ struct SettingsScreen: View {
                 }
             } else if viewModel.isSignedIn {
                 Button("Sign Out", role: .destructive) { viewModel.signOut() }
-            } else {
-                Button("Sign In") { viewModel.signIn() }
-                    .disabled(!viewModel.canSignIn)
+            }
+        } header: {
+            Text("Immich Server")
+        } footer: {
+            if !viewModel.isSignedIn {
+                Text("Optional. Biscuit Tin works fully offline with just the photos on this iPhone.")
             }
         }
+    }
+
+    private var accountRow: some View {
+        HStack(spacing: 14) {
+            Image(systemName: "person.crop.circle.fill")
+                .font(.largeTitle)
+                .foregroundStyle(.tint)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(viewModel.accountDescription)
+                    .font(.headline)
+                if let url = viewModel.serverURL {
+                    Text([ImmichServerInfo.displayHost(for: url), viewModel.serverVersion].compactMap { $0 }.joined(separator: " · "))
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
     }
 
     /// Requirement 14: the backup toggle, its scope, and progress.
@@ -156,9 +173,6 @@ struct SettingsScreen: View {
     @ViewBuilder
     private var connectedSection: some View {
         Section("Library") {
-            if let version = viewModel.serverVersion {
-                LabeledContent("Server version", value: version)
-            }
             if let date = viewModel.lastSyncDate {
                 LabeledContent("Last refreshed",
                                value: date.formatted(date: .abbreviated, time: .shortened))

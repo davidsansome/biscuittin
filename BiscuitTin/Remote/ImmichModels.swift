@@ -20,6 +20,76 @@ enum Immich {
         let name: String?
     }
 
+    struct ServerPing: Decodable {
+        let res: String
+    }
+
+    /// Public, unlike `ServerAbout`, so the version gate can run before sign-in.
+    struct ServerVersion: Decodable, Equatable {
+        let major: Int
+        let minor: Int
+        let patch: Int
+
+        var description: String { "v\(major).\(minor).\(patch)" }
+    }
+
+    /// The subset of `/api/server/features` that shapes the sign-in screen.
+    struct ServerFeatures: Decodable, Equatable {
+        let oauth: Bool
+        let oauthAutoLaunch: Bool
+        let passwordLogin: Bool
+
+        init(oauth: Bool, oauthAutoLaunch: Bool, passwordLogin: Bool) {
+            self.oauth = oauth
+            self.oauthAutoLaunch = oauthAutoLaunch
+            self.passwordLogin = passwordLogin
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            oauth = try c.decodeIfPresent(Bool.self, forKey: .oauth) ?? false
+            oauthAutoLaunch = try c.decodeIfPresent(Bool.self, forKey: .oauthAutoLaunch) ?? false
+            // Absent on a server that predates the flag, all of which allowed password login.
+            passwordLogin = try c.decodeIfPresent(Bool.self, forKey: .passwordLogin) ?? true
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case oauth, oauthAutoLaunch, passwordLogin
+        }
+    }
+
+    struct ServerConfig: Decodable, Equatable {
+        let loginPageMessage: String?
+        let oauthButtonText: String?
+    }
+
+    /// `/.well-known/immich`, which lets a server live behind a proxy path while users type
+    /// only its hostname.
+    struct WellKnown: Decodable {
+        struct API: Decodable { let endpoint: String }
+        let api: API
+    }
+
+    struct OAuthAuthorizeRequest: Encodable {
+        let redirectUri: String
+        let state: String
+        let codeChallenge: String
+    }
+
+    struct OAuthAuthorizeResponse: Decodable {
+        let url: String
+    }
+
+    struct OAuthCallbackRequest: Encodable {
+        let url: String
+        let state: String
+        let codeVerifier: String
+    }
+
+    struct ErrorBody: Decodable {
+        let message: String
+    }
+
     struct ServerAbout: Decodable {
         let version: String
         let versionUrl: String?
@@ -419,7 +489,13 @@ enum ImmichError: LocalizedError, Equatable {
     /// The credentials just supplied were rejected. Distinct from `unauthorized`, which would
     /// otherwise tell a user signing in for the first time that their session had expired.
     case invalidCredentials
+    case invalidAPIKey
     case unreachable
+    /// Something answered, but not as Immich.
+    case notImmich
+    case oauthFailed(String?)
+    /// A 400 carrying the server's own explanation.
+    case rejected(String)
     case serverTooOld(found: String, required: String)
     case http(status: Int)
     case decoding(String)
@@ -430,10 +506,17 @@ enum ImmichError: LocalizedError, Equatable {
         case .notConfigured: return "No Immich server is configured."
         case .unauthorized: return "Session expired. Sign in again."
         case .invalidCredentials: return "Incorrect email or password."
+        case .invalidAPIKey:
+            return "That API key wasn’t accepted. Check it’s complete and has the permissions "
+                + "Biscuit Tin needs."
         case .unreachable: return "Server unreachable."
+        case .notImmich: return "That address doesn’t look like an Immich server."
+        case let .oauthFailed(detail):
+            return detail.map { "Sign-in didn’t complete: \($0)" } ?? "Sign-in didn’t complete."
         case let .serverTooOld(found, required):
             return "This server runs Immich \(found); \(required) or newer is required."
         case let .http(status): return "Server error (\(status))."
+        case let .rejected(message): return message
         case let .decoding(detail): return "Unexpected response from server. \(detail)"
         case .invalidURL: return "That server URL isn’t valid."
         }

@@ -22,7 +22,7 @@ final class RemoteImageFetcher: RemoteImageFetching, @unchecked Sendable {
         self.session = session
         self.cache = cache
         self.clientFactory = clientFactory ?? { url in
-            ImmichClient(baseURL: url, tokenProvider: { session.token })
+            ImmichClient(baseURL: url, credentialProvider: { session.credential })
         }
     }
 
@@ -35,7 +35,7 @@ final class RemoteImageFetcher: RemoteImageFetching, @unchecked Sendable {
         let key = RemoteThumbnailCache.key(immichID: immichID, variant: Self.variantKey(variant))
         if let cached = cache.image(for: key) { return cached }
 
-        guard let baseURL = session.baseURL, session.token != nil else {
+        guard let baseURL = session.baseURL, session.credential != nil else {
             throw ImmichError.notConfigured
         }
         let client = clientFactory(baseURL)
