@@ -1965,9 +1965,15 @@ Result on the same phone: a delete blocks the main thread for ~370 ms (patch ~85
 UIKit's animated apply), down from ~6.3 s; a new photo arriving costs ~500 ms; and the
 boot-cache→live handover at launch dropped from 3.4 s to 113 ms.
 
-**Still open:** first paint at launch builds the full snapshot from nothing and blocks for ~3 s
-at this library size. Patching cannot help there; building it off the main thread, or a layout
-that does not need one section per day, would.
+**First paint** had nothing to patch and still built the whole snapshot on the main thread (~3 s).
+It now applies the newest 1,000 items at once (11 ms) and builds the full snapshot on a
+background task (~3.1 s, measured off the main thread), then patches it to whatever the timeline
+became meanwhile and applies it (~340 ms). While that build runs the grid's `timeline` is the
+prefix itself, so every index-path lookup matches what is drawn; the viewer and search read the
+full timeline, which shares the prefix's index paths.
+
+Still on the main thread at full cost: regrouping, cancelling a search, and bulk changes over
+500 items, which rebuild the snapshot there.
 
 ### Notes for later milestones
 

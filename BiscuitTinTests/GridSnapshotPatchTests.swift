@@ -101,4 +101,43 @@ final class GridSnapshotPatchTests: XCTestCase {
     func testEmptySnapshotFallsBackToAFullBuild() {
         XCTAssertNil(GridViewController.patch(Snapshot(), to: timeline(base)))
     }
+
+    // MARK: - First-paint prefix
+
+    func testPrefixTruncatesTheLastKeptBucket() {
+        let prefix = timeline(base).prefix(maxItems: 4)
+        XCTAssertEqual(prefix.buckets.map(\.id), ["d3", "d2"])
+        XCTAssertEqual(prefix.buckets.map { $0.items.map(\.id.raw) }, [["a", "b", "c"], ["d"]])
+        XCTAssertEqual(prefix.totalCount, 4)
+
+        let cut = timeline(base).prefix(maxItems: 2)
+        XCTAssertEqual(cut.buckets.map { $0.items.map(\.id.raw) }, [["a", "b"]])
+    }
+
+    func testPrefixOfASmallTimelineIsTheTimeline() {
+        let full = timeline(base)
+        XCTAssertEqual(full.prefix(maxItems: 100).buckets, full.buckets)
+    }
+
+    /// The grid resolves index paths against its prefix while the viewer and search use the
+    /// full timeline; the two must agree on every position the prefix has.
+    func testPrefixIndexPathsResolveToTheSameItemsAsTheFullTimeline() {
+        let full = timeline(base)
+        let prefix = full.prefix(maxItems: 5)
+        for (section, bucket) in prefix.buckets.enumerated() {
+            for item in bucket.items.indices {
+                let indexPath = IndexPath(item: item, section: section)
+                XCTAssertEqual(prefix.stub(at: indexPath), full.stub(at: indexPath))
+                XCTAssertEqual(prefix.flatIndex(of: indexPath), full.flatIndex(of: indexPath))
+            }
+        }
+    }
+
+    /// A delete while the full snapshot is still building shifts one item into the prefix.
+    func testPrefixAfterADeletePatchesInPlace() {
+        let before = timeline(base).prefix(maxItems: 4)
+        let after = timeline([("d3", ["a", "c"]), ("d2", ["d"]), ("d1", ["e", "f"])]).prefix(maxItems: 4)
+        let result = GridViewController.patch(GridViewController.fullSnapshot(of: before), to: after)
+        XCTAssertEqual(result?.snapshot.itemIdentifiers.map(\.raw), ["a", "c", "d", "e"])
+    }
 }

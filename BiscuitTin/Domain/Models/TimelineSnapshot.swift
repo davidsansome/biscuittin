@@ -62,6 +62,26 @@ struct TimelineSnapshot {
 
     var isEmpty: Bool { totalCount == 0 }
 
+    /// The newest `maxItems` items, keeping the same buckets up to the cut, so every index path
+    /// valid in the prefix resolves to the same item as in the full snapshot. The last bucket
+    /// may be truncated.
+    func prefix(maxItems: Int) -> TimelineSnapshot {
+        guard totalCount > maxItems else { return self }
+        var kept = [Bucket]()
+        var remaining = maxItems
+        for bucket in buckets where remaining > 0 {
+            let items = bucket.items.count <= remaining ? bucket.items : Array(bucket.items.prefix(remaining))
+            kept.append(Bucket(id: bucket.id, title: bucket.title, items: items))
+            remaining -= items.count
+        }
+        let keptIDs = Set(kept.flatMap { $0.items.map(\.id) })
+        return TimelineSnapshot(grouping: grouping,
+                                buckets: kept,
+                                totalCount: maxItems,
+                                provenance: provenance,
+                                reconfiguredIDs: reconfiguredIDs.filter { keptIDs.contains($0) })
+    }
+
     /// Resolves a section/item position to its stub. O(1); used by the grid's cell provider.
     func stub(at indexPath: IndexPath) -> AssetStub? {
         guard indexPath.section >= 0, indexPath.section < buckets.count else { return nil }

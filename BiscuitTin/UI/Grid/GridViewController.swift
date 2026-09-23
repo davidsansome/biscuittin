@@ -37,6 +37,22 @@ final class GridViewController: UIViewController {
 
     /// What the collection view is currently showing.
     private var displayed: TimelineSnapshot { searchResults ?? timeline }
+
+    /// The newest timeline from the store while its full snapshot is still being built off the
+    /// main thread (first paint of a large library). `timeline` meanwhile holds its prefix, so
+    /// everything resolving index paths stays consistent with what is on screen; anything that
+    /// needs the whole library reads `fullTimeline`.
+    private var pendingFullTimeline: TimelineSnapshot?
+    /// Bumped whenever `pendingFullTimeline` is replaced, so a finished build knows whether it
+    /// is already stale.
+    private var pendingFullTimelineGeneration = 0
+    private var fullBuildTask: Task<Void, Never>?
+    private var fullTimeline: TimelineSnapshot { pendingFullTimeline ?? timeline }
+
+    /// Items shown immediately on first paint while the rest is built in the background.
+    /// Building a snapshot costs ~40 µs per item across many sections (see `patch`), so this
+    /// is a few screens' worth rather than the library.
+    private static let firstPaintPrefixCount = 1_000
     private var columns: Int
     private var snapshotTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
@@ -97,7 +113,10 @@ final class GridViewController: UIViewController {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    deinit { snapshotTask?.cancel() }
+    deinit {
+        snapshotTask?.cancel()
+        fullBuildTask?.cancel()
+    }
 
     // MARK: - Lifecycle
 
@@ -346,8 +365,8 @@ final class GridViewController: UIViewController {
         searchController = controller
 
         searchSession.stubProvider = { [weak self] id in
-            guard let self, let indexPath = self.timeline.indexPath(of: id) else { return nil }
-            return self.timeline.stub(at: indexPath)
+            guard let self, let indexPath = self.fullTimeline.indexPath(of: id) else { return nil }
+            return self.fullTimeline.stub(at: indexPath)
         }
         searchSession.onResults = { [weak self] results in
             self?.showSearchResults(results)
@@ -604,9 +623,21 @@ final class GridViewController: UIViewController {
     }
 
     private func apply(_ new: TimelineSnapshot) {
-        let previousCount = timeline.totalCount
-        let groupingChanged = new.grouping != timeline.grouping
-        timeline = new
+        let previousCount = fullTimeline.totalCount
+        let groupingChanged = new.grouping != fullTimeline.grouping
+
+        // A large first paint shows the newest items now and swaps in the full snapshot once it
+        // is built. Updates arriving meanwhile keep the prefix live and are caught up after.
+        let isFirstPaint = previousCount == 0
+        if pendingFullTimeline != nil
+            || (isFirstPaint && searchResults == nil && new.totalCount > Self.firstPaintPrefixCount) {
+            pendingFullTimeline = new
+            pendingFullTimelineGeneration += 1
+            timeline = new.prefix(maxItems: Self.firstPaintPrefixCount)
+            if fullBuildTask == nil { startFullBuild() }
+        } else {
+            timeline = new
+        }
 
         // §14 P1 is about photos being visible, not just a view existing. Measured from the
         // live timeline even mid-search: it is a launch metric, not a display one.
@@ -658,7 +689,43 @@ final class GridViewController: UIViewController {
         updateScrubberVisibility()
     }
 
-    static func fullSnapshot(of timeline: TimelineSnapshot) -> NSDiffableDataSourceSnapshot<String, AssetID> {
+    /// Builds `pendingFullTimeline`'s snapshot off the main thread. Snapshots are values and may
+    /// be built on any thread; only applying them is confined to the main queue.
+    private func startFullBuild() {
+        guard let target = pendingFullTimeline else { return }
+        let generation = pendingFullTimelineGeneration
+        fullBuildTask = Task.detached(priority: .userInitiated) { [weak self] in
+            let snapshot = GridViewController.fullSnapshot(of: target)
+            await self?.finishFullBuild(snapshot, generation: generation)
+        }
+    }
+
+    private func finishFullBuild(_ built: Snapshot, generation: Int) {
+        fullBuildTask = nil
+        guard let latest = pendingFullTimeline else { return }
+
+        var snapshot = built
+        if generation != pendingFullTimelineGeneration {
+            // The timeline moved on while building. Usually a small delta; a regroup is not,
+            // and gets another background build rather than a main-thread one.
+            guard let patched = Self.patch(built, to: latest) else {
+                startFullBuild()
+                return
+            }
+            snapshot = patched.snapshot
+        }
+
+        pendingFullTimeline = nil
+        timeline = latest
+        // Search results keep the screen; cancelling search re-applies the timeline.
+        guard searchResults == nil else { return }
+        dataSource.applySnapshotUsingReloadData(snapshot)
+        selection.retain(only: Set(latest.buckets.flatMap { $0.items.map(\.id) }))
+        updateStatusViews()
+        updateScrubberVisibility()
+    }
+
+    nonisolated static func fullSnapshot(of timeline: TimelineSnapshot) -> NSDiffableDataSourceSnapshot<String, AssetID> {
         var snapshot = NSDiffableDataSourceSnapshot<String, AssetID>()
         snapshot.appendSections(timeline.buckets.map(\.id))
         for bucket in timeline.buckets {
@@ -668,7 +735,7 @@ final class GridViewController: UIViewController {
     }
 
     /// Above this many inserted plus removed items, a fresh snapshot is built instead.
-    static let maxPatchedChanges = 500
+    nonisolated static let maxPatchedChanges = 500
 
     /// Edits `snapshot` into one matching `target`, rather than building a new one.
     ///
@@ -679,7 +746,7 @@ final class GridViewController: UIViewController {
     ///
     /// Returns nil when the result does not reproduce `target` exactly (an item moved between
     /// days, sections reordered), so correctness never rests on the delta logic being complete.
-    static func patch(_ original: NSDiffableDataSourceSnapshot<String, AssetID>,
+    nonisolated static func patch(_ original: NSDiffableDataSourceSnapshot<String, AssetID>,
                       to target: TimelineSnapshot)
         -> (snapshot: NSDiffableDataSourceSnapshot<String, AssetID>, changed: Bool)? {
         var snapshot = original
@@ -919,8 +986,11 @@ extension GridViewController {
     /// (§14 P4). The flattened item list and start index both come from the snapshot already
     /// in hand.
     private func openViewer(at indexPath: IndexPath) {
+        // A prefix shares its index paths with the full timeline, so the start index holds and
+        // the viewer can page past what the grid has drawn so far.
+        let source = searchResults ?? fullTimeline
         guard let startIndex = displayed.flatIndex(of: indexPath) else { return }
-        let items = displayed.flattened()
+        let items = source.flattened()
         guard !items.isEmpty else { return }
 
         let viewer = ViewerPagerController(env: env,
