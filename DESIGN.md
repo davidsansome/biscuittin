@@ -1972,8 +1972,14 @@ became meanwhile and applies it (~340 ms). While that build runs the grid's `tim
 prefix itself, so every index-path lookup matches what is drawn; the viewer and search read the
 full timeline, which shares the prefix's index paths.
 
-Still on the main thread at full cost: regrouping, cancelling a search, and bulk changes over
-500 items, which rebuild the snapshot there.
+Regrouping and bulk changes (more than a patch covers) take the same background path, but keep
+the current grid on screen, frozen, rather than a prefix, and on swapping in the new snapshot
+scroll so the item that was at the top of the screen stays where it was. Leaving search patches
+the timeline snapshot saved when search began (~390 ms including the reload), and falls back to
+the prefix path only when more than 500 items changed during the search. Measured on the same
+iPhone 13: regrouping blocks the main thread for 117–325 ms instead of ~3 s.
+
+**Known slow:** opening the map view blocks the main thread for seconds at this library size.
 
 ### Notes for later milestones
 

@@ -39,20 +39,44 @@ final class GridViewController: UIViewController {
     private var displayed: TimelineSnapshot { searchResults ?? timeline }
 
     /// The newest timeline from the store while its full snapshot is still being built off the
-    /// main thread (first paint of a large library). `timeline` meanwhile holds its prefix, so
-    /// everything resolving index paths stays consistent with what is on screen; anything that
-    /// needs the whole library reads `fullTimeline`.
+    /// main thread. `timeline` meanwhile holds whatever the collection view actually shows —
+    /// a prefix of this, or the previous timeline — so everything resolving index paths stays
+    /// consistent with the screen; anything that needs the whole library reads `fullTimeline`.
     private var pendingFullTimeline: TimelineSnapshot?
     /// Bumped whenever `pendingFullTimeline` is replaced, so a finished build knows whether it
     /// is already stale.
     private var pendingFullTimelineGeneration = 0
+    private var pendingPlaceholder = Placeholder.prefix
+    /// The item to keep in place on screen when the finished build replaces the grid.
+    private var pendingAnchor: ScrollAnchor?
     private var fullBuildTask: Task<Void, Never>?
     private var fullTimeline: TimelineSnapshot { pendingFullTimeline ?? timeline }
 
-    /// Items shown immediately on first paint while the rest is built in the background.
-    /// Building a snapshot costs ~40 µs per item across many sections (see `patch`), so this
-    /// is a few screens' worth rather than the library.
-    private static let firstPaintPrefixCount = 1_000
+    /// What the grid shows while a full snapshot builds in the background.
+    private enum Placeholder {
+        /// The newest items of the target, kept live. Used when there is nothing sensible
+        /// already on screen: first paint, and leaving search.
+        case prefix
+        /// The grid as it was, frozen. Used for regrouping and bulk changes, where a prefix
+        /// would throw away the user's scroll position.
+        case current
+    }
+
+    private struct ScrollAnchor {
+        let id: AssetID
+        /// The item's top edge relative to the visible top of the collection view.
+        let offsetFromTop: CGFloat
+    }
+
+    /// Item count above which a full snapshot is built in the background rather than on the
+    /// main thread, and the size of the prefix shown meanwhile. Building one costs ~40 µs per
+    /// item across many sections (see `patch`), so this is a few screens' worth.
+    private static let backgroundBuildThreshold = 1_000
+
+    /// The timeline's snapshot as it stood when search took over the screen, so leaving search
+    /// is a patch rather than a rebuild.
+    private var timelineSnapshotBeforeSearch: Snapshot?
+
     private var columns: Int
     private var snapshotTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
@@ -374,14 +398,49 @@ final class GridViewController: UIViewController {
     }
 
     private func showSearchResults(_ results: TimelineSnapshot?) {
+        // Cancelling reports "no results" more than once; the timeline is already showing.
+        if results == nil, searchResults == nil { return }
+        if searchResults == nil, results != nil, pendingFullTimeline == nil {
+            timelineSnapshotBeforeSearch = dataSource.snapshot()
+        }
         searchResults = results
         // A selection carried from the timeline into a result set (or back) would act on items
         // the user can no longer see.
         selection.end()
-        applyDisplayedSnapshot(reloading: true)
+        if results == nil {
+            showTimelineAfterSearch()
+        } else {
+            applyDisplayedSnapshot(reloading: true)
+            collectionView.setContentOffset(.zero, animated: false)
+        }
         updateStatusViews()
         updateScrubberVisibility()
-        if results != nil { collectionView.setContentOffset(.zero, animated: false) }
+    }
+
+    private func showTimelineAfterSearch() {
+        let saved = timelineSnapshotBeforeSearch
+        timelineSnapshotBeforeSearch = nil
+        // A build still running keeps going; its placeholder just needs putting back.
+        if let pending = pendingFullTimeline {
+            timeline = pending.prefix(maxItems: Self.backgroundBuildThreshold)
+            pendingPlaceholder = .prefix
+            pendingAnchor = nil
+            applyDisplayedSnapshot(reloading: true)
+            return
+        }
+        if let saved, let patch = Self.patch(saved, to: timeline) {
+            var snapshot = patch.snapshot
+            let reconfigurable = timeline.reconfiguredIDs.filter { snapshot.indexOfItem($0) != nil }
+            if !reconfigurable.isEmpty { snapshot.reconfigureItems(reconfigurable) }
+            dataSource.applySnapshotUsingReloadData(snapshot)
+            selection.retain(only: Set(timeline.buckets.flatMap { $0.items.map(\.id) }))
+            return
+        }
+        if timeline.totalCount > Self.backgroundBuildThreshold {
+            beginBackgroundBuild(of: timeline, placeholder: .prefix)
+        } else {
+            applyDisplayedSnapshot(reloading: true)
+        }
     }
 
     // MARK: - Date scrubber (fast-scroll index)
@@ -592,7 +651,8 @@ final class GridViewController: UIViewController {
     }
 
     private func makeGroupingMenu() -> UIMenu {
-        let current = timeline.grouping
+        // The chosen grouping, even while the grid still shows the previous one during a build.
+        let current = fullTimeline.grouping
         let actions = Grouping.allCases.map { grouping in
             UIAction(title: grouping.localizedName,
                      state: grouping == current ? .on : .off) { [weak self] _ in
@@ -623,70 +683,113 @@ final class GridViewController: UIViewController {
     }
 
     private func apply(_ new: TimelineSnapshot) {
-        let previousCount = fullTimeline.totalCount
-        let groupingChanged = new.grouping != fullTimeline.grouping
-
-        // A large first paint shows the newest items now and swaps in the full snapshot once it
-        // is built. Updates arriving meanwhile keep the prefix live and are caught up after.
-        let isFirstPaint = previousCount == 0
-        if pendingFullTimeline != nil
-            || (isFirstPaint && searchResults == nil && new.totalCount > Self.firstPaintPrefixCount) {
-            pendingFullTimeline = new
-            pendingFullTimelineGeneration += 1
-            timeline = new.prefix(maxItems: Self.firstPaintPrefixCount)
-            if fullBuildTask == nil { startFullBuild() }
-        } else {
-            timeline = new
-        }
+        let previous = fullTimeline
 
         // §14 P1 is about photos being visible, not just a view existing. Measured from the
         // live timeline even mid-search: it is a launch metric, not a display one.
         LaunchClock.reportFirstContent(
             itemCount: new.totalCount,
             provenance: new.provenance == .bootCache ? "boot-cache" : "live")
-        defaultRightBarButtonItem?.menu = makeGroupingMenu()
+
+        if pendingFullTimeline != nil {
+            pendingFullTimeline = new
+            pendingFullTimelineGeneration += 1
+            // A live prefix follows the timeline; a frozen grid waits for the build.
+            if pendingPlaceholder == .prefix {
+                let groupingChanged = new.grouping != timeline.grouping
+                timeline = new.prefix(maxItems: Self.backgroundBuildThreshold)
+                if searchResults == nil { applyDisplayedSnapshot(reloading: groupingChanged) }
+            }
+            defaultRightBarButtonItem?.menu = makeGroupingMenu()
+            return
+        }
 
         // While search results are on screen the timeline keeps updating underneath but must not
-        // replace them. Cancelling search re-applies whatever the timeline has become by then.
-        guard searchResults == nil else { return }
+        // replace them. Leaving search re-applies whatever the timeline has become by then.
+        guard searchResults == nil else {
+            timeline = new
+            defaultRightBarButtonItem?.menu = makeGroupingMenu()
+            return
+        }
 
-        // Animate small deltas; fall back to a straight reload for first paint, regrouping,
-        // and bulk changes where diffing would cost more than it buys (§14 P3).
-        let delta = abs(new.totalCount - previousCount)
-        let shouldReload = previousCount == 0 || groupingChanged || delta > 500
-        applyDisplayedSnapshot(reloading: shouldReload)
+        let isFirstPaint = previous.totalCount == 0
+        let groupingChanged = new.grouping != previous.grouping
+
+        if new.totalCount <= Self.backgroundBuildThreshold {
+            timeline = new
+            applyDisplayedSnapshot(reloading: isFirstPaint || groupingChanged)
+        } else if isFirstPaint {
+            beginBackgroundBuild(of: new, placeholder: .prefix)
+        } else if !groupingChanged, let patch = Self.patch(dataSource.snapshot(), to: new) {
+            timeline = new
+            applyPatch(patch.snapshot, changed: patch.changed)
+        } else {
+            // Regrouping, or more change than a patch covers (a bulk sync, an item moving day).
+            beginBackgroundBuild(of: new, placeholder: .current)
+        }
+        defaultRightBarButtonItem?.menu = makeGroupingMenu()
     }
 
-    /// Pushes `displayed` — timeline or search results — into the diffable data source.
+    /// Pushes `displayed` — timeline or search results — into the diffable data source, building
+    /// or patching on the main thread. Only for content small enough to do that, or a patch.
     private func applyDisplayedSnapshot(reloading: Bool) {
         let current = displayed
-
-        var snapshot: Snapshot
-        var changed = true
         if !reloading, let patch = Self.patch(dataSource.snapshot(), to: current) {
-            snapshot = patch.snapshot
-            changed = patch.changed
-        } else {
-            snapshot = Self.fullSnapshot(of: current)
+            applyPatch(patch.snapshot, changed: patch.changed)
+            return
         }
-
-        // Content-only changes keep their identifiers, so the diff misses them entirely.
-        let reconfigurable = current.reconfiguredIDs.filter { snapshot.indexOfItem($0) != nil }
-        if !reconfigurable.isEmpty {
-            snapshot.reconfigureItems(reconfigurable)
-            changed = true
-        }
-
+        var snapshot = Self.fullSnapshot(of: current)
+        reconfigure(&snapshot, for: current)
         if reloading {
             dataSource.applySnapshotUsingReloadData(snapshot)
-        } else if changed {
+        } else {
             dataSource.apply(snapshot, animatingDifferences: true)
         }
+        didApply(current)
+    }
 
+    private func applyPatch(_ patched: Snapshot, changed: Bool) {
+        let current = displayed
+        var snapshot = patched
+        let reconfigured = reconfigure(&snapshot, for: current)
+        if changed || reconfigured {
+            dataSource.apply(snapshot, animatingDifferences: true)
+        }
+        didApply(current)
+    }
+
+    /// Content-only changes keep their identifiers, so the diff misses them entirely.
+    @discardableResult
+    private func reconfigure(_ snapshot: inout Snapshot, for timeline: TimelineSnapshot) -> Bool {
+        let reconfigurable = timeline.reconfiguredIDs.filter { snapshot.indexOfItem($0) != nil }
+        guard !reconfigurable.isEmpty else { return false }
+        snapshot.reconfigureItems(reconfigurable)
+        return true
+    }
+
+    private func didApply(_ current: TimelineSnapshot) {
         // Assets can disappear underneath a live selection (deleted here or on another device).
         selection.retain(only: Set(current.buckets.flatMap { $0.items.map(\.id) }))
         updateStatusViews()
         updateScrubberVisibility()
+    }
+
+    // MARK: - Background snapshot builds
+
+    private func beginBackgroundBuild(of target: TimelineSnapshot, placeholder: Placeholder) {
+        pendingFullTimeline = target
+        pendingFullTimelineGeneration += 1
+        pendingPlaceholder = placeholder
+        switch placeholder {
+        case .prefix:
+            pendingAnchor = nil
+            timeline = target.prefix(maxItems: Self.backgroundBuildThreshold)
+            applyDisplayedSnapshot(reloading: true)
+        case .current:
+            // `timeline` and the data source stay as they are, which keeps them consistent.
+            pendingAnchor = topVisibleAnchor()
+        }
+        if fullBuildTask == nil { startFullBuild() }
     }
 
     /// Builds `pendingFullTimeline`'s snapshot off the main thread. Snapshots are values and may
@@ -706,8 +809,8 @@ final class GridViewController: UIViewController {
 
         var snapshot = built
         if generation != pendingFullTimelineGeneration {
-            // The timeline moved on while building. Usually a small delta; a regroup is not,
-            // and gets another background build rather than a main-thread one.
+            // The timeline moved on while building. Usually a small delta; a regroup or a
+            // bulk sync is not, and gets another background build rather than a main-thread one.
             guard let patched = Self.patch(built, to: latest) else {
                 startFullBuild()
                 return
@@ -715,14 +818,42 @@ final class GridViewController: UIViewController {
             snapshot = patched.snapshot
         }
 
+        let anchor = pendingAnchor
         pendingFullTimeline = nil
+        pendingAnchor = nil
         timeline = latest
-        // Search results keep the screen; cancelling search re-applies the timeline.
-        guard searchResults == nil else { return }
+        defaultRightBarButtonItem?.menu = makeGroupingMenu()
+        guard searchResults == nil else {
+            // Search keeps the screen; leaving it patches from this rather than rebuilding.
+            timelineSnapshotBeforeSearch = snapshot
+            return
+        }
         dataSource.applySnapshotUsingReloadData(snapshot)
-        selection.retain(only: Set(latest.buckets.flatMap { $0.items.map(\.id) }))
-        updateStatusViews()
-        updateScrubberVisibility()
+        if let anchor { restore(anchor) }
+        didApply(latest)
+    }
+
+    private func topVisibleAnchor() -> ScrollAnchor? {
+        let top = collectionView.contentOffset.y + collectionView.adjustedContentInset.top
+        let candidates = collectionView.indexPathsForVisibleItems.sorted()
+        for indexPath in candidates {
+            guard let stub = displayed.stub(at: indexPath),
+                  let frame = collectionView.layoutAttributesForItem(at: indexPath)?.frame,
+                  frame.maxY > top else { continue }
+            return ScrollAnchor(id: stub.id, offsetFromTop: frame.minY - top)
+        }
+        return nil
+    }
+
+    private func restore(_ anchor: ScrollAnchor) {
+        guard let indexPath = timeline.indexPath(of: anchor.id) else { return }
+        collectionView.layoutIfNeeded()
+        guard let frame = collectionView.layoutAttributesForItem(at: indexPath)?.frame else { return }
+        let inset = collectionView.adjustedContentInset
+        let maxY = max(-inset.top,
+                       collectionView.contentSize.height + inset.bottom - collectionView.bounds.height)
+        let y = min(max(frame.minY - anchor.offsetFromTop - inset.top, -inset.top), maxY)
+        collectionView.setContentOffset(CGPoint(x: collectionView.contentOffset.x, y: y), animated: false)
     }
 
     nonisolated static func fullSnapshot(of timeline: TimelineSnapshot) -> NSDiffableDataSourceSnapshot<String, AssetID> {
@@ -824,7 +955,7 @@ final class GridViewController: UIViewController {
     // MARK: - Grouping and zoom
 
     private func setGrouping(_ grouping: Grouping) {
-        guard grouping != timeline.grouping else { return }
+        guard grouping != fullTimeline.grouping else { return }
         Task { await env.timelineStore.setGrouping(grouping) }
     }
 
@@ -987,8 +1118,9 @@ extension GridViewController {
     /// in hand.
     private func openViewer(at indexPath: IndexPath) {
         // A prefix shares its index paths with the full timeline, so the start index holds and
-        // the viewer can page past what the grid has drawn so far.
-        let source = searchResults ?? fullTimeline
+        // the viewer can page past what the grid has drawn so far. A frozen grid does not.
+        let source = searchResults
+            ?? (pendingFullTimeline != nil && pendingPlaceholder == .prefix ? fullTimeline : timeline)
         guard let startIndex = displayed.flatIndex(of: indexPath) else { return }
         let items = source.flattened()
         guard !items.isEmpty else { return }
