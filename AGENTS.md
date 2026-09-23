@@ -47,8 +47,8 @@ asserted a cause that had never been demonstrated.
    *what* is wrong, and never sufficient to conclude something is wrong at all.
 2. For anything geometric — position, size, overlap, duplication — get a non-visual reading
    before changing code:
-   - `mcp__ios-simulator__ui_describe_all` / `ui_find_element` for the real view hierarchy and
-     frames.
+   - `mcp__Claude_Code_iOS_Simulator__control`'s `inspect` action for the real view hierarchy and
+     frames — when it's available; see "Driving the simulator" below, it often is not.
    - A temporary `Log.ui.error(...)` of the frames in question (`.debug` and `.info` are **not**
      persisted to the log store; read them back with
      `xcrun simctl spawn <UDID> log show --last 60s --predicate 'subsystem BEGINSWITH "dev.biscuittin"' --style compact`).
@@ -107,17 +107,70 @@ mock is wrong; fix it in the same change, or the next bug hides in the same plac
 
 ## Driving the simulator
 
-Tap by **accessibility element**, not by arithmetic on a screenshot:
+The tool is **`mcp__Claude_Code_iOS_Simulator__control`**. (An earlier version of this file
+referenced `mcp__ios-simulator__ui_find_element` / `ui_tap` / `ui_describe_all` — those do not
+exist in this environment; the actions below are what actually replaced them.) Relevant actions:
+`attach` (open the live panel — cheap, do it before building; harmlessly errors if nothing's
+booted yet), `launch`, `screenshot`, `inspect` (accessibility tree, by whole-tree/marker/point —
+the real replacement for the old `ui_describe_all`/`ui_find_element`), `tap`, `swipe`, `text`,
+`button`.
 
-```
-mcp__ios-simulator__ui_find_element  → returns the element's real AXFrame in points
-mcp__ios-simulator__ui_tap           → tap that frame's centre
-```
+**Tap by accessibility element when you can get one** — `inspect` returns the element's real
+frame in points, which sidesteps everything below. But **`inspect` may simply not be available**:
+every call against this app, this session, returned `'inspect' is not available right now. Use
+'screenshot' instead.` — not a bad request, just unavailable for this simulator/app combination.
+When that happens there is no accessibility-frame fallback, and screenshot arithmetic is what's
+left — which is exactly where the next two mistakes happened.
 
-The same downscaling that produced the phantom icons also produced a mis-aimed tap early on:
-computing a button's centre from screenshot pixels put the tap ~42pt low, which hit
-"Don't Allow" on the photo-library permission prompt instead of "Allow Full Access", and the
-resulting denied-access screen was briefly mistaken for an authorization bug.
+**Mistake 1, from an earlier session: forgetting the native-vs-point scale.** Computing a
+button's centre from screenshot pixels and using it directly as a tap point put the tap ~42pt
+low, hitting "Don't Allow" on the photo-library permission prompt instead of "Allow Full
+Access" — briefly mistaken for an authorization bug.
+
+**Mistake 2, this session: two *different* scale factors, only one of which matters for taps.**
+`tap`/`swipe` coordinates are **device points** (402×874 on an iPhone 17 — the tool states this
+in its own response after `attach`/`launch`). Two separate things are not that:
+
+- The tool's own `screenshot` action started returning `captureFailed` partway through a
+  session, for no obvious reason. The reliable fallback is raw `simctl`:
+  ```bash
+  xcrun simctl io <UDID> screenshot /tmp/shot.png
+  ```
+  This file is at the device's **native pixel resolution — 3× the point resolution** on an
+  iPhone 17 (1206×2622; see "Pixel probing" above) — not 1:1 with tap coordinates.
+- Reading that file back with the `Read` tool adds a *second*, unrelated scale on top: Read
+  reports something like `[Image: original 1206x2622, displayed at 920x2000. Multiply
+  coordinates by 1.31 to map to original image.]`. That factor describes what got rendered to
+  you for viewing — it has nothing to do with tap coordinates. Applying it (or skipping it
+  inconsistently) on top of the native/point ratio is what produces a plausible-looking
+  coordinate that misses — several taps in a row landed on "Sign Out" while aiming at a toggle
+  two rows down, and one landed on the wrong screen entirely, before the pattern was clear.
+
+**What actually worked, repeatedly and precisely, once `inspect` was off the table:** stop
+estimating from either "displayed" image and measure the raw file instead. Crop it tightly
+around the target with a real image library and read pixel offsets off the crop, not off a
+mental scaling of the full screenshot:
+
+```bash
+python3 -c "
+from PIL import Image
+img = Image.open('/tmp/shot.png')
+print(img.size)                          # confirms native pixel dimensions
+crop = img.crop((x0, y0, x1, y1))        # a generous box around the target
+crop.save('/tmp/crop.png')
+"
+```
+(`pip3 install --break-system-packages Pillow` first if the host doesn't have it.) Read
+`/tmp/crop.png` back — a small crop displays close to 1:1, so measuring within it is trustworthy
+— find the target's centre **in the crop's own pixel coordinates**, add `(x0, y0)` back to get
+native-pixel coordinates, then divide by the fixed native:point ratio (3 for this device). The
+`Read`-tool "displayed" ratio never enters this calculation at all.
+
+For anything large enough that being off by ~10pt doesn't matter — a full-width settings row, a
+toolbar icon — eyeballing the raw screenshot directly (native pixels ÷ 3) is fine and faster.
+Reserve crop-and-measure for small or closely-spaced controls (a `UISwitch`, adjacent toolbar
+icons): that is exactly where the two compounding scale factors above turn a reasonable-looking
+estimate into a tap on the wrong row.
 
 **SwiftUI `Toggle` does not respond to synthetic taps** from these tools, even at coordinates
 where a `Button` in the same form does. Verify toggle-gated behaviour by setting the underlying
