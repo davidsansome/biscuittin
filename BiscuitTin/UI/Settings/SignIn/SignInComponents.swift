@@ -3,7 +3,9 @@ import SwiftUI
 /// The frame every sign-in page shares: a header, scrolling content, and actions pinned above
 /// the keyboard so the primary button is never hidden while typing.
 struct SignInPageLayout<Content: View, Actions: View>: View {
-    let symbol: String
+    /// Omitted on pages with a text field: with the keyboard up, the icon pushes the field and
+    /// its status out of view.
+    var symbol: String?
     let title: String
     let subtitle: String
     @ViewBuilder var content: Content
@@ -16,13 +18,15 @@ struct SignInPageLayout<Content: View, Actions: View>: View {
         ScrollView {
             VStack(spacing: 28) {
                 VStack(spacing: 14) {
-                    Image(systemName: symbol)
-                        .font(.system(size: 32, weight: .semibold))
-                        .foregroundStyle(.tint)
-                        .frame(width: 72, height: 72)
-                        .background(.tint.opacity(0.14),
-                                    in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-                        .accessibilityHidden(true)
+                    if let symbol {
+                        Image(systemName: symbol)
+                            .font(.system(size: 32, weight: .semibold))
+                            .foregroundStyle(.tint)
+                            .frame(width: 72, height: 72)
+                            .background(.tint.opacity(0.14),
+                                        in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                            .accessibilityHidden(true)
+                    }
                     Text(title)
                         .font(.title.bold())
                         .multilineTextAlignment(.center)

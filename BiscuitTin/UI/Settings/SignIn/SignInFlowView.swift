@@ -37,30 +37,32 @@ private struct ServerPage: View {
     @FocusState private var fieldFocused: Bool
 
     var body: some View {
-        SignInPageLayout(symbol: "server.rack",
-                         title: "Connect to Immich",
+        SignInPageLayout(title: "Connect to Immich",
                          subtitle: "Enter the address you use to open Immich in a browser.") {
             VStack(alignment: .leading, spacing: 14) {
-                SignInField(symbol: "globe") {
-                    TextField("photos.example.com", text: $model.serverText)
-                        .textContentType(.URL)
-                        .keyboardType(.URL)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .submitLabel(.continue)
-                        .focused($fieldFocused)
-                        .onSubmit { model.submitServer(webAuthenticate: webAuthenticate) }
+                HStack(spacing: 10) {
+                    SignInField(symbol: "globe") {
+                        // No `textContentType`: nothing useful completes a server address, and
+                        // any suggestion strip over the keyboard pushes the field out of view.
+                        TextField("photos.example.com", text: $model.serverText)
+                            .keyboardType(.URL)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .submitLabel(.continue)
+                            .focused($fieldFocused)
+                            .onSubmit { model.submitServer(webAuthenticate: webAuthenticate) }
+                    }
+
+                    if model.serverText.isEmpty {
+                        PasteButton(payloadType: String.self) { strings in
+                            if let text = strings.first { model.serverText = text }
+                        }
+                        .buttonBorderShape(.capsule)
+                        .labelStyle(.iconOnly)
+                    }
                 }
 
                 status
-
-                if model.serverText.isEmpty {
-                    PasteButton(payloadType: String.self) { strings in
-                        if let text = strings.first { model.serverText = text }
-                    }
-                    .buttonBorderShape(.capsule)
-                    .labelStyle(.titleAndIcon)
-                }
 
                 if let server = model.server, server.isInsecureNonLocal {
                     insecureWarning
@@ -114,7 +116,7 @@ private struct ServerPage: View {
         case .checking:
             SignInStatusLine(text: "Looking for Immich…", showsProgress: true)
         case let .found(server):
-            SignInStatusLine(text: "Immich \(server.version.description) at \(server.displayHost)",
+            SignInStatusLine(text: "Immich \(server.version.description)",
                              symbol: "checkmark.circle.fill", tone: .success)
         case let .failed(message):
             SignInStatusLine(text: message, symbol: "exclamationmark.circle.fill", tone: .failure)
@@ -148,8 +150,7 @@ private struct CredentialsPage: View {
     @FocusState private var focus: Field?
 
     var body: some View {
-        SignInPageLayout(symbol: "person.crop.circle",
-                         title: "Sign In",
+        SignInPageLayout(title: "Sign In",
                          subtitle: "to \(model.server?.displayHost ?? "your server")") {
             VStack(alignment: .leading, spacing: 14) {
                 if let message = model.loginPageMessage {
