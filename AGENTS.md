@@ -14,6 +14,11 @@ xcodebuild -project BiscuitTin.xcodeproj -scheme BiscuitTin -destination 'id=<SI
 xcodebuild test -project BiscuitTin.xcodeproj -scheme BiscuitTin -destination 'id=<SIM_UDID>' -derivedDataPath build/DerivedData
 ```
 
+- **In a fresh git worktree, run `Tools/fetch_models.sh` before the first build.** The CLIP
+  models are gitignored, so a worktree starts without them, and a build without them has **no
+  search bar**. It still compiles, runs and passes tests. The script copies the models from the
+  main checkout when it has them, so this is instant and needs no network. Search went missing
+  from device builds for weeks this way before anyone noticed.
 - Target the simulator by **UDID**, not name: several installed simulators share names like
   "iPhone 16 Pro" and `xcodebuild` fails with an ambiguous-destination error.
 - `project.pbxproj` uses Xcode 16+ **filesystem-synchronized groups**. New `.swift` files under

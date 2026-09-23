@@ -325,9 +325,12 @@ final class GridViewController: UIViewController {
     private func configureSearch() {
         // Search is unavailable rather than broken when the CLIP resources were never fetched
         // (Tools/fetch_models.sh is a manual build step) — no bar at all beats one that
-        // silently returns nothing.
+        // silently returns nothing. The absence itself must not be silent, though: builds from a
+        // fresh git worktree lacked the gitignored models and shipped without a search bar for
+        // weeks, unnoticed, because this line was `.info` and never reached a device console.
         guard env.clipEncoder.isAvailable else {
-            Log.search.info("CLIP models absent; search UI disabled")
+            Log.device("search", "CLIP models absent from the bundle; search UI disabled. "
+                       + "Run Tools/fetch_models.sh and rebuild.")
             return
         }
 

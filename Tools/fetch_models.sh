@@ -21,6 +21,18 @@ TOKENIZER_REVISION="main"
 
 cd "$(dirname "$0")/.."
 DEST="BiscuitTin/Resources/Models"
+
+# A git worktree starts without $DEST, because it is gitignored, and a build without it silently
+# ships no search bar. Clone the main checkout's copy (APFS copy-on-write, so instant and
+# free) rather than re-downloading 120 MB. Anything still missing afterwards is fetched below.
+MAIN_CHECKOUT="$(git worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p')"
+if [ -n "$MAIN_CHECKOUT" ] && [ "$MAIN_CHECKOUT" != "$(pwd -P)" ] \
+        && [ -d "$MAIN_CHECKOUT/$DEST" ] && [ ! -e "$DEST" ]; then
+    echo "Copying models from the main checkout ($MAIN_CHECKOUT):"
+    mkdir -p "$(dirname "$DEST")"
+    cp -cR "$MAIN_CHECKOUT/$DEST" "$DEST" 2>/dev/null || cp -R "$MAIN_CHECKOUT/$DEST" "$DEST"
+fi
+
 mkdir -p "$DEST"
 
 fetch() {
