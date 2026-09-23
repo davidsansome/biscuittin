@@ -1206,11 +1206,18 @@ animating a reorder of a few hundred tiles per pan is both costly and noisy.
 Dots are plain red circles with `isEnabled = false` — a density display, not tap
 targets. The grid below is how photos are opened.
 
+There is **one dot per dot-sized cell of the screen, not one per photo**
+(`PhotoDotIndex`). A dot drawn over another in the same spot adds nothing, so
+the annotation count is bounded by screen area rather than library size. Each
+dot sits at a real photo's location; cells are anchored to the map origin and
+rounded to a power-of-two size, so a pan or a small zoom only adds and removes
+dots at the edges. The grid still lists every photo in the region.
+
 ### 20.4 Not built
 
-- **Clustering.** At 2.3k dots MapKit's own collision handling is enough. A
-  library with a dense city cluster may want real clustering; that is a change to
-  the annotation layer alone.
+- **Clustering with counts.** Dots are thinned per screen cell (§20.3) but carry
+  no count; a numbered cluster badge would be a change to the annotation layer
+  alone.
 - **Filtering to a dot.** Tapping a dot to isolate that photo was considered and
   dropped: dots overlap at any realistic zoom, so the tap target is ambiguous.
 - **Coordinates for remote-only assets in the boot cache** are whatever the last
@@ -1979,7 +1986,22 @@ the timeline snapshot saved when search began (~390 ms including the reload), an
 the prefix path only when more than 500 items changed during the search. Measured on the same
 iPhone 13: regrouping blocks the main thread for 117–325 ms instead of ~3 s.
 
-**Known slow:** opening the map view blocks the main thread for seconds at this library size.
+### The map at 63k located photos (2026-09-23)
+
+One annotation per photo meant MapKit asked for 63,139 annotation views on opening the map
+(1.9 s, followed by a 2.3 s block, on an iPhone 13) and blocked for up to 7.4 s while zooming,
+with a continuous 100–300 ms stutter during pans. The map now shows one dot per dot-sized
+screen cell (§20.3): 40–600 annotations, updated in ≤ 25 ms after each movement. Opening the
+map takes 68 ms and the worst block while zooming is ~200 ms.
+
+**An `MKOverlay` drawing every dot was tried first and rejected on measurement.** It removed
+the per-dot views, but MapKit renders overlay tiles at whole zoom levels and scales them in
+between: the same dot measured 30, 41 and 58 px across one zoom level, where the annotation
+views hold 9 pt at every zoom. (Its size also needed `contentScaleFactor`: `zoomScale` alone
+drew dots a third of their size on a 3× screen.)
+
+Still on the main thread: the grid half reloads with every region change, 110–200 ms when the
+region holds tens of thousands of photos, and 16–55 ms zoomed in.
 
 ### Notes for later milestones
 

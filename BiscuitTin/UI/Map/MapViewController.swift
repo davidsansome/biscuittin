@@ -48,7 +48,9 @@ final class MapViewController: UIViewController {
     /// All stubs that carry a coordinate, held once. Filtering per map move is a scan over this
     /// rather than a query, which is what lets the grid track a pan without lag (§20.1).
     private var located: [AssetStub] = []
-    private var annotationsByID: [AssetID: MKPointAnnotation] = [:]
+    private var dotIndex = PhotoDotIndex(coordinates: [])
+    /// The annotations currently on the map, keyed by the cell each stands for.
+    private var annotationsByDot: [PhotoDotIndex.Dot: MKPointAnnotation] = [:]
     private var regionChangeWork: DispatchWorkItem?
 
     init(env: AppEnvironment) {
@@ -185,32 +187,47 @@ final class MapViewController: UIViewController {
     // MARK: - Data
 
     private func loadLocatedAssets() {
-        Task { [weak self] in
-            guard let self else { return }
-            let snapshot = await self.env.timelineStore.currentSnapshot()
+        let store = env.timelineStore
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let snapshot = await store.currentSnapshot()
             let located = snapshot.flattened().filter(\.hasCoordinate)
-            await MainActor.run {
-                self.located = located
-                self.populateAnnotations()
-                self.showInitialRegion()
-            }
+            let index = PhotoDotIndex(coordinates: located.compactMap(\.coordinate))
+            await self?.show(located: located, index: index)
         }
     }
 
-    private func populateAnnotations() {
-        mapView.removeAnnotations(mapView.annotations)
-        annotationsByID.removeAll()
+    private func show(located: [AssetStub], index: PhotoDotIndex) {
+        self.located = located
+        dotIndex = index
+        showInitialRegion()
+    }
 
-        var annotations = [MKPointAnnotation]()
-        annotations.reserveCapacity(located.count)
-        for stub in located {
-            guard let coordinate = stub.coordinate else { continue }
-            let annotation = MKPointAnnotation()
-            annotation.coordinate = coordinate
-            annotations.append(annotation)
-            annotationsByID[stub.id] = annotation
+    /// Replaces only the dots that changed, so a pan at one zoom adds and removes at the edges
+    /// rather than rebuilding every annotation.
+    private func updateDots() {
+        let visible = mapView.visibleMapRect
+        guard mapView.bounds.width > 0, visible.width > 0 else { return }
+        // One dot's diameter in map points at the current zoom.
+        let cellSize = visible.width / Double(mapView.bounds.width) * Double(PhotoDotAnnotationView.size)
+        // Half a screen of margin on every side, so a pan does not reveal an empty edge before
+        // the next update.
+        let search = visible.insetBy(dx: -visible.width / 2, dy: -visible.height / 2)
+        let wanted = dotIndex.dots(in: search, cellSize: cellSize)
+
+        var removed = [MKPointAnnotation]()
+        for (dot, annotation) in annotationsByDot where !wanted.contains(dot) {
+            removed.append(annotation)
+            annotationsByDot[dot] = nil
         }
-        mapView.addAnnotations(annotations)
+        var added = [MKPointAnnotation]()
+        for dot in wanted where annotationsByDot[dot] == nil {
+            let annotation = MKPointAnnotation()
+            annotation.coordinate = dot.point.coordinate
+            annotationsByDot[dot] = annotation
+            added.append(annotation)
+        }
+        if !removed.isEmpty { mapView.removeAnnotations(removed) }
+        if !added.isEmpty { mapView.addAnnotations(added) }
     }
 
     /// Opens on everything that has a location, so the user starts with the whole picture and
@@ -228,6 +245,7 @@ final class MapViewController: UIViewController {
         }
         let padding = UIEdgeInsets(top: 60, left: 40, bottom: 40, right: 40)
         mapView.setVisibleMapRect(rect, edgePadding: padding, animated: false)
+        updateDots()
         updateGridForVisibleRegion()
     }
 
@@ -333,7 +351,10 @@ extension MapViewController: MKMapViewDelegate {
         // A pan fires this continuously. Re-filtering and re-applying a diffable snapshot per
         // callback would fight the gesture, so coalesce to the end of the movement (§14 P4).
         regionChangeWork?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.updateGridForVisibleRegion() }
+        let work = DispatchWorkItem { [weak self] in
+            self?.updateDots()
+            self?.updateGridForVisibleRegion()
+        }
         regionChangeWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
     }
@@ -343,7 +364,7 @@ extension MapViewController: MKMapViewDelegate {
 /// *where photographs happened*, which reads better as a scatter than as annotated markers.
 private final class PhotoDotAnnotationView: MKAnnotationView {
     static let reuseIdentifier = "PhotoDot"
-    private static let size: CGFloat = 9
+    static let size: CGFloat = 9
 
     override init(annotation: MKAnnotation?, reuseIdentifier: String?) {
         super.init(annotation: annotation, reuseIdentifier: reuseIdentifier)
