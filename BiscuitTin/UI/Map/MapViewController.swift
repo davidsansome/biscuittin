@@ -97,6 +97,7 @@ final class MapViewController: UIViewController {
         mapView.translatesAutoresizingMaskIntoConstraints = false
         mapView.showsUserLocation = false      // the feature is about photos, not the viewer
         mapView.pointOfInterestFilter = .excludingAll
+        mapView.isRotateEnabled = false
         mapView.register(PhotoDotAnnotationView.self,
                          forAnnotationViewWithReuseIdentifier: PhotoDotAnnotationView.reuseIdentifier)
         mapContainer.addSubview(mapView)
