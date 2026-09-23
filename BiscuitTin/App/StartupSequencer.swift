@@ -88,6 +88,8 @@ final class StartupSequencer: ObservableObject {
     ///
     /// `syncStream` reports hard deletes as explicit events in the same call (D9), so unlike the
     /// old paged delta sync this is the whole catch-up — no separate reconciliation sweep needed.
+    /// Once that succeeds — proof the network round-trip actually works right now — this also
+    /// drains any edit left behind by a previous offline failure (D22).
     private func runRemoteSync() async {
         guard session.isConfigured else { return }
         do {
@@ -96,7 +98,9 @@ final class StartupSequencer: ObservableObject {
             return
         } catch {
             Log.immich.error("Sync failed: \(error.localizedDescription, privacy: .public)")
+            return
         }
+        await remoteLibrary.retryPendingEdits()
     }
 
     /// Foreground refresh, so returning to the app picks up server-side changes.

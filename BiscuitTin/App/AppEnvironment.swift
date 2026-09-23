@@ -43,10 +43,14 @@ final class AppEnvironment: ObservableObject {
         let rotators = RotatorRegistry.v1
         let database = AppDatabase()
         let immichSession = ImmichAuthSession()
-        let remoteLibrary = RemoteLibraryService(database: database, session: immichSession)
+        let exporter = LocalAssetExporter()
+        let remoteLibrary = RemoteLibraryService(database: database,
+                                                 session: immichSession,
+                                                 resolver: resolver,
+                                                 exporter: exporter,
+                                                 registry: rotators)
         let remoteImages = RemoteImageFetcher(session: immichSession,
                                               cache: RemoteThumbnailCache())
-        let exporter = LocalAssetExporter()
         let backupStatus = BackupStatusStore()
         let syncEngine = SyncEngine(database: database,
                                     session: immichSession,

@@ -133,6 +133,36 @@ final class AppDatabase: @unchecked Sendable {
             }
         }
 
+        migrator.registerMigration("v4-pending-edits") { db in
+            // A local edit whose remote leg failed, queued for catch-up once the server is
+            // reachable again (D22). `local_identifier` is nullable: a remote-only asset has
+            // nothing local to reconcile from, so it carries an operation `payload` instead —
+            // see RemoteLibraryService's doc comment on `PendingEditRecord` for the two
+            // reconciliation strategies this supports.
+            try db.create(table: "pending_edits") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("local_identifier", .text)
+                t.column("immich_id", .text).notNull()
+                t.column("edit_type", .text).notNull()
+                t.column("media_kind", .integer).notNull()
+                t.column("payload", .text)
+                t.column("retry_count", .integer).notNull().defaults(to: 0)
+                t.column("last_error", .text)
+                t.column("updated_at", .double).notNull()
+            }
+            // Partial unique indexes: at most one pending edit per local asset, and separately
+            // at most one per remote-only asset — the two id spaces never collide, so they need
+            // independent uniqueness rather than one index over both columns.
+            try db.execute(sql: """
+                CREATE UNIQUE INDEX idx_pending_edits_local
+                ON pending_edits(local_identifier) WHERE local_identifier IS NOT NULL
+                """)
+            try db.execute(sql: """
+                CREATE UNIQUE INDEX idx_pending_edits_remote_only
+                ON pending_edits(immich_id) WHERE local_identifier IS NULL
+                """)
+        }
+
         return migrator
     }
 }

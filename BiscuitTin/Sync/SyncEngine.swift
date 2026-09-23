@@ -420,7 +420,13 @@ actor SyncEngine {
     func handleBackgroundTask(_ task: BGProcessingTask) async {
         scheduleBackgroundTask()   // always leave a successor queued
 
-        let work = Task { await kick() }
+        // Reuses this same background window for D22's pending-edit retries rather than
+        // registering a second BGTaskScheduler identifier for what is, in practice, a much
+        // smaller and rarer queue than the upload backlog this task already exists for.
+        let work = Task {
+            await kick()
+            await remoteLibrary.retryPendingEdits()
+        }
         task.expirationHandler = { work.cancel() }
         await work.value
         task.setTaskCompleted(success: true)

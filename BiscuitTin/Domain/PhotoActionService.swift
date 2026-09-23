@@ -174,7 +174,9 @@ actor PhotoActionService {
     ///
     /// The local edit runs first because it is the one the user sees immediately. If the server
     /// copy then fails, the local rotation still stands and the failure is reported — reporting
-    /// a partial success is more honest than rolling back a correct local edit.
+    /// a partial success is more honest than rolling back a correct local edit. The remote leg
+    /// is also queued for a background retry (D22), so the failure is not the end of the story —
+    /// just because it always throws to report the toast.
     private func rotateOne(asset: Asset, rotator: any AssetRotator, clockwise: Bool) async throws {
         var rotatedSomething = false
 
@@ -191,6 +193,10 @@ actor PhotoActionService {
                                                      rotator: rotator)
                 rotatedSomething = true
             } catch {
+                try? await remoteLibrary.enqueuePendingRotation(localIdentifier: asset.localIdentifier,
+                                                                immichID: immichID,
+                                                                mediaKind: asset.stub.kind,
+                                                                clockwise: clockwise)
                 if rotatedSomething {
                     throw PartialRotationError.serverCopyNotRotated(underlying: error)
                 }
