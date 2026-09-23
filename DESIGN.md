@@ -1199,7 +1199,8 @@ filtered by geography.
 
 Region changes are coalesced (120 ms) rather than applied per callback, since a
 pan fires them continuously and re-applying a diffable snapshot each time would
-fight the gesture (§14 P4). Snapshots are applied with a reload rather than a
+fight the gesture (§14 P4). The filter and the snapshot build run off the main
+thread; only the reload is on it. Snapshots are applied with a reload rather than a
 diff: consecutive regions share most of their photos but differ in *order*, and
 animating a reorder of a few hundred tiles per pan is both costly and noisy.
 
@@ -2000,8 +2001,10 @@ between: the same dot measured 30, 41 and 58 px across one zoom level, where the
 views hold 9 pt at every zoom. (Its size also needed `contentScaleFactor`: `zoomScale` alone
 drew dots a third of their size on a 3× screen.)
 
-Still on the main thread: the grid half reloads with every region change, 110–200 ms when the
-region holds tens of thousands of photos, and 16–55 ms zoomed in.
+The grid half then filtered and rebuilt its snapshot on the main thread per region change,
+110–200 ms for a region of ~50k photos. Filtering and building now run off the main thread
+(54–71 ms there), and a result for a region the map has already left is dropped. What remains on
+the main thread is UIKit's reload: 56–124 ms for ~50k photos, 11–37 ms zoomed in.
 
 ### Notes for later milestones
 

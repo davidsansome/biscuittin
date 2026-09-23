@@ -52,6 +52,8 @@ final class MapViewController: UIViewController {
     /// The annotations currently on the map, keyed by the cell each stands for.
     private var annotationsByDot: [PhotoDotIndex.Dot: MKPointAnnotation] = [:]
     private var regionChangeWork: DispatchWorkItem?
+    /// Bumped per region change, so a filter finishing after the map has moved on is dropped.
+    private var gridGeneration = 0
 
     init(env: AppEnvironment) {
         self.env = env
@@ -254,19 +256,34 @@ final class MapViewController: UIViewController {
     /// Uses `MKMapRect` containment rather than latitude/longitude comparison: a longitude range
     /// straddling the antimeridian is not a simple interval, and `MKMapRect` already handles
     /// that wrap correctly.
+    ///
+    /// Filtering and building the grid's snapshot run off the main thread: the whole-world view
+    /// holds tens of thousands of photos, and only the reload itself has to be on main.
     private func updateGridForVisibleRegion() {
         let region = mapView.visibleMapRect
-        let matching = located.filter { stub in
-            guard let coordinate = stub.coordinate else { return false }
-            return region.contains(MKMapPoint(coordinate))
+        let located = self.located
+        gridGeneration += 1
+        let generation = gridGeneration
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let matching = located.filter { stub in
+                guard let coordinate = stub.coordinate else { return false }
+                return region.contains(MKMapPoint(coordinate))
+            }
+            let snapshot = MapViewController.snapshot(for: matching)
+            let built = GridViewController.fullSnapshot(of: snapshot)
+            await self?.showGrid(snapshot, built: built, generation: generation)
         }
-        gridController.showExternalSnapshot(Self.snapshot(for: matching))
     }
 
+    private func showGrid(_ snapshot: TimelineSnapshot,
+                          built: NSDiffableDataSourceSnapshot<String, AssetID>, generation: Int) {
+        guard generation == gridGeneration else { return }
+        gridController.showExternalSnapshot(snapshot, built: built)
+    }
 
     /// One bucket, newest first — `located` comes from the flattened timeline, which is already
     /// in that order, so the filter preserves it.
-    private static func snapshot(for stubs: [AssetStub]) -> TimelineSnapshot {
+    nonisolated private static func snapshot(for stubs: [AssetStub]) -> TimelineSnapshot {
         guard !stubs.isEmpty else {
             return TimelineSnapshot(grouping: .day, buckets: [], totalCount: 0, provenance: .live)
         }

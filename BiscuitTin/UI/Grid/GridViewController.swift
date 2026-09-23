@@ -176,15 +176,19 @@ final class GridViewController: UIViewController {
 
     /// Displays a snapshot chosen by an owning screen (the map's region filter, §20). Only valid
     /// in `.map` mode; the timeline grid publishes its own content.
-    func showExternalSnapshot(_ snapshot: TimelineSnapshot) {
+    ///
+    /// `built` is `fullSnapshot(of: snapshot)` made off the main thread by the caller; a region
+    /// can hold tens of thousands of photos.
+    func showExternalSnapshot(_ snapshot: TimelineSnapshot,
+                              built: NSDiffableDataSourceSnapshot<String, AssetID>) {
         guard mode == .map, isViewLoaded else { return }
         let isFirst = timeline.isEmpty
         timeline = snapshot
-        selection.retain(only: Set(snapshot.buckets.flatMap { $0.items.map(\.id) }))
         // Reload rather than diff: consecutive map regions share most of their photos but the
         // *order* is what changed, and animating a reorder of a few hundred tiles per pan is
         // both expensive and visually noisy.
-        applyDisplayedSnapshot(reloading: true)
+        dataSource.applySnapshotUsingReloadData(built)
+        didApply(snapshot)
         if !isFirst { collectionView.setContentOffset(.zero, animated: false) }
     }
 
