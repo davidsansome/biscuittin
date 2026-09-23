@@ -1950,3 +1950,11 @@ Keycloak setup before relying on it.
   array there, before `index.replaceAll`.
 * `StartupSequencer.runStartupSequence()` has the M5 (`deltaSync`) and M6 (`SyncEngine.kick`)
   hook points marked in order.
+
+### D14 deviation: `NSAllowsArbitraryLoads` unconditionally
+
+Sign-in to a LAN Immich server over plain HTTP failed on a real device. D14 planned to add
+`NSAllowsArbitraryLoads` only behind a user acknowledgement, but ATS is a static Info.plist
+setting and cannot be toggled at runtime, so the gate can only live in the UI
+(`ImmichAuthSession.isInsecureNonLocal` still drives the warning). `NSAllowsLocalNetworking` was
+removed rather than kept alongside: iOS ignores `NSAllowsArbitraryLoads` when it is present.

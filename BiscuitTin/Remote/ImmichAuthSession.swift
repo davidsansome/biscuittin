@@ -237,7 +237,7 @@ final class ImmichAuthSession: @unchecked Sendable {
     }
 
     /// True when plain HTTP is being used to a non-local host, which needs an explicit warning
-    /// because ATS only exempts local networking (D14).
+    /// because ATS permits it (D14) and credentials would cross the internet in the clear.
     static func isInsecureNonLocal(_ url: URL) -> Bool {
         guard url.scheme?.lowercased() == "http", let host = url.host?.lowercased() else {
             return false
