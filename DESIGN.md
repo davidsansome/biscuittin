@@ -2098,6 +2098,34 @@ date comes from a PhotoKit fetch of just those identifiers. Changes over 200 ass
 * **Launch pays ~45 ms more** to build the id lookup for 70k rows. That rebuild is no longer
   on the path to a new photo appearing (see the local catch-up above).
 
+### The grid's share of a one-photo change (2026-09-26)
+
+With the store applying server changes directly, the grid became the main cost between a
+server change and the screen. Split on the iPhone 13 at 70,842 items, over eight one-photo
+changes driven by trashing and restoring one row in the local cache:
+
+| main-thread step | ms |
+|---|---|
+| `dataSource.snapshot()` | 0–8 |
+| `GridViewController.patch` | 105–153 |
+| UIKit `dataSource.apply(animatingDifferences: true)` | 223–242 |
+| `selection.retain`'s 70k-id `Set` (status and scrubber ~0) | 22–30 |
+
+* **The selection set is built only when something is selected.** `retain` already returned
+  early otherwise, but its caller built the set first.
+* **`patch` runs off the main thread.** `timeline` keeps describing what the data source shows
+  until the patch lands, so index-path lookups stay in step with the screen. The newest store
+  snapshot waits in `patchTarget`. One patch runs at a time. A finished one is applied even if
+  newer snapshots arrived meanwhile, then the next chases the latest, so a steady stream of
+  updates cannot hold the screen back. Anything else that writes the data source bumps
+  `patchGeneration` first, so a patch computed against the old contents is dropped. Entering
+  search also promotes the pending target to `timeline`.
+
+Measured with a main-thread watchdog over four changes: the block per change fell from 354–435
+ms to **220–246 ms**, almost all of it UIKit's animated apply. `patch` now takes 105–125 ms in
+the background. What is left is UIKit diffing 70k string identifiers. Integer identifiers, or
+batch updates driven by the store's own delta, are the next options.
+
 ### Notes for later milestones
 
 * `GridLayoutProvider` sizes tiles by giving the item `fractionalWidth(1/columns)` and
