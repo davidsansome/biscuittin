@@ -29,6 +29,20 @@ actor TimelineStore {
     private var remoteRefreshRequested = false
     private static let remoteRefreshDebounce: Double = 0.25
 
+    /// Every cached server asset, newest first, kept between rebuilds: reading all of them back
+    /// from SQLite takes 500–650 ms at 70k rows on an iPhone 13, and a one-asset change 65 ms.
+    /// Nil until first loaded, and again after a change that could not be described by id.
+    private var remoteStubs: TimelineIndex?
+    /// Server assets whose cached stubs may be out of date.
+    private var staleRemoteIDs = Set<String>()
+    /// Bumped by `.all`, so a load that started before it does not store what it read.
+    private var remoteGeneration = 0
+    /// The most recent remote load. Each waits for the one before, so reads of the same rows
+    /// cannot land out of order.
+    private var remoteLoadTail: Task<RemoteMergeData, Never>?
+    /// Above this many stale ids, re-reading everything costs less than looking each one up.
+    private static let maxRemoteDelta = 2_000
+
     // MARK: - Index state
 
     /// The whole timeline, newest first. Also the viewer's flattened paging order.
@@ -94,8 +108,8 @@ actor TimelineStore {
         self.remoteLibrary = remoteLibrary
 
         remoteObservationTask = Task { [weak self] in
-            for await _ in remoteLibrary.changes {
-                await self?.scheduleRemoteRefresh()
+            for await change in remoteLibrary.changes {
+                await self?.noteRemoteChange(change)
             }
         }
         if isLive { Task { await refresh() } }
@@ -176,6 +190,20 @@ actor TimelineStore {
         // This rebuild subsumes anything the coalescer was still holding.
         remoteRefreshRequested = false
         await rebuildIndex()
+    }
+
+    private func noteRemoteChange(_ change: RemoteChange) {
+        switch change {
+        case .assets(let ids):
+            staleRemoteIDs.formUnion(ids)
+        case .links:
+            break
+        case .all:
+            remoteStubs = nil
+            staleRemoteIDs.removeAll()
+            remoteGeneration += 1
+        }
+        scheduleRemoteRefresh()
     }
 
     /// Coalesces a burst of remote-change notifications into a single rebuild.
@@ -266,14 +294,56 @@ actor TimelineStore {
     }
 
     private func loadRemoteMergeData() async -> RemoteMergeData {
+        let previous = remoteLoadTail
+        let load = Task {
+            _ = await previous?.value
+            return await self.performRemoteLoad()
+        }
+        remoteLoadTail = load
+        return await load.value
+    }
+
+    private func performRemoteLoad() async -> RemoteMergeData {
         guard let remoteLibrary else { return RemoteMergeData() }
         do {
-            return try await remoteLibrary.mergeData()
+            var data = try await remoteLibrary.mergeLinks()
+            data.stubs = try await currentRemoteStubs(from: remoteLibrary)
+            return data
         } catch {
             // A failed metadata read must never take the local timeline down with it.
             Log.timeline.error("Remote merge data unavailable: \(error.localizedDescription, privacy: .public)")
             return RemoteMergeData()
         }
+    }
+
+    /// `remoteStubs`, brought up to date by re-reading only the stale rows when it can.
+    private func currentRemoteStubs(from remoteLibrary: RemoteLibraryService) async throws -> [AssetStub] {
+        let generation = remoteGeneration
+        let ids = staleRemoteIDs
+        staleRemoteIDs.removeAll()
+
+        if var cached = remoteStubs, ids.count <= Self.maxRemoteDelta {
+            guard !ids.isEmpty else { return cached.stubs }
+            let fresh: [AssetStub]
+            do {
+                fresh = try await remoteLibrary.remoteStubs(ids: ids)
+            } catch {
+                staleRemoteIDs.formUnion(ids)
+                throw error
+            }
+            cached.update(fresh)
+            let visible = Set(fresh.map(\.id))
+            _ = cached.remove(ids.map { AssetID.remote($0) }.filter { !visible.contains($0) })
+            if generation == remoteGeneration { remoteStubs = cached }
+            return cached.stubs
+        }
+
+        // Dropped first, so a failed read leaves nothing stale behind to be patched later.
+        remoteStubs = nil
+        var loaded = TimelineIndex()
+        loaded.replaceAll(try await remoteLibrary.remoteStubs())
+        if generation == remoteGeneration { remoteStubs = loaded }
+        return loaded.stubs
     }
 
     // MARK: - Incremental changes (D20)

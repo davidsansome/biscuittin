@@ -133,9 +133,11 @@ actor SyncEngine {
                 let before = try await outstandingCount()
                 guard before > 0 else { break }
 
-                try await computeMissingChecksums()
-                try await dedupeAgainstServer()
-                try await uploadPending()
+                let checksummed = try await computeMissingChecksums()
+                let deduped = try await dedupeAgainstServer()
+                let uploaded = try await uploadPending()
+                // All three link facets in `facet_links` directly; the timeline hears of it only here.
+                if checksummed || deduped || uploaded { remoteLibrary.facetLinksDidChange() }
                 await publishStatus(uploading: true)
 
                 let after = try await outstandingCount()
@@ -187,8 +189,8 @@ actor SyncEngine {
         }
     }
 
-    /// Step 2: checksum assets we have not hashed yet.
-    private func computeMissingChecksums() async throws {
+    /// Step 2: checksum assets we have not hashed yet. Returns whether it linked any facets.
+    private func computeMissingChecksums() async throws -> Bool {
         let writer = try database.writer()
         let identifiers = try await writer.read { db in
             try String.fetchAll(db, sql: """
@@ -197,8 +199,9 @@ actor SyncEngine {
                 LIMIT ?
                 """, arguments: [BackupStateRecord.State.pending.rawValue, Self.checksumBatchSize])
         }
-        guard !identifiers.isEmpty else { return }
+        guard !identifiers.isEmpty else { return false }
 
+        var linked = false
         let assets = resolver.resolve(identifiers)
         for identifier in identifiers {
             try Task.checkCancellation()
@@ -220,15 +223,17 @@ actor SyncEngine {
                         ON CONFLICT(checksum_hex) DO UPDATE SET local_identifier = excluded.local_identifier
                         """, arguments: [checksum, identifier])
                 }
+                linked = true
             } catch {
                 try await mark(identifier, state: .ineligible, error: error.localizedDescription)
             }
         }
+        return linked
     }
 
     /// Step 3: ask the server which checksums it already has. Duplicates are marked uploaded
-    /// without transferring anything.
-    private func dedupeAgainstServer() async throws {
+    /// without transferring anything. Returns whether it linked any facets.
+    private func dedupeAgainstServer() async throws -> Bool {
         guard let baseURL = session.baseURL else { throw ImmichError.notConfigured }
         let client = ImmichClient(baseURL: baseURL, credentialProvider: { [session] in session.credential })
 
@@ -240,12 +245,13 @@ actor SyncEngine {
                 LIMIT ?
                 """, arguments: [BackupStateRecord.State.pending.rawValue, Self.checksumBatchSize])
         }
-        guard !candidates.isEmpty else { return }
+        guard !candidates.isEmpty else { return false }
 
         let items = candidates.map {
             Immich.BulkUploadCheckItem(id: $0["local_identifier"], checksum: $0["checksum_hex"])
         }
         let response = try await client.bulkUploadCheck(items)
+        var linked = false
 
         for result in response.results where result.action == "reject" {
             guard result.reason == "duplicate" else { continue }
@@ -267,12 +273,14 @@ actor SyncEngine {
                         WHERE local_identifier = ?
                         """, arguments: [assetID, result.id])
                 }
+                linked = true
             }
         }
+        return linked
     }
 
-    /// Step 4: upload what is left.
-    private func uploadPending() async throws {
+    /// Step 4: upload what is left. Returns whether it linked any facets.
+    private func uploadPending() async throws -> Bool {
         guard let baseURL = session.baseURL else { throw ImmichError.notConfigured }
         let client = ImmichClient(baseURL: baseURL, credentialProvider: { [session] in session.credential })
 
@@ -288,8 +296,9 @@ actor SyncEngine {
                                  Self.maxRetries,
                                  Self.uploadConcurrency * 4])
         }
-        guard !pending.isEmpty else { return }
+        guard !pending.isEmpty else { return false }
 
+        var linked = false
         let assets = resolver.resolve(pending)
         for identifier in pending {
             try Task.checkCancellation()
@@ -297,12 +306,14 @@ actor SyncEngine {
                 try await mark(identifier, state: .ineligible, error: "Asset no longer exists")
                 continue
             }
-            await upload(asset: asset, identifier: identifier, client: client)
+            if await upload(asset: asset, identifier: identifier, client: client) { linked = true }
             await publishStatus(uploading: true)
         }
+        return linked
     }
 
-    private func upload(asset: PHAsset, identifier: String, client: ImmichClient) async {
+    /// Returns whether it linked the uploaded asset to its server copy.
+    private func upload(asset: PHAsset, identifier: String, client: ImmichClient) async -> Bool {
         do {
             try await mark(identifier, state: .uploading, error: nil)
             let export = try await exporter.export(asset: asset)
@@ -335,11 +346,13 @@ actor SyncEngine {
                 }
             }
             Log.sync.info("Uploaded \(export.filename, privacy: .public) (\(export.byteCount) bytes)")
+            return response?.id != nil
         } catch is CancellationError {
             try? await mark(identifier, state: .pending, error: nil)
         } catch {
             try? await bumpFailure(identifier, error: error.localizedDescription)
         }
+        return false
     }
 
     // MARK: - State helpers

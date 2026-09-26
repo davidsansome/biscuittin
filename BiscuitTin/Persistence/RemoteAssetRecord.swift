@@ -42,16 +42,38 @@ struct RemoteAssetRecord: Codable, FetchableRecord, PersistableRecord, Equatable
     }
 
     var mediaKind: MediaKind {
+        Self.mediaKind(type: type, livePhotoVideoID: livePhotoVideoID)
+    }
+
+    private static func mediaKind(type: String, livePhotoVideoID: String?) -> MediaKind {
         if type == Immich.AssetType.video.rawValue { return .video }
         return livePhotoVideoID != nil ? .livePhoto : .image
     }
 
     var stub: AssetStub {
+        Self.stub(immichID: immichID, type: type, livePhotoVideoID: livePhotoVideoID,
+                  durationSeconds: durationSeconds, captureAt: captureAt, width: width,
+                  height: height, latitude: latitude, longitude: longitude)
+    }
+
+    /// The columns `stub(row:)` reads, in its order. Selecting only these rather than whole
+    /// records skips decoding every row's EXIF JSON, which a stub never uses.
+    static let stubColumns =
+        "immich_id, type, live_photo_video_id, duration_seconds, capture_at, width, height, latitude, longitude"
+
+    static func stub(row: Row) -> AssetStub {
+        stub(immichID: row[0], type: row[1], livePhotoVideoID: row[2], durationSeconds: row[3],
+             captureAt: row[4], width: row[5], height: row[6], latitude: row[7], longitude: row[8])
+    }
+
+    private static func stub(immichID: String, type: String, livePhotoVideoID: String?,
+                             durationSeconds: Double, captureAt: Double, width: Int?, height: Int?,
+                             latitude: Double?, longitude: Double?) -> AssetStub {
         AssetStub(id: .remote(immichID),
                   captureDate: Date(timeIntervalSince1970: captureAt),
                   hasLocal: false,
                   hasRemote: true,
-                  kind: mediaKind,
+                  kind: mediaKind(type: type, livePhotoVideoID: livePhotoVideoID),
                   durationSeconds: Float(durationSeconds),
                   pixelWidth: Int32(clamping: width ?? 0),
                   pixelHeight: Int32(clamping: height ?? 0),

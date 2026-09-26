@@ -2037,6 +2037,34 @@ Reading every server row from SQLite (`mergeData`) is most of each rebuild. It w
   startup sequence. It now signals only when rows changed, and scene activation defers to the
   startup sequence's own sync. On the phone, launch now does one rebuild.
 
+**Follow-up: the server rows are cached between rebuilds.** `TimelineStore` keeps the server
+stubs in memory, and `RemoteLibraryService.changes` now says what changed
+(`RemoteChange.assets(ids)`, `.links`, `.all`), so a rebuild re-reads only the named rows.
+Links (~3k complete pairs) are re-read on every rebuild, filtered in SQL rather than in Swift.
+That keeps them correct without tracking each one. The full read selects only the columns a
+stub needs, instead of decoding whole records and their EXIF JSON. On the iPhone 13:
+
+| | before | after |
+|---|---|---|
+| full server read, 70,833 rows | 848–1,397 ms | 511–639 ms |
+| read after a one-asset change | a full read | 65 ms + links 30 ms |
+| rebuild after a server change | ~1.1–2.2 s | 256–266 ms |
+
+The one-asset case was driven by a temporary hook that reported a fake change, since no real
+server change could be made from the bench. Most of its 65 ms is `TimelineIndex.update`
+hashing all 70k ids, not SQLite.
+
+Three things this depends on:
+
+* **Every writer must report.** `SyncEngine` wrote `facet_links` without telling anyone, and
+  the timeline only saw those writes because every sync used to force a rebuild. It now calls
+  `facetLinksDidChange()` after a round that linked anything. Rotation and edit retries report
+  both ids from `repointAfterRotation`, where they all end.
+* **The stream is unbounded.** It kept only the newest event, which was harmless when events
+  carried nothing. Now a dropped event would leave stale rows in memory until relaunch.
+* **Loads run one at a time, and `.all` bumps a generation.** Otherwise two reads of the same
+  row could land out of order, or a load that started before a wipe could store what it read.
+
 ### Notes for later milestones
 
 * `GridLayoutProvider` sizes tiles by giving the item `fractionalWidth(1/columns)` and

@@ -8,6 +8,16 @@ import Photos
 /// hidden behind a local one depends on the local asset still existing, which only the timeline
 /// knows — a link row outlives the local file it names. Filtering here made every photo vanish
 /// from the grid after Free Up Space removed its local copy (D18).
+/// What a committed change to the metadata cache touched, so the timeline can re-read only that.
+enum RemoteChange: Sendable, Equatable {
+    /// Rows for these server assets may have been added, changed, trashed or removed.
+    case assets(Set<String>)
+    /// Only `facet_links` changed. The timeline re-reads links on every rebuild anyway.
+    case links
+    /// Anything may have changed.
+    case all
+}
+
 struct RemoteMergeData {
     /// Every non-trashed remote asset, newest first.
     var stubs: [AssetStub] = []
@@ -39,8 +49,8 @@ struct RemoteMergeData {
 actor RemoteLibraryService {
 
     /// Emitted after each committed batch so the timeline can re-merge.
-    nonisolated let changes: AsyncStream<Void>
-    private let changesContinuation: AsyncStream<Void>.Continuation
+    nonisolated let changes: AsyncStream<RemoteChange>
+    private let changesContinuation: AsyncStream<RemoteChange>.Continuation
 
     private let database: AppDatabase
     private let session: ImmichAuthSession
@@ -75,7 +85,9 @@ actor RemoteLibraryService {
         self.clientFactory = clientFactory ?? { url in
             ImmichClient(baseURL: url, credentialProvider: { session.credential })
         }
-        let (stream, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        // Unbounded: each event names what changed, and the timeline caches rows between them,
+        // so a dropped event would leave it showing stale rows until relaunch.
+        let (stream, continuation) = AsyncStream<RemoteChange>.makeStream()
         changes = stream
         changesContinuation = continuation
     }
@@ -154,9 +166,10 @@ actor RemoteLibraryService {
         }
         try setCursor(Cursor.lastSyncedAt, to: Immich.iso8601String(from: Date()))
         Log.immich.info("Sync stream applied \(upserts.count) upserts, \(deletedIDs.count) deletes")
-        // Every yield costs the timeline a full rebuild, about a second on a 70k-asset library.
-        if !upserts.isEmpty || !exifs.isEmpty || !deletedIDs.isEmpty {
-            changesContinuation.yield()
+        // Every yield costs the timeline a rebuild.
+        let changedIDs = Set(upserts.keys).union(exifs.keys).union(deletedIDs)
+        if !changedIDs.isEmpty {
+            changesContinuation.yield(.assets(changedIDs))
         }
     }
 
@@ -214,29 +227,61 @@ actor RemoteLibraryService {
         }
     }
 
-    /// Reads what the timeline needs for its merge. Runs off the main thread by construction.
-    func mergeData() throws -> RemoteMergeData {
-        guard database.isOpen || session.isConfigured else { return RemoteMergeData() }
-        let writer = try database.writer()
+    /// True when there cannot be anything cached, so reads can skip opening the database.
+    private var hasNoCache: Bool { !database.isOpen && !session.isConfigured }
 
-        return try writer.read { db in
-            var data = RemoteMergeData()
-
-            for link in try FacetLinkRecord.fetchAll(db) {
-                guard let localIdentifier = link.localIdentifier, let immichID = link.immichID else {
-                    continue
-                }
-                data.localIdentifierByImmichID[immichID] = localIdentifier
-                data.linkedLocalIdentifiers.insert(localIdentifier)
-            }
-
-            data.stubs = try RemoteAssetRecord
-                .filter(sql: "is_trashed = 0")
-                .order(sql: "capture_at DESC")
-                .fetchAll(db)
-                .map(\.stub)
-            return data
+    /// The local↔server links the timeline merges on, with `stubs` left empty. Runs off the
+    /// main thread by construction.
+    func mergeLinks() throws -> RemoteMergeData {
+        var data = RemoteMergeData()
+        guard !hasNoCache else { return data }
+        let rows = try database.writer().read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT immich_id, local_identifier FROM facet_links
+                WHERE immich_id IS NOT NULL AND local_identifier IS NOT NULL
+                """)
         }
+        for row in rows {
+            let immichID: String = row[0]
+            let localIdentifier: String = row[1]
+            data.localIdentifierByImmichID[immichID] = localIdentifier
+            data.linkedLocalIdentifiers.insert(localIdentifier)
+        }
+        return data
+    }
+
+    /// Every non-trashed server asset, newest first.
+    func remoteStubs() throws -> [AssetStub] {
+        guard !hasNoCache else { return [] }
+        return try database.writer().read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT \(RemoteAssetRecord.stubColumns) FROM remote_assets
+                WHERE is_trashed = 0 ORDER BY capture_at DESC
+                """).map(RemoteAssetRecord.stub(row:))
+        }
+    }
+
+    /// The non-trashed stubs among `ids`. An id missing from the result has no visible row.
+    func remoteStubs(ids: Set<String>) throws -> [AssetStub] {
+        guard !hasNoCache, !ids.isEmpty else { return [] }
+        let all = Array(ids)
+        return try database.writer().read { db in
+            var stubs = [AssetStub]()
+            // Stays well under SQLite's bound-parameter limit.
+            for start in stride(from: 0, to: all.count, by: 500) {
+                let chunk = Array(all[start..<min(start + 500, all.count)])
+                stubs += try Row.fetchAll(db, sql: """
+                    SELECT \(RemoteAssetRecord.stubColumns) FROM remote_assets
+                    WHERE is_trashed = 0 AND immich_id IN (\(databaseQuestionMarks(count: chunk.count)))
+                    """, arguments: StatementArguments(chunk)).map(RemoteAssetRecord.stub(row:))
+            }
+            return stubs
+        }
+    }
+
+    /// For writers outside this actor — `SyncEngine` links facets as it checksums and uploads.
+    nonisolated func facetLinksDidChange() {
+        changesContinuation.yield(.links)
     }
 
     func record(for immichID: String) throws -> RemoteAssetRecord? {
@@ -306,7 +351,6 @@ actor RemoteLibraryService {
         defer { try? FileManager.default.removeItem(at: rotated) }
 
         try await replaceRemoteFile(oldID: immichID, fileURL: rotated, filename: filename, record: record)
-        changesContinuation.yield()
     }
 
     /// Uploads `fileURL` as `oldID`'s replacement, retires the original, and repoints local
@@ -363,6 +407,8 @@ actor RemoteLibraryService {
             try db.execute(sql: "UPDATE facet_links SET immich_id = ? WHERE immich_id = ?",
                            arguments: [newID, oldID])
         }
+        // Every rotation and pending-edit retry ends here.
+        changesContinuation.yield(.assets([oldID, newID]))
     }
 
     private func writeSwappedDimensions(immichID: String) async throws {
@@ -386,7 +432,7 @@ actor RemoteLibraryService {
             try db.execute(sql: "UPDATE remote_assets SET is_trashed = 1 WHERE immich_id IN (\(placeholders))",
                            arguments: StatementArguments(ids))
         }
-        changesContinuation.yield()
+        changesContinuation.yield(.assets(Set(ids)))
     }
 
     /// Clears cached server data without touching the device library.
@@ -398,7 +444,7 @@ actor RemoteLibraryService {
             try db.execute(sql: "DELETE FROM kv")
             try db.execute(sql: "DELETE FROM pending_edits")
         }
-        changesContinuation.yield()
+        changesContinuation.yield(.all)
     }
 
     // MARK: - Pending edits (D22)
@@ -476,7 +522,6 @@ actor RemoteLibraryService {
                 try Task.checkCancellation()
                 try await reconcile(edit)
                 try await clearPendingEdit(id: edit.id)
-                changesContinuation.yield()
             } catch is CancellationError {
                 return
             } catch {
