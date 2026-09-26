@@ -29,19 +29,26 @@ actor TimelineStore {
     private var remoteRefreshRequested = false
     private static let remoteRefreshDebounce: Double = 0.25
 
-    /// Every cached server asset, newest first, kept between rebuilds: reading all of them back
-    /// from SQLite takes 500–650 ms at 70k rows on an iPhone 13, and a one-asset change 65 ms.
-    /// Nil until first loaded, and again after a change that could not be described by id.
-    private var remoteStubs: TimelineIndex?
-    /// Server assets whose cached stubs may be out of date.
+    /// The server half of the timeline, kept so a server change is applied to the timeline
+    /// directly instead of rebuilding it. Reading all 70k rows back takes 500–650 ms on an
+    /// iPhone 13; one row, under a millisecond. Nil until first loaded, and again after a change
+    /// that could not be described by id.
+    private var remoteState: RemoteMergeState?
+    /// Server assets whose cached rows and links may be out of date.
     private var staleRemoteIDs = Set<String>()
-    /// Bumped by `.all`, so a load that started before it does not store what it read.
+    /// Set by a link change that did not say which links; every link is re-read (~30 ms).
+    private var remoteLinksStale = false
+    /// Bumped by `.all`, so a read that started before it does not store what it read.
     private var remoteGeneration = 0
-    /// The most recent remote load. Each waits for the one before, so reads of the same rows
+    /// The most recent remote read. Each waits for the one before, so reads of the same rows
     /// cannot land out of order.
-    private var remoteLoadTail: Task<RemoteMergeData, Never>?
+    private var remoteSyncTail: Task<Bool, Never>?
     /// Above this many stale ids, re-reading everything costs less than looking each one up.
     private static let maxRemoteDelta = 2_000
+    /// Above this many changed assets, the timeline is rebuilt rather than patched: each patched
+    /// asset shifts the index array, so patching grows with the change times the library, while
+    /// a rebuild (~300 ms at 70k on an iPhone 13) does not grow with the change.
+    private static let maxPatchedRemoteChanges = 200
 
     // MARK: - Index state
 
@@ -189,6 +196,8 @@ actor TimelineStore {
     func refresh() async {
         // This rebuild subsumes anything the coalescer was still holding.
         remoteRefreshRequested = false
+        // Links are cheap to re-read, and a reconciliation should not trust a missed signal.
+        remoteLinksStale = true
         await rebuildIndex()
     }
 
@@ -197,25 +206,26 @@ actor TimelineStore {
         case .assets(let ids):
             staleRemoteIDs.formUnion(ids)
         case .links:
-            break
+            remoteLinksStale = true
         case .all:
-            remoteStubs = nil
+            remoteState = nil
             staleRemoteIDs.removeAll()
+            remoteLinksStale = false
             remoteGeneration += 1
         }
         scheduleRemoteRefresh()
     }
 
-    /// Coalesces a burst of remote-change notifications into a single rebuild.
+    /// Coalesces a burst of remote-change notifications into a single pass.
     ///
-    /// `RemoteLibraryService.sync` yields once per page of results, and a rebuild is a full
-    /// re-enumeration of the photo library — measured at 348 ms of a 394 ms rebuild on a
-    /// 2,652-asset library. Rebuilding per page therefore multiplied one sign-in into three
+    /// Most passes patch the timeline directly (`applyRemoteChanges`), but a large change still
+    /// takes a rebuild, which re-enumerates the photo library, and a sync can report several
+    /// batches in quick succession. Rebuilding per batch once multiplied one sign-in into three
     /// complete rebuilds that all produced an identical index.
     ///
     /// A single drain task owns the work: requests set a flag, and the drain sleeps once to let
-    /// a burst accumulate before paying for one rebuild. Changes that arrive *during* a rebuild
-    /// re-arm the flag and get their own pass, so a long multi-page sync still updates
+    /// a burst accumulate before paying for one pass. Changes that arrive *during* a pass
+    /// re-arm the flag and get their own, so a long multi-batch sync still updates
     /// progressively rather than showing nothing until the end.
     private func scheduleRemoteRefresh() {
         remoteRefreshRequested = true
@@ -232,52 +242,35 @@ actor TimelineStore {
             // `refresh()` may have rebuilt in the meantime, which makes this pass redundant.
             guard remoteRefreshRequested else { return }
             remoteRefreshRequested = false
-            await rebuildIndex()
+            if await !syncRemoteState(patchingTimeline: true) {
+                await rebuildIndex()
+            }
         }
     }
 
     private func rebuildIndex() async {
-        // Remote metadata is read first: it is a SQLite query on this actor, and doing it
-        // before the PhotoKit enumeration keeps the merge a single pass.
-        let remote = await loadRemoteMergeData()
+        // Brought up to date first, so the merge below is one synchronous pass over it.
+        await syncRemoteState(patchingTimeline: false)
         // Taken after the suspension: another rebuild can run on this actor while it waits.
+        let remote = remoteState?.mergeData ?? RemoteMergeData()
         let previousIndex = index
         let previousProvenance = provenance
 
         Signposts.interval(Signposts.indexBuild) {
             var localStubs = [AssetStub]()
-            var presentLocalIdentifiers = Set<String>()
-
             if localLibrary.hasAnyAccess {
                 indexChangeToken = localLibrary.currentChangeToken
                 let result = localLibrary.fetchAllAssets()
                 fetchResult = result
                 localStubs.reserveCapacity(result.count)
                 result.enumerateObjects { asset, _, _ in
-                    var stub = AssetStub(asset)
-                    presentLocalIdentifiers.insert(asset.localIdentifier)
-                    // An asset with a server copy is one asset with two facets, not two rows.
-                    if remote.linkedLocalIdentifiers.contains(asset.localIdentifier) {
-                        stub = stub.withFacets(hasLocal: true, hasRemote: true)
-                    }
-                    localStubs.append(stub)
+                    localStubs.append(AssetStub(asset))
                 }
             } else {
                 fetchResult = nil
                 indexChangeToken = nil
             }
-
-            // A server copy is hidden behind its local twin only while that twin actually
-            // exists. Link rows outlive the local file they name — after Free Up Space removes
-            // it (D18) the asset must reappear as remote-only, not disappear altogether.
-            let remoteOnly = remote.remoteOnlyStubs(presentLocalIdentifiers: presentLocalIdentifiers)
-
-            // PhotoKit sorts by creationDate, but assets with no creation date fall back to
-            // `.distantPast` and can land out of order; `replaceAll` sorts only if needed.
-            index.replaceAll(localStubs)
-            if !remoteOnly.isEmpty {
-                index.insert(remoteOnly)
-            }
+            index = remote.merged(withLocal: localStubs)
             provenance = .live
         }
 
@@ -293,57 +286,90 @@ actor TimelineStore {
         scheduleBootCacheSave()
     }
 
-    private func loadRemoteMergeData() async -> RemoteMergeData {
-        let previous = remoteLoadTail
-        let load = Task {
+    // MARK: - Remote changes
+
+    /// Brings `remoteState` up to date with what the remote library has reported, re-reading
+    /// only what changed. With `patchingTimeline`, also applies the change to the timeline, and
+    /// returns false when that needs a rebuild instead.
+    @discardableResult
+    private func syncRemoteState(patchingTimeline: Bool) async -> Bool {
+        let previous = remoteSyncTail
+        let sync = Task {
             _ = await previous?.value
-            return await self.performRemoteLoad()
+            return await self.performRemoteSync(patchingTimeline: patchingTimeline)
         }
-        remoteLoadTail = load
-        return await load.value
+        remoteSyncTail = sync
+        return await sync.value
     }
 
-    private func performRemoteLoad() async -> RemoteMergeData {
-        guard let remoteLibrary else { return RemoteMergeData() }
-        do {
-            var data = try await remoteLibrary.mergeLinks()
-            data.stubs = try await currentRemoteStubs(from: remoteLibrary)
-            return data
-        } catch {
-            // A failed metadata read must never take the local timeline down with it.
-            Log.timeline.error("Remote merge data unavailable: \(error.localizedDescription, privacy: .public)")
-            return RemoteMergeData()
-        }
-    }
-
-    /// `remoteStubs`, brought up to date by re-reading only the stale rows when it can.
-    private func currentRemoteStubs(from remoteLibrary: RemoteLibraryService) async throws -> [AssetStub] {
+    private func performRemoteSync(patchingTimeline: Bool) async -> Bool {
+        guard let remoteLibrary else { return true }
         let generation = remoteGeneration
         let ids = staleRemoteIDs
+        let linksStale = remoteLinksStale
         staleRemoteIDs.removeAll()
+        remoteLinksStale = false
 
-        if var cached = remoteStubs, ids.count <= Self.maxRemoteDelta {
-            guard !ids.isEmpty else { return cached.stubs }
-            let fresh: [AssetStub]
-            do {
-                fresh = try await remoteLibrary.remoteStubs(ids: ids)
-            } catch {
-                staleRemoteIDs.formUnion(ids)
-                throw error
+        do {
+            guard remoteState != nil, ids.count <= Self.maxRemoteDelta else {
+                let stubs = try await remoteLibrary.remoteStubs()
+                let links = try await remoteLibrary.links()
+                guard generation == remoteGeneration else { return false }
+                remoteState = RemoteMergeState(stubs: stubs, links: links)
+                // A timeline built before this read needs rebuilding from it; one not yet built
+                // will be.
+                return !isLive
             }
-            cached.update(fresh)
-            let visible = Set(fresh.map(\.id))
-            _ = cached.remove(ids.map { AssetID.remote($0) }.filter { !visible.contains($0) })
-            if generation == remoteGeneration { remoteStubs = cached }
-            return cached.stubs
-        }
+            guard !ids.isEmpty || linksStale else { return true }
 
-        // Dropped first, so a failed read leaves nothing stale behind to be patched later.
-        remoteStubs = nil
-        var loaded = TimelineIndex()
-        loaded.replaceAll(try await remoteLibrary.remoteStubs())
-        if generation == remoteGeneration { remoteStubs = loaded }
-        return loaded.stubs
+            let rows = try await remoteLibrary.remoteStubs(ids: ids)
+            let links = linksStale
+                ? try await remoteLibrary.links()
+                : try await remoteLibrary.links(immichIDs: ids)
+            guard generation == remoteGeneration, var state = remoteState else { return false }
+
+            var linkIDs = ids
+            if linksStale {
+                for (immichID, localIdentifier) in links
+                where state.localIdentifierByImmichID[immichID] != localIdentifier {
+                    linkIDs.insert(immichID)
+                }
+                for immichID in state.localIdentifierByImmichID.keys where links[immichID] == nil {
+                    linkIDs.insert(immichID)
+                }
+            }
+            // Released while mutating, so the 70k-entry state is not copied on write.
+            remoteState = nil
+            let transition = state.update(stubsFor: ids, stubs: rows, linksFor: linkIDs, links: links)
+            remoteState = state
+
+            guard patchingTimeline, isLive else { return true }
+            guard provenance == .live,
+                  transition.immichIDs.count <= Self.maxPatchedRemoteChanges else { return false }
+            let dates = localCaptureDates(for: transition.localIdentifiers)
+            if state.patch(&index, for: transition, localCaptureDates: dates) {
+                scheduleEmit()
+                scheduleBootCacheSave()
+            }
+            return true
+        } catch {
+            // A failed read must never take the timeline down with it: keep what is cached, and
+            // try these ids again on the next pass.
+            staleRemoteIDs.formUnion(ids)
+            if linksStale { remoteLinksStale = true }
+            Log.timeline.error("Remote merge data unavailable: \(error.localizedDescription, privacy: .public)")
+            return true
+        }
+    }
+
+    /// The dates these local assets' stubs are indexed under, for the ones PhotoKit still has.
+    private func localCaptureDates(for localIdentifiers: Set<String>) -> [String: Date] {
+        guard !localIdentifiers.isEmpty, localLibrary.hasAnyAccess else { return [:] }
+        var dates = [String: Date]()
+        for asset in localLibrary.assets(for: Array(localIdentifiers)) {
+            dates[asset.localIdentifier] = AssetStub(asset).captureDate
+        }
+        return dates
     }
 
     // MARK: - Incremental changes (D20)

@@ -89,10 +89,11 @@ final class RemoteMergeReadTests: XCTestCase {
                 """)
         }
 
-        let links = try await makeService().mergeLinks()
+        let service = makeService()
+        let all = try await service.links()
+        let named = try await service.links(immichIDs: ["R1", "R3", "missing"])
 
-        XCTAssertEqual(links.localIdentifierByImmichID, ["R1": "L1"])
-        XCTAssertEqual(links.linkedLocalIdentifiers, ["L1"])
-        XCTAssertTrue(links.stubs.isEmpty)
+        XCTAssertEqual(all, ["R1": "L1"])
+        XCTAssertEqual(named, ["R1": "L1"])
     }
 }

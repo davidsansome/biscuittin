@@ -73,6 +73,38 @@ struct TimelineIndex: Equatable {
                 position + 1 < stubs.count ? stubs[position + 1].id : nil)
     }
 
+    // MARK: - Located by date
+
+    // `insert`, `remove` and `update` each hash every id in the index: ~22 ms apiece at 70k
+    // items on an iPhone 13, to change one of them. When the caller knows the date an item is
+    // indexed under, these find it by binary search instead.
+
+    /// Where `id` sits, looking only among items indexed under `date`. Nil when it is absent,
+    /// or indexed under a different date.
+    func position(of id: AssetID, capturedAt date: Date) -> Int? {
+        var position = insertionIndex(for: date)
+        while position < stubs.count, stubs[position].captureDate == date {
+            if stubs[position].id == id { return position }
+            position += 1
+        }
+        return nil
+    }
+
+    mutating func remove(at position: Int) {
+        stubs.remove(at: position)
+    }
+
+    /// Swaps in a stub with the same capture date, so the order holds without moving anything.
+    mutating func replace(at position: Int, with stub: AssetStub) {
+        precondition(stub.captureDate == stubs[position].captureDate, "replacement would break the sort order")
+        stubs[position] = stub
+    }
+
+    /// Inserts a stub the caller knows is absent, skipping the whole-index check `insert(_:)` makes.
+    mutating func insertAbsent(_ stub: AssetStub) {
+        stubs.insert(stub, at: insertionIndex(for: stub.captureDate))
+    }
+
     /// First position whose capture date is not newer than `date`, in a newest-first array.
     func insertionIndex(for date: Date) -> Int {
         var low = 0

@@ -230,24 +230,44 @@ actor RemoteLibraryService {
     /// True when there cannot be anything cached, so reads can skip opening the database.
     private var hasNoCache: Bool { !database.isOpen && !session.isConfigured }
 
-    /// The local↔server links the timeline merges on, with `stubs` left empty. Runs off the
-    /// main thread by construction.
-    func mergeLinks() throws -> RemoteMergeData {
-        var data = RemoteMergeData()
-        guard !hasNoCache else { return data }
-        let rows = try database.writer().read { db in
-            try Row.fetchAll(db, sql: """
+    /// Every complete local↔server link, immich id → local identifier. Runs off the main thread
+    /// by construction.
+    func links() throws -> [String: String] {
+        guard !hasNoCache else { return [:] }
+        return try database.writer().read { db in
+            try Self.links(in: db, sql: """
                 SELECT immich_id, local_identifier FROM facet_links
                 WHERE immich_id IS NOT NULL AND local_identifier IS NOT NULL
                 """)
         }
-        for row in rows {
-            let immichID: String = row[0]
-            let localIdentifier: String = row[1]
-            data.localIdentifierByImmichID[immichID] = localIdentifier
-            data.linkedLocalIdentifiers.insert(localIdentifier)
+    }
+
+    /// The complete links among `immichIDs`. An id missing from the result has none.
+    func links(immichIDs: Set<String>) throws -> [String: String] {
+        guard !hasNoCache, !immichIDs.isEmpty else { return [:] }
+        let all = Array(immichIDs)
+        return try database.writer().read { db in
+            var links = [String: String]()
+            // Stays well under SQLite's bound-parameter limit.
+            for start in stride(from: 0, to: all.count, by: 500) {
+                let chunk = Array(all[start..<min(start + 500, all.count)])
+                links.merge(try Self.links(in: db, sql: """
+                    SELECT immich_id, local_identifier FROM facet_links
+                    WHERE local_identifier IS NOT NULL
+                      AND immich_id IN (\(databaseQuestionMarks(count: chunk.count)))
+                    """, arguments: StatementArguments(chunk))) { $1 }
+            }
+            return links
         }
-        return data
+    }
+
+    private static func links(in db: Database, sql: String,
+                              arguments: StatementArguments = StatementArguments()) throws -> [String: String] {
+        var links = [String: String]()
+        for row in try Row.fetchAll(db, sql: sql, arguments: arguments) {
+            links[row[0] as String] = row[1] as String
+        }
+        return links
     }
 
     /// Every non-trashed server asset, newest first.

@@ -163,6 +163,13 @@ final class AppDatabase: @unchecked Sendable {
                 """)
         }
 
+        migrator.registerMigration("v5-links-by-immich-id") { db in
+            // The timeline looks links up by server id on every server change, and sync, delete
+            // and rotation all update them by it. Without this each was a scan of one row per
+            // synced asset: 5–30 ms per lookup at 70k rows on an iPhone 13.
+            try db.create(index: "idx_links_immich", on: "facet_links", columns: ["immich_id"])
+        }
+
         return migrator
     }
 }

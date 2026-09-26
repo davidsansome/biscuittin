@@ -2051,8 +2051,11 @@ stub needs, instead of decoding whole records and their EXIF JSON. On the iPhone
 | rebuild after a server change | ~1.1–2.2 s | 256–266 ms |
 
 The one-asset case was driven by a temporary hook that reported a fake change, since no real
-server change could be made from the bench. Most of its 65 ms is `TimelineIndex.update`
-hashing all 70k ids, not SQLite.
+server change could be made from the bench. Measured separately afterwards, its 65 ms was
+almost all in memory: the SQLite row read took 0.2–0.4 ms, `update`'s `removeAll` 22 ms,
+`insert`'s whole-index `Set` 21–24 ms, and a copy-on-write copy of the 70k array ~17 ms in
+four of six runs. (The first version of this entry stated that split before it had been
+measured.)
 
 Three things this depends on:
 
@@ -2064,6 +2067,36 @@ Three things this depends on:
   carried nothing. Now a dropped event would leave stale rows in memory until relaunch.
 * **Loads run one at a time, and `.all` bumps a generation.** Otherwise two reads of the same
   row could land out of order, or a load that started before a wipe could store what it read.
+
+**Follow-up: server changes are applied to the timeline directly.** Even with cached rows, a
+server change still rebuilt the whole timeline, about 300 ms on the iPhone 13: remote 102–147,
+PhotoKit re-enumeration 80–91, merge 66–71, compare and emit 7 ms. None of that is needed to
+change one asset. `RemoteMergeState` now holds the server half of the merge (rows, links and
+an id lookup), and for the assets a change names, `patch` reconciles the timeline to what a
+rebuild would give. It finds each item by binary search on its capture date
+(`TimelineIndex.position(of:capturedAt:)`), so no pass hashes the whole index. A local twin's
+date comes from a PhotoKit fetch of just those identifiers. Changes over 200 assets, a wipe
+(`.all`) and a timeline not yet live still rebuild.
+
+* **Held to the rebuild by a test.** The rebuild's merge moved into
+  `RemoteMergeData.merged(withLocal:)`. `RemoteMergeStateTests` applies 40 seeded sequences of
+  row and link changes and compares `patch` against a fresh merge after every step. Two
+  deliberately broken patches (a local badge never flipped, a server copy shown despite its
+  twin) each made it fail before it was trusted.
+* **The links lookup was a table scan.** `facet_links` had no index on `immich_id`, so looking
+  up one asset's link took 4.5–30 ms (`EXPLAIN QUERY PLAN`: `SCAN facet_links`). Migration
+  `v5-links-by-immich-id` adds the index, and the lookup now takes 0.1–1.5 ms. Sync, delete
+  and rotation filter on that column too.
+* **Measured on the phone.** A visible change was driven end to end by temporarily trashing,
+  then restoring, one server-only row in the local cache. The timeline went from 70,842 to
+  70,841 items and back with no rebuild, and matched a fresh merge afterwards. Store-side work
+  per change is 1–17 ms, mostly the PhotoKit fetch.
+* **What remains is the grid.** Applying that one-item snapshot blocked the main thread for
+  353–382 ms: the diffable-snapshot path at 70k items (see the post-delete freeze entry
+  above). It is now the largest cost between a server change and the screen, ahead of the
+  250 ms coalescing debounce.
+* **Launch pays ~45 ms more** to build the id lookup for 70k rows. That rebuild is no longer
+  on the path to a new photo appearing (see the local catch-up above).
 
 ### Notes for later milestones
 
