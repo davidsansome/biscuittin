@@ -36,6 +36,10 @@ actor TimelineStore {
     private var grouping: Grouping
     private var provenance: TimelineSnapshot.Provenance = .bootCache
     private var fetchResult: PHFetchResult<PHAsset>?
+    /// Taken just before the enumeration behind `fetchResult`, and saved with the boot cache.
+    private var indexChangeToken: PHPersistentChangeToken?
+    /// The token the boot-cache index was saved with, until launch has replayed from it.
+    private var bootCacheChangeToken: PHPersistentChangeToken?
     private var isLive = false
 
     private var emitPending = false
@@ -77,6 +81,9 @@ actor TimelineStore {
         index.replaceAll(payload.stubs)
         grouping = settings.grouping
         provenance = .bootCache
+        bootCacheChangeToken = payload.changeToken.flatMap {
+            try? NSKeyedUnarchiver.unarchivedObject(ofClass: PHPersistentChangeToken.self, from: $0)
+        }
         Log.perf.info("Boot cache painted \(payload.stubs.count) items")
         emitNow()
     }
@@ -108,9 +115,47 @@ actor TimelineStore {
             return
         }
 
-        await rebuildIndex()
+        // Observing starts before the rebuild's enumeration so nothing that happens during it
+        // is missed. A change handled before `fetchResult` exists is dropped, but the
+        // enumeration that follows already includes it.
         localLibrary.startObserving()
         startObservingChanges()
+        applyLocalChangesSinceBootCache()
+        await rebuildIndex()
+    }
+
+    /// Brings the boot-cache index up to date with local changes made while the app was not
+    /// running, so a new photo appears straight away. The full rebuild that follows reads every
+    /// cached server row before it can publish — seconds, on a large server library — and
+    /// still reconciles anything this cannot express.
+    private func applyLocalChangesSinceBootCache() {
+        guard let token = bootCacheChangeToken else { return }
+        bootCacheChangeToken = nil
+        guard provenance == .bootCache, let delta = localLibrary.delta(since: token) else { return }
+
+        let upsertedIDs = Set(delta.upserted.map { AssetID.local($0.localIdentifier) })
+        let removedIDs = Set(delta.removedIdentifiers.map { AssetID.local($0) })
+        var present = Set<AssetID>()
+        var linked = Set<AssetID>()
+        for stub in index.stubs where upsertedIDs.contains(stub.id) || removedIDs.contains(stub.id) {
+            present.insert(stub.id)
+            if stub.hasRemote { linked.insert(stub.id) }
+        }
+
+        let stubs = delta.upserted.map { asset -> AssetStub in
+            let stub = AssetStub(asset)
+            return linked.contains(stub.id) ? stub.withFacets(hasLocal: true, hasRemote: true) : stub
+        }
+        // A removed photo with a server copy must turn into that copy, whose id only the rebuild
+        // knows. Removing it here would make it vanish and then reappear.
+        let removable = removedIDs.filter { present.contains($0) && !linked.contains($0) }
+
+        Log.timeline.info("Boot cache catch-up: \(stubs.count) upserted, \(removable.count) removed")
+        guard !stubs.isEmpty || !removable.isEmpty else { return }
+        index.remove(Array(removable))
+        index.update(stubs)
+        pendingReconfiguredIDs.formUnion(stubs.map(\.id).filter(present.contains))
+        emitNow()
     }
 
     private func startObservingChanges() {
@@ -176,6 +221,7 @@ actor TimelineStore {
             var presentLocalIdentifiers = Set<String>()
 
             if localLibrary.hasAnyAccess {
+                indexChangeToken = localLibrary.currentChangeToken
                 let result = localLibrary.fetchAllAssets()
                 fetchResult = result
                 localStubs.reserveCapacity(result.count)
@@ -190,6 +236,7 @@ actor TimelineStore {
                 }
             } else {
                 fetchResult = nil
+                indexChangeToken = nil
             }
 
             // A server copy is hidden behind its local twin only while that twin actually
@@ -371,6 +418,12 @@ actor TimelineStore {
     /// Also called directly on scene background so a fresh index is never lost.
     func writeBootCache() {
         guard provenance == .live else { return }
-        bootCache.save(stubs: index.stubs, grouping: grouping)
+        // Replaying from this token next launch also repeats changes already applied here
+        // incrementally, which is harmless: inserts and updates are upserts, removals of absent
+        // ids no-ops.
+        let token = indexChangeToken.flatMap {
+            try? NSKeyedArchiver.archivedData(withRootObject: $0, requiringSecureCoding: true)
+        }
+        bootCache.save(stubs: index.stubs, grouping: grouping, changeToken: token)
     }
 }

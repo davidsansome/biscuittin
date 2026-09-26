@@ -52,14 +52,28 @@ final class LocalLibraryService: NSObject, @unchecked Sendable {
     /// Images and videos only (D3), newest first. Returns PhotoKit's lazy fetch result;
     /// callers enumerate it off the main thread.
     func fetchAllAssets() -> PHFetchResult<PHAsset> {
-        let options = PHFetchOptions()
+        let options = Self.timelineFetchOptions()
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        return PHAsset.fetchAssets(with: options)
+    }
+
+    private static func timelineFetchOptions() -> PHFetchOptions {
+        let options = PHFetchOptions()
         options.includeHiddenAssets = false
         options.includeAllBurstAssets = false
         options.predicate = NSPredicate(format: "mediaType == %d OR mediaType == %d",
                                         PHAssetMediaType.image.rawValue,
                                         PHAssetMediaType.video.rawValue)
-        return PHAsset.fetchAssets(with: options)
+        return options
+    }
+
+    /// Whether `fetchAllAssets` would include this asset. An asset fetched by identifier is
+    /// checked here as well as by the fetch options, which are not documented to apply the
+    /// hidden and burst filters to an explicit identifier list.
+    private static func belongsInTimeline(_ asset: PHAsset) -> Bool {
+        (asset.mediaType == .image || asset.mediaType == .video)
+            && !asset.isHidden
+            && (asset.burstIdentifier == nil || asset.representsBurst)
     }
 
     func asset(for localIdentifier: String) -> PHAsset? {
@@ -73,6 +87,56 @@ final class LocalLibraryService: NSObject, @unchecked Sendable {
         assets.reserveCapacity(result.count)
         result.enumerateObjects { asset, _, _ in assets.append(asset) }
         return assets
+    }
+
+    // MARK: - Persistent changes
+
+    struct Delta {
+        /// Assets inserted or updated since the token that still belong in the timeline.
+        var upserted: [PHAsset] = []
+        /// Identifiers deleted since the token, or changed so they no longer belong (hidden,
+        /// say). May name assets the caller never had.
+        var removedIdentifiers: [String] = []
+    }
+
+    /// Marks the library's current position in its change history. Take it *before*
+    /// enumerating: replaying from a token that is too old is harmless, one that is too new
+    /// loses changes.
+    var currentChangeToken: PHPersistentChangeToken {
+        PHPhotoLibrary.shared().currentChangeToken
+    }
+
+    /// The net asset changes since `token`, or nil when PhotoKit can no longer describe them
+    /// (an expired token, most often) and the caller must enumerate the whole library.
+    func delta(since token: PHPersistentChangeToken) -> Delta? {
+        var touched = Set<String>()
+        var deleted = Set<String>()
+        do {
+            for change in try PHPhotoLibrary.shared().fetchPersistentChanges(since: token) {
+                let details = try change.changeDetails(for: .asset)
+                touched.formUnion(details.insertedLocalIdentifiers)
+                touched.formUnion(details.updatedLocalIdentifiers)
+                deleted.formUnion(details.deletedLocalIdentifiers)
+            }
+        } catch {
+            Log.timeline.error("Persistent changes unavailable: \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
+
+        touched.subtract(deleted)
+        var delta = Delta(removedIdentifiers: Array(deleted))
+        guard !touched.isEmpty else { return delta }
+
+        let result = PHAsset.fetchAssets(withLocalIdentifiers: Array(touched),
+                                         options: Self.timelineFetchOptions())
+        var kept = Set<String>()
+        result.enumerateObjects { asset, _, _ in
+            guard Self.belongsInTimeline(asset) else { return }
+            delta.upserted.append(asset)
+            kept.insert(asset.localIdentifier)
+        }
+        delta.removedIdentifiers.append(contentsOf: touched.subtracting(kept))
+        return delta
     }
 
     // MARK: - Observation

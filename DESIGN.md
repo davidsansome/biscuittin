@@ -2006,6 +2006,37 @@ The grid half then filtered and rebuilt its snapshot on the main thread per regi
 (54–71 ms there), and a result for a region the map has already left is dropped. What remains on
 the main thread is UIKit's reload: 56–124 ms for ~50k photos, 11–37 ms zoomed in.
 
+### New photos took ~2 s to appear at launch (2026-09-26)
+
+A photo taken while the app was closed appeared ~2 s after the first frame. Measured on the
+iPhone 13 (70,842-item timeline, 70,833 cached server rows): the grid applied the live snapshot
+in 3 ms. The time went into the rebuild behind it, which is also the first moment launch looks
+at PhotoKit at all:
+
+```
+rebuild remote=1397 photokit=197 merge=107 ms   (first, database cold)
+rebuild remote=1960 photokit=133 merge=76  ms   (identical index)
+rebuild remote=848  photokit=136 merge=118 ms   (identical index)
+```
+
+Reading every server row from SQLite (`mergeData`) is most of each rebuild. It was 41 ms at
+894 rows, so this came with the large library rather than the recent threading work.
+
+* **D19 gains a local catch-up.** The boot cache (format v3) now carries PhotoKit's persistent
+  change token, taken just before the enumeration it came from. Launch replays
+  `fetchPersistentChanges(since:)` onto the cached index before the full rebuild: 13 ms on the
+  phone with nothing to replay, and 21 ms in the simulator to apply a photo added while the
+  app was closed, which appeared before the rebuild started. A removed photo that has a server
+  copy is left for the rebuild, which alone knows the server copy's id. An expired token
+  falls back to the rebuild.
+* **The PhotoKit observer is registered before the rebuild's enumeration**, not after it,
+  which closes a window where a change made during the enumeration went unseen until the next
+  rebuild.
+* **Two of the three launch rebuilds found nothing.** `syncStream` signalled a change after
+  every sync, even an empty one, and a sync ran both from scene activation and from the
+  startup sequence. It now signals only when rows changed, and scene activation defers to the
+  startup sequence's own sync. On the phone, launch now does one rebuild.
+
 ### Notes for later milestones
 
 * `GridLayoutProvider` sizes tiles by giving the item `fractionalWidth(1/columns)` and

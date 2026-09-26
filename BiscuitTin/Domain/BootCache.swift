@@ -11,13 +11,17 @@ final class BootCache {
     struct Payload {
         let grouping: Grouping
         let stubs: [AssetStub]
+        /// PhotoKit's persistent change token (archived) from before the enumeration these stubs
+        /// came from, so launch can replay just what changed since. Nil when there was none.
+        var changeToken: Data? = nil
     }
 
     private enum Format {
         static let magic: UInt32 = 0x4F44_4243 // "ODBC"
-        /// v2 added per-stub coordinates for the map (§20). A version bump discards the
-        /// old cache rather than misreading it; the live index repopulates within a frame.
-        static let version: UInt32 = 2
+        /// v2 added per-stub coordinates for the map (§20); v3 a trailing PhotoKit change
+        /// token. A version bump discards the old cache rather than misreading it; the live
+        /// index repopulates within a frame.
+        static let version: UInt32 = 3
         static let headerSize = 16
         /// Fixed-size portion of a record; the UTF-8 identifier follows it.
         /// Fixed portion of one record; the variable-length id follows it.
@@ -113,15 +117,21 @@ final class BootCache {
                                        latitude: latitude,
                                        longitude: longitude))
             }
-            return Payload(grouping: grouping, stubs: stubs)
+
+            guard let tokenLength = read(UInt32.self),
+                  offset + Int(tokenLength) == raw.count else { return nil }
+            let changeToken = tokenLength == 0
+                ? nil
+                : Data(raw[offset..<(offset + Int(tokenLength))])
+            return Payload(grouping: grouping, stubs: stubs, changeToken: changeToken)
         }
     }
 
     // MARK: - Writing
 
     /// Serializes and writes asynchronously at utility QoS (§14 P6) so the caller never waits.
-    func save(stubs: [AssetStub], grouping: Grouping) {
-        let data = Self.encode(stubs: stubs, grouping: grouping)
+    func save(stubs: [AssetStub], grouping: Grouping, changeToken: Data? = nil) {
+        let data = Self.encode(stubs: stubs, grouping: grouping, changeToken: changeToken)
         queue.async { [fileURL] in
             do {
                 try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(),
@@ -133,7 +143,7 @@ final class BootCache {
         }
     }
 
-    static func encode(stubs: [AssetStub], grouping: Grouping) -> Data {
+    static func encode(stubs: [AssetStub], grouping: Grouping, changeToken: Data? = nil) -> Data {
         var data = Data()
         data.reserveCapacity(Format.headerSize + stubs.count * (Format.recordFixedSize + 40))
 
@@ -169,6 +179,10 @@ final class BootCache {
             append(UInt16(idBytes.count))
             data.append(contentsOf: idBytes)
         }
+
+        let token = changeToken ?? Data()
+        append(UInt32(token.count))
+        data.append(token)
         return data
     }
 

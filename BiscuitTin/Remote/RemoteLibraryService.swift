@@ -154,7 +154,10 @@ actor RemoteLibraryService {
         }
         try setCursor(Cursor.lastSyncedAt, to: Immich.iso8601String(from: Date()))
         Log.immich.info("Sync stream applied \(upserts.count) upserts, \(deletedIDs.count) deletes")
-        changesContinuation.yield()
+        // Every yield costs the timeline a full rebuild, about a second on a 70k-asset library.
+        if !upserts.isEmpty || !exifs.isEmpty || !deletedIDs.isEmpty {
+            changesContinuation.yield()
+        }
     }
 
     // MARK: - Persistence

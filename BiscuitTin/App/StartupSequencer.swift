@@ -27,6 +27,9 @@ final class StartupSequencer: ObservableObject {
     private let syncEngine: SyncEngine
     private let searchIndexer: SearchIndexer
     private var hasStarted = false
+    /// The launch sequence runs its own remote sync; a scene activation before that would be
+    /// a second one racing it.
+    private var hasRunStartupSync = false
 
     init(localLibrary: LocalLibraryService,
          timelineStore: TimelineStore,
@@ -63,6 +66,7 @@ final class StartupSequencer: ObservableObject {
             // to show, and a stale boot cache must stop showing local ones we can't read.
             await timelineStore.startLive()
             await runRemoteSync()
+            hasRunStartupSync = true
             return
         }
 
@@ -71,6 +75,7 @@ final class StartupSequencer: ObservableObject {
         phase = .ready
 
         await runRemoteSync()
+        hasRunStartupSync = true
 
         // Upload sync runs last: it is the lowest-priority work and must never delay the
         // grid or the metadata refresh (§14 P6).
@@ -105,7 +110,7 @@ final class StartupSequencer: ObservableObject {
 
     /// Foreground refresh, so returning to the app picks up server-side changes.
     func sceneDidBecomeActive() {
-        guard hasStarted else { return }
+        guard hasRunStartupSync else { return }
         Task {
             await runRemoteSync()
             await syncEngine.kick()

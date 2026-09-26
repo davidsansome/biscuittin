@@ -60,13 +60,36 @@ final class BootCacheTests: XCTestCase {
         }
     }
 
-    /// A cache written by the previous format must be rejected rather than misread: the record
-    /// grew by eight bytes, so decoding v1 bytes as v2 would slide every field after the first
+    /// A cache written by a previous format must be rejected rather than misread: v2 grew the
+    /// record by eight bytes, so decoding v1 bytes as v2 would slide every field after the first
     /// record and produce plausible-looking garbage.
     func testPreviousFormatVersionIsRejected() {
-        var data = BootCache.encode(stubs: [stub("L:a", 0)], grouping: .day)
-        data.replaceSubrange(4..<8, with: withUnsafeBytes(of: UInt32(1)) { Data($0) })
-        XCTAssertNil(BootCache.decode(data))
+        for version: UInt32 in [1, 2] {
+            var data = BootCache.encode(stubs: [stub("L:a", 0)], grouping: .day)
+            data.replaceSubrange(4..<8, with: withUnsafeBytes(of: version) { Data($0) })
+            XCTAssertNil(BootCache.decode(data), "v\(version) accepted")
+        }
+    }
+
+    func testChangeTokenRoundTrips() {
+        let token = Data((0..<300).map { UInt8($0 % 251) })
+        let decoded = BootCache.decode(BootCache.encode(stubs: [stub("L:a", 0)], grouping: .day,
+                                                        changeToken: token))
+        XCTAssertEqual(decoded?.changeToken, token)
+        XCTAssertEqual(decoded?.stubs.map(\.id.raw), ["L:a"])
+    }
+
+    func testMissingChangeTokenDecodesAsNil() {
+        let decoded = BootCache.decode(BootCache.encode(stubs: [stub("L:a", 0)], grouping: .day))
+        XCTAssertNotNil(decoded)
+        XCTAssertNil(decoded?.changeToken)
+    }
+
+    /// A token cut short would unarchive to nothing at best; the whole cache is refused instead.
+    func testTruncatedChangeTokenDecodesToNil() {
+        let data = BootCache.encode(stubs: [stub("L:a", 0)], grouping: .day,
+                                    changeToken: Data(repeating: 7, count: 64))
+        XCTAssertNil(BootCache.decode(data.dropLast(10)))
     }
 
     func testRoundTripPreservesOrder() {
