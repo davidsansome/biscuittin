@@ -1,3 +1,7 @@
 Biscuit Tin is a photo browser for Immich, a self-hosted photo server. No account is needed: without one, the app shows the photos on the device.
 
-To try the server features, sign in when the app first asks, or later from Settings > Immich Server. Use the public Immich demo server at https://demo.immich.app, with the demo account shown on that site's sign-in page.
+To try the server features, sign in when the app first asks, or later from Settings > Immich Server, using Immich's public demo server:
+
+Server: https://demo.immich.app
+Email: demo@immich.app
+Password: demo
