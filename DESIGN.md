@@ -1240,20 +1240,28 @@ dots at the edges. The grid still lists every photo in the region.
 
 ### Live Text in the viewer (2026-09-27)
 
-D25. Written and pushed without a build: the session ran on Linux, with no Xcode or
-simulator. Before trusting it, check on a real device:
+D25. Written without a build, on Linux. Built and driven on the iPhone 17 Pro simulator
+(iOS 26.5) afterwards, using a generated menu photo that contains a URL and a phone number:
 
-- It compiles. The VisionKit calls used are `ImageAnalyzer.isSupported`, `analyze(_:configuration:)`,
-  `ImageAnalysis.hasResults(for:)`, and on `ImageAnalysisInteraction`: `analysis`,
-  `selectableItemsHighlighted`, `hasActiveTextSelection`, `hasInteractiveItem(at:)`,
-  `resetTextSelection()` (iOS 17), `isSupplementaryInterfaceHidden`,
-  `setContentsRectNeedsUpdate()`. Delegate methods: `presentingViewController(for:)`,
-  `interaction(_:highlightSelectedItemsDidChange:)`, `textSelectionDidChange(_:)` (iOS 17).
-- Highlights and selection line up with the photo **while zoomed**. The interaction is on the
-  image view that `UIScrollView` transforms, and each rendition swap refreshes its contents rect.
-- Gestures: the chrome tap, double-tap zoom, and dragging selection handles don't fight VisionKit's own recognizers.
-- Whether the simulator supports `ImageAnalyzer` at all. If it doesn't, the button never
-  appears there. That means the simulator doesn't support it; it's not a bug.
+- It compiles cleanly against the VisionKit API as written.
+- The simulator supports `ImageAnalyzer`. Analysis finds the text, and the toolbar button
+  appears. On a photo without text the button stays hidden and nothing else in the toolbar moves.
+- Highlight mode lines the boxes up with the text, underlines the data detectors, and fills the
+  button. The boxes still line up after pinching well past 1×, i.e. after the full-resolution swap.
+- Long-press selects, with Copy / Select All / Look Up. Copy put the selected word on the
+  pasteboard (read back with `simctl pbpaste`).
+- While text is selected, a horizontal swipe does not page, and a tap clears the selection
+  without toggling the chrome. While text is highlighted, swipe-down does not dismiss. With
+  highlight off (the control), a tap toggles the chrome and swipe-down dismisses as before.
+- Paging away and back clears highlight and selection.
+
+`preferredInteractionTypes = .automatic` includes subject lifting. The simulator logs
+`RemoveBackground … unsupported device` (Code=-8) for it. That is harmless there, but on a
+device long-pressing a subject will probably offer to lift it.
+
+Still unverified: tapping a data detector, whether Look Up / Translate present, double-tap zoom
+and dragging selection handles, a rotate reloading the page while Live Text is active, and
+anything on hardware (real HEIC photos).
 
 
 ### A "queued retry" that DESIGN.md described but nothing implemented (2026-09-23)
