@@ -66,15 +66,27 @@ platform :ios do
     # Needs the full history, which the TestFlight workflow checks out for its own tag lookup.
     changelog = sh("git", "-C", ROOT, "log", "-5", "--no-merges", "--format=- %s", log: false).strip
 
+    # Pilot only hands a build to external testers once it has finished processing, so this
+    # waits for that rather than skipping it. The first build of each version then waits for
+    # Beta App Review; later builds of that version usually go straight out.
     upload_to_testflight(
       api_key: api_key,
       ipa: lane_context[SharedValues::IPA_OUTPUT_PATH],
       changelog: changelog,
       beta_app_description: File.read(File.join(ROOT, "fastlane/description.txt")).strip,
-      # Internal testers need no review; their group's automatic distribution picks the build
-      # up once processing finishes. With a changelog, pilot still waits for the build to
-      # appear in App Store Connect so it can attach it, then stops.
-      skip_waiting_for_build_processing: true
+      beta_app_feedback_email: "me@davidsansome.com",
+      beta_app_review_info: {
+        contact_first_name: "David",
+        contact_last_name: "Sansome",
+        contact_email: "me@davidsansome.com",
+        # A secret rather than a literal, because this repository is public.
+        contact_phone: ENV.fetch("ASC_REVIEW_PHONE"),
+        demo_account_required: false,
+        notes: File.read(File.join(ROOT, "fastlane/review_notes.txt")).strip
+      },
+      distribute_external: true,
+      groups: ["External testers"],
+      notify_external_testers: true
     )
 
     sh("git", "-C", ROOT, "tag", "build/#{build_number}")

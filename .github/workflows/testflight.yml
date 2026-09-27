@@ -21,7 +21,7 @@ jobs:
     name: Archive and upload
     if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
     runs-on: macos-26
-    timeout-minutes: 60
+    timeout-minutes: 120 # includes waiting for App Store Connect to process the build
     steps:
       - uses: actions/checkout@v4
         with:
@@ -74,6 +74,7 @@ jobs:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
           ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          ASC_REVIEW_PHONE: ${{ secrets.ASC_REVIEW_PHONE }}
         run: |
           export ASC_KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
           printf '%s\n' "$ASC_KEY_P8" > "$ASC_KEY_PATH"

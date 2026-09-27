@@ -362,7 +362,10 @@ explanation before the flattering one.
 ## Releasing
 
 - **TestFlight** (`.github/workflows/testflight.yml`): every push to `main` that passes CI is
-  archived, uploaded for internal testers and tagged `build/<N>`. Documentation-only pushes
+  archived, uploaded, sent to the internal testers and the "External testers" group, and
+  tagged `build/<N>`. The first build of each version waits for Beta App Review before
+  external testers get it; the reviewer notes are `fastlane/review_notes.txt`, and the
+  contact phone number is the `ASC_REVIEW_PHONE` secret. Documentation-only pushes
   are skipped. The tester changelog is the titles of the last five commits, and the Beta App
   Description is `fastlane/description.txt`. The build number is the latest TestFlight build
   number plus one, set at build time and never committed; `CURRENT_PROJECT_VERSION = 1` in
