@@ -1,0 +1,18 @@
+Biscuit Tin is a fast, lightweight app for browsing your Immich library.
+
+It does a small number of things and does them quickly. It opens straight to your photos even with tens of thousands of them, new photos appear as soon as you take them, and scrolling stays smooth. Nothing you tap waits on the network.
+
+What it does:
+
+- Browse by day, week or month, and pinch to resize thumbnails
+- View photos and videos, zoom to full resolution, and see where and how a photo was taken
+- Search for things like "dog on the beach". Search runs on your phone, so it works offline
+- See your photos on a map
+- Rotate, share and delete
+- Back up to your server in the background, then free up space once photos are safely uploaded
+
+There are no albums, people or memories. It's for looking through your photos.
+
+No ads, analytics or tracking. Your photos only go to your own server.
+
+Needs Immich 3.0 or newer. Biscuit Tin isn't made by or affiliated with the Immich team.

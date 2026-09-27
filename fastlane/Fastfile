@@ -101,6 +101,8 @@ platform :ios do
       build_number: build.version,
       # Ignored by deliver for an app's first version, which App Store Connect gives no notes.
       release_notes: { "default" => File.read(File.join(ROOT, "fastlane/release_notes.txt")).strip },
+      # Like the screenshots, this replaces whatever App Store Connect has on every release.
+      description: { "default" => File.read(File.join(ROOT, "fastlane/description.txt")).strip },
       skip_binary_upload: true,
       # The committed set replaces whatever App Store Connect has, so edits made in its web UI
       # do not survive a release. Made by Tools/screenshots (README.md there).
