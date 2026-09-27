@@ -338,7 +338,14 @@ if __name__ == "__main__":
     parser.add_argument("--no-password-login", action="store_true")
     parser.add_argument("--expire-sessions", action="store_true",
                         help="reject every credential, to exercise re-sign-in")
+    parser.add_argument("--port", type=int, default=PORT,
+                        help="listen port; a real server's default is 2283")
+    parser.add_argument("--no-assets", action="store_true",
+                        help="serve an empty library, so no synthetic tiles join the grid")
     args = parser.parse_args()
+    PORT = args.port
+    if args.no_assets:
+        ASSETS = []
     EXPIRE_SESSIONS = args.expire_sessions
     FEATURES.update(oauth=args.oauth, oauthAutoLaunch=args.oauth_auto_launch,
                     passwordLogin=not args.no_password_login)
