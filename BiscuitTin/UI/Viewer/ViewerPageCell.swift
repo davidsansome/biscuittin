@@ -12,6 +12,8 @@ final class ViewerPageCell: UICollectionViewCell {
     private(set) var stub: AssetStub?
     private var token: ImageRequestToken?
     private var fullResolutionToken: ImageRequestToken?
+    private var thumbnailToken: ImageRequestToken?
+    private var hasPreview = false
     private var hasFullResolution = false
     private weak var loader: ImageLoader?
 
@@ -60,8 +62,11 @@ final class ViewerPageCell: UICollectionViewCell {
         super.prepareForReuse()
         loader?.cancel(token)
         loader?.cancel(fullResolutionToken)
+        loader?.cancel(thumbnailToken)
         token = nil
         fullResolutionToken = nil
+        thumbnailToken = nil
+        hasPreview = false
         hasFullResolution = false
         stub = nil
         liveTextTask?.cancel()
@@ -92,16 +97,47 @@ final class ViewerPageCell: UICollectionViewCell {
         videoView.bottomInset = toolbarInset
 
         // `.opportunistic` delivers a cached low-resolution frame almost immediately and then
-        // upgrades, which is what keeps the page from ever showing empty (§14 P4).
+        // upgrades, which is what keeps a local page from ever showing empty (§14 P4). A remote
+        // preview has no such first frame — it is a download — so the grid's thumbnail stands
+        // in until it lands. Requested first so that, when both are cached, it is delivered
+        // first.
+        if stub.isRemoteOnly { showThumbnail(for: stub, loader: loader) }
+
         token = loader.requestImage(for: stub, variant: .viewerPreview) { [weak self] image, degraded in
-            guard let self, self.stub?.id == stub.id, let image else { return }
+            guard let self, self.stub?.id == stub.id else { return }
+            guard let image else {
+                if !degraded, self.thumbnailToken == nil { self.showThumbnail(for: stub, loader: loader) }
+                return
+            }
             // A late preview must not undo the native-resolution rendition already on screen.
             guard !self.hasFullResolution else { return }
+            self.hasPreview = true
             if isVideo {
                 self.videoView.setPoster(image)
             } else {
                 self.photoView.setImage(image, resetZoom: self.photoView.imageView.image == nil)
                 if !degraded { self.offerLiveTextSource(image) }
+            }
+        }
+    }
+
+    /// Shows the grid's thumbnail while the preview downloads, or instead of it when the
+    /// preview cannot be had, rather than an empty black page. For a remote photo it is almost
+    /// always cached already, since the user just tapped it in the grid — which is also what
+    /// still works while the server is unreachable or the session has expired. Never offered to
+    /// Live Text: it is too small to read text from.
+    private func showThumbnail(for stub: AssetStub, loader: ImageLoader) {
+        let scale = traitCollection.displayScale > 0 ? traitCollection.displayScale : 2
+        thumbnailToken = loader.requestImage(for: stub,
+                                             variant: .gridThumb(pointSize: contentView.bounds.size,
+                                                                 scale: scale)) { [weak self] image, _ in
+            // An uncached thumbnail is itself a download, and may lose the race to the preview.
+            guard let self, self.stub?.id == stub.id, let image,
+                  !self.hasPreview, !self.hasFullResolution else { return }
+            if stub.kind == .video {
+                self.videoView.setPoster(image)
+            } else {
+                self.photoView.setImage(image, resetZoom: self.photoView.imageView.image == nil)
             }
         }
     }
