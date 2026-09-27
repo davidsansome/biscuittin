@@ -73,8 +73,15 @@ platform :ios do
       api_key: api_key,
       ipa: lane_context[SharedValues::IPA_OUTPUT_PATH],
       changelog: changelog,
-      beta_app_description: File.read(File.join(ROOT, "fastlane/description.txt")).strip,
-      beta_app_feedback_email: "me@davidsansome.com",
+      # Keyed by locale, not passed as beta_app_description: that only updates beta app
+      # localizations that already exist, and reports success when there are none. A named
+      # locale is created if missing. en-AU is the App Store listing's language.
+      localized_app_info: {
+        "en-AU" => {
+          description: File.read(File.join(ROOT, "fastlane/description.txt")).strip,
+          feedback_email: "me@davidsansome.com"
+        }
+      },
       beta_app_review_info: {
         contact_first_name: "David",
         contact_last_name: "Sansome",
