@@ -27,6 +27,7 @@ final class ViewerPagerController: UIViewController {
     private let contentContainer = UIView()
     private var collectionView: UICollectionView!
     private let toolbar = ViewerToolbar()
+    private let expiredBanner = UIButton(type: .system)
 
     private let transitionDelegate = ViewerTransitionDelegate()
     private weak var transitionSource: ViewerTransitionSource?
@@ -76,6 +77,7 @@ final class ViewerPagerController: UIViewController {
 
         configureCollectionView()
         configureToolbar()
+        configureExpiredBanner()
         configureDismissGesture()
     }
 
@@ -173,7 +175,67 @@ final class ViewerPagerController: UIViewController {
         contentContainer.addGestureRecognizer(pan)
     }
 
+    // MARK: - Expired session
+
+    /// Remote photos that are not already cached cannot load while the session is expired, and
+    /// fall back to their grid thumbnail. This says why, instead of leaving a soft page
+    /// unexplained.
+    private func configureExpiredBanner() {
+        var config = UIButton.Configuration.filled()
+        config.cornerStyle = .capsule
+        config.baseBackgroundColor = .systemOrange
+        config.baseForegroundColor = .white
+        config.image = UIImage(systemName: "exclamationmark.icloud",
+                               withConfiguration: UIImage.SymbolConfiguration(pointSize: 14,
+                                                                              weight: .semibold))
+        config.imagePadding = 6
+        config.title = "Immich session expired · Sign In"
+        expiredBanner.configuration = config
+        expiredBanner.accessibilityLabel = "Immich session expired. Sign in again."
+        expiredBanner.translatesAutoresizingMaskIntoConstraints = false
+        expiredBanner.addAction(UIAction { [weak self] _ in self?.presentSettings() },
+                                for: .touchUpInside)
+        view.addSubview(expiredBanner)
+        NSLayoutConstraint.activate([
+            expiredBanner.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            expiredBanner.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor,
+                                               constant: 8)
+        ])
+
+        NotificationCenter.default.addObserver(self,
+                                               selector: #selector(sessionStateDidChange),
+                                               name: ImmichAuthSession.stateDidChangeNotification,
+                                               object: env.immichSession)
+        expiredBanner.isHidden = env.immichSession.state != .expired
+    }
+
+    @objc private func sessionStateDidChange() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let wasExpired = !self.expiredBanner.isHidden
+            let state = self.env.immichSession.state
+            self.expiredBanner.isHidden = state != .expired
+            // Pages that fell back to a thumbnail while expired would otherwise keep it until
+            // they were paged away from and back.
+            if wasExpired, case .signedIn = state {
+                self.collectionView.reloadItems(at: self.collectionView.indexPathsForVisibleItems)
+                self.collectionView.layoutIfNeeded()
+                self.activateCurrentPage()
+            }
+        }
+    }
+
+    private func presentSettings() {
+        let host = UIHostingController(rootView: SettingsScreen(viewModel: env.makeSettingsViewModel()))
+        present(host, animated: true)
+    }
+
     // MARK: - Chrome (requirement 7)
+
+    private func setChromeAlpha(_ alpha: CGFloat) {
+        toolbar.alpha = alpha
+        expiredBanner.alpha = alpha
+    }
 
     private func toggleChrome() {
         setChromeVisible(!isChromeVisible, animated: true)
@@ -184,7 +246,7 @@ final class ViewerPagerController: UIViewController {
         isChromeVisible = visible
 
         let apply = {
-            self.toolbar.alpha = visible ? 1 : 0
+            self.setChromeAlpha(visible ? 1 : 0)
             self.setNeedsStatusBarAppearanceUpdate()
         }
         animated ? UIView.animate(withDuration: 0.22, animations: apply) : apply()
@@ -284,7 +346,7 @@ final class ViewerPagerController: UIViewController {
                                                            y: translation.y)
                 .scaledBy(x: scale, y: scale)
             backdropView.alpha = 1 - progress * 0.9
-            toolbar.alpha = isChromeVisible ? max(0, 1 - progress * 3) : 0
+            setChromeAlpha(isChromeVisible ? max(0, 1 - progress * 3) : 0)
 
         case .ended, .cancelled:
             let shouldDismiss = gesture.state == .ended
@@ -299,7 +361,7 @@ final class ViewerPagerController: UIViewController {
                                options: [.curveEaseOut]) {
                     self.contentContainer.transform = .identity
                     self.backdropView.alpha = 1
-                    self.toolbar.alpha = self.isChromeVisible ? 1 : 0
+                    self.setChromeAlpha(self.isChromeVisible ? 1 : 0)
                 }
             }
         default:

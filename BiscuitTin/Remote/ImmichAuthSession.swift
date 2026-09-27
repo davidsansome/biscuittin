@@ -34,6 +34,10 @@ final class ImmichAuthSession: @unchecked Sendable {
     /// Fires whenever sign-in state changes, so the UI and sync engine can react.
     var onStateChange: ((State) -> Void)?
 
+    /// Posted on every state change, for the several screens that show an expired session.
+    /// It can be posted from any thread: a 401 is noticed wherever the request ran.
+    static let stateDidChangeNotification = Notification.Name("ImmichAuthSession.stateDidChange")
+
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         if Keychain.get(Key.token) != nil, let email = defaults.string(forKey: Key.email) {
@@ -207,6 +211,7 @@ final class ImmichAuthSession: @unchecked Sendable {
         cachedState = new
         lock.unlock()
         onStateChange?(new)
+        NotificationCenter.default.post(name: Self.stateDidChangeNotification, object: self)
     }
 
     // MARK: - Version gate (D8)

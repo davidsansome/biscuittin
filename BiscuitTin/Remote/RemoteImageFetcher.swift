@@ -15,15 +15,21 @@ final class RemoteImageFetcher: RemoteImageFetching, @unchecked Sendable {
     private let session: ImmichAuthSession
     private let cache: RemoteThumbnailCache
     private let clientFactory: @Sendable (URL) -> ImmichClient
+    private let onCredentialRejected: @Sendable () -> Void
+
+    private let lock = NSLock()
+    private var credentialCheck: Task<Void, Never>?
 
     init(session: ImmichAuthSession,
          cache: RemoteThumbnailCache,
-         clientFactory: (@Sendable (URL) -> ImmichClient)? = nil) {
+         clientFactory: (@Sendable (URL) -> ImmichClient)? = nil,
+         onCredentialRejected: (@Sendable () -> Void)? = nil) {
         self.session = session
         self.cache = cache
         self.clientFactory = clientFactory ?? { url in
             ImmichClient(baseURL: url, credentialProvider: { session.credential })
         }
+        self.onCredentialRejected = onCredentialRejected ?? { session.markExpired() }
     }
 
     func cachedImage(immichID: String, variant: ImageVariant) -> UIImage? {
@@ -41,19 +47,50 @@ final class RemoteImageFetcher: RemoteImageFetching, @unchecked Sendable {
         let client = clientFactory(baseURL)
 
         let data: Data
-        switch variant {
-        case .gridThumb:
-            data = try await client.thumbnailData(id: immichID, size: .thumbnail)
-        case .viewerPreview:
-            data = try await client.thumbnailData(id: immichID, size: .preview)
-        case .fullResolution:
-            data = try await client.originalData(id: immichID)
+        do {
+            switch variant {
+            case .gridThumb:
+                data = try await client.thumbnailData(id: immichID, size: .thumbnail)
+            case .viewerPreview:
+                data = try await client.thumbnailData(id: immichID, size: .preview)
+            case .fullResolution:
+                data = try await client.originalData(id: immichID)
+            }
+        } catch ImmichError.unauthorized {
+            await confirmCredentialRejected(using: client)
+            throw ImmichError.unauthorized
         }
 
         guard let image = cache.store(data, for: key, downsamplingTo: Self.maxPixelSize(variant)) else {
             throw ImmichError.decoding("thumbnail was not a decodable image")
         }
         return image
+    }
+
+    /// Expires the session only once an account-level call is refused too.
+    ///
+    /// Sync is the only other place that notices a dead token, and it runs rarely, so without
+    /// this every uncached photo failed silently until the next launch. The check is needed
+    /// because `ImmichClient` reports 401 and 403 alike, and an asset endpoint can refuse one
+    /// asset — an API key without `asset.view` — while the credential itself is fine; expiring
+    /// on that would delete a working key. Concurrent failures share one check.
+    func confirmCredentialRejected(using client: ImmichClient) async {
+        let check: Task<Void, Never> = lock.withLock {
+            if let credentialCheck { return credentialCheck }
+            let task = Task { [onCredentialRejected] in
+                do {
+                    _ = try await client.me()
+                } catch ImmichError.unauthorized {
+                    onCredentialRejected()
+                } catch {}
+            }
+            credentialCheck = task
+            return task
+        }
+        await check.value
+        lock.withLock {
+            if credentialCheck == check { credentialCheck = nil }
+        }
     }
 
     func clearCache() { cache.removeAll() }

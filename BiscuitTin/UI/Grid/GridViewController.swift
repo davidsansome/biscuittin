@@ -307,8 +307,16 @@ final class GridViewController: UIViewController {
     }
 
     /// Requirement 14: cloud glyph plus the outstanding count, hidden when sync is off.
+    ///
+    /// Doubles as the expired-session notice: every remote photo not already cached stops
+    /// loading when the token dies, and Settings is otherwise the only place that says why.
     private func observeBackupStatus() {
         env.backupStatus.objectWillChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.updateBackupIndicator() }
+            .store(in: &cancellables)
+        NotificationCenter.default.publisher(for: ImmichAuthSession.stateDidChangeNotification,
+                                             object: env.immichSession)
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.updateBackupIndicator() }
             .store(in: &cancellables)
@@ -316,6 +324,22 @@ final class GridViewController: UIViewController {
     }
 
     private func updateBackupIndicator() {
+        var config = UIButton.Configuration.plain()
+        config.imagePadding = 4
+        config.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 6, bottom: 4, trailing: 6)
+
+        if env.immichSession.state == .expired {
+            backupIndicatorItem.isHidden = false
+            config.image = UIImage(systemName: "exclamationmark.icloud",
+                                   withConfiguration: UIImage.SymbolConfiguration(pointSize: 15,
+                                                                                  weight: .medium))
+            config.title = "Sign In"
+            config.baseForegroundColor = .systemOrange
+            backupIndicatorButton.configuration = config
+            backupIndicatorButton.accessibilityLabel = "Immich session expired. Sign in again."
+            return
+        }
+
         let status = env.backupStatus
         guard status.isEnabled else {
             backupIndicatorItem.isHidden = true
@@ -323,13 +347,10 @@ final class GridViewController: UIViewController {
         }
         backupIndicatorItem.isHidden = false
 
-        var config = UIButton.Configuration.plain()
         config.image = UIImage(systemName: status.indicatorSymbol,
                                withConfiguration: UIImage.SymbolConfiguration(pointSize: 15,
                                                                               weight: .medium))
         config.title = status.indicatorText
-        config.imagePadding = 4
-        config.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 6, bottom: 4, trailing: 6)
         config.baseForegroundColor = status.remainingCount > 0 ? .secondaryLabel : .systemGreen
         backupIndicatorButton.configuration = config
         backupIndicatorButton.accessibilityLabel = status.remainingCount > 0
