@@ -52,8 +52,9 @@ platform :ios do
       output_directory: File.join(ROOT, "build/Release"),
       derived_data_path: File.join(ROOT, "build/DerivedData"),
       cloned_source_packages_path: File.join(ROOT, "build/SourcePackages"),
+      # gym appends xcargs to the -exportArchive command as well, which carries the auth flags
+      # there too. Repeating them in export_xcargs makes xcodebuild reject the duplicates.
       xcargs: "#{xcode_auth} CURRENT_PROJECT_VERSION=#{build_number}",
-      export_xcargs: xcode_auth,
       export_method: "app-store",
       export_options: { signingStyle: "automatic", manageAppVersionAndBuildNumber: false }
     )
