@@ -368,8 +368,9 @@ explanation before the flattering one.
   builds.
 - **App Store** (`.github/workflows/appstore.yml`, run by hand): submits an existing TestFlight
   build, not a rebuild, for review, and it is released automatically on approval. Update
-  `fastlane/release_notes.txt` first. The App Store description is `fastlane/description.txt`,
-  uploaded on every run; edits made to it in App Store Connect are overwritten. The workflow
+  `fastlane/release_notes.txt` first. The App Store description, subtitle and promotional
+  text are `fastlane/description.txt`, `subtitle.txt` and `promotional_text.txt`, uploaded on
+  every run; edits made to them in App Store Connect are overwritten. The workflow
   tags `v<version>` and then commits the next `MARKETING_VERSION` to `main`, because App
   Store Connect refuses uploads to a version once it is approved.
 - Both run `fastlane` (`fastlane/Fastfile`) with one App Store Connect API key in the

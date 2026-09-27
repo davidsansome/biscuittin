@@ -1,0 +1,1 @@
+A lightweight Immich app that opens straight to your photos, even with a huge library. Offline search, a map and background backup included.
