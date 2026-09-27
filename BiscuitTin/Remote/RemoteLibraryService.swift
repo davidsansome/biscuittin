@@ -69,6 +69,8 @@ actor RemoteLibraryService {
         /// Wall-clock time of the last successful sync, for display only (§13.4) — the sync
         /// cursor itself lives server-side, keyed to the access token.
         static let lastSyncedAt = "last_synced_at"
+        /// Base URL and account whose server data the cache holds.
+        static let cacheOwner = "cache_owner"
     }
 
     init(database: AppDatabase,
@@ -158,6 +160,9 @@ actor RemoteLibraryService {
             progress?(upserts.count)
         }
 
+        // Signing out mid-download wipes the cache; applying this afterwards would put the
+        // signed-out server's assets back.
+        guard session.isConfigured else { throw CancellationError() }
         try apply(upserts: upserts, exifs: exifs, deletedIDs: deletedIDs)
 
         // At most 3 entries (one per requested type), always well under the server's 1000-ack cap.
@@ -457,14 +462,50 @@ actor RemoteLibraryService {
 
     /// Clears cached server data without touching the device library.
     func wipeCache() throws {
-        let writer = try database.writer()
-        try writer.write { db in
-            try db.execute(sql: "DELETE FROM remote_assets")
-            try db.execute(sql: "DELETE FROM facet_links")
-            try db.execute(sql: "DELETE FROM kv")
-            try db.execute(sql: "DELETE FROM pending_edits")
-        }
+        try database.writer().write { db in try Self.wipe(db) }
         changesContinuation.yield(.all)
+    }
+
+    /// Wipes the cache unless it was filled by `owner`, then records `owner` as filling it.
+    /// Returns whether it wiped.
+    ///
+    /// Sign Out keeps the cache so it stays browsable offline (§13), so without this a sign-in
+    /// to another server or account kept the old one's assets in the grid, where their images
+    /// could no longer be fetched. A cache from before owners were recorded is treated as
+    /// someone else's; sign-in replays the whole library regardless, so that costs no downloads.
+    @discardableResult
+    func claimCache(for owner: String) throws -> Bool {
+        let wiped = try database.writer().write { db -> Bool in
+            let current = try String.fetchOne(db, sql: "SELECT value FROM kv WHERE key = ?",
+                                              arguments: [Cursor.cacheOwner])
+            guard current != owner else { return false }
+            try Self.wipe(db)
+            try db.execute(sql: "INSERT INTO kv (key, value) VALUES (?, ?)",
+                           arguments: [Cursor.cacheOwner, owner])
+            return true
+        }
+        if wiped { changesContinuation.yield(.all) }
+        return wiped
+    }
+
+    private static func wipe(_ db: Database) throws {
+        try db.execute(sql: "DELETE FROM remote_assets")
+        try db.execute(sql: "DELETE FROM kv")
+        try db.execute(sql: "DELETE FROM pending_edits")
+        // The local half of a link is kept: a local checksum is computed only while its
+        // backup_state row has none, so dropping it would leave the photo unlinked from its
+        // server copy on the next server and shown twice.
+        try db.execute(sql: "DELETE FROM facet_links WHERE local_identifier IS NULL")
+        try db.execute(sql: "UPDATE facet_links SET immich_id = NULL")
+        // Uploaded to a server this cache no longer describes. Pending re-checks each against
+        // whichever server comes next, which skips the ones it already has.
+        try db.execute(sql: """
+            UPDATE backup_state SET state = ?, retry_count = 0, last_error = NULL
+            WHERE state IN (?, ?, ?)
+            """, arguments: [BackupStateRecord.State.pending.rawValue,
+                             BackupStateRecord.State.uploaded.rawValue,
+                             BackupStateRecord.State.uploading.rawValue,
+                             BackupStateRecord.State.failed.rawValue])
     }
 
     // MARK: - Pending edits (D22)
