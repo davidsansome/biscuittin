@@ -17,14 +17,15 @@ Everything is a real capture of the app. Only the frame, headline and caption ar
 ## The pipeline
 
 Steps 1, 2, 3 and 6 are scripts. Steps 4 and 5 are driving the simulator by hand, which is
-where the time goes. Everything is written under `build/screenshots/`, which is gitignored.
+where the time goes. Everything is written under `build/screenshots/`, which is gitignored,
+except the finished screenshots. Those go in `fastlane/screenshots/en-AU/`, which is committed.
 
 ```bash
 Tools/screenshots/fetch_photos.sh          # 1. ~100 MB of Unsplash photos -> build/screenshots/raw
 swift Tools/screenshots/tag_photos.swift   # 2. EXIF dates, GPS, camera  -> build/screenshots/tagged
 Tools/screenshots/setup_sims.sh            # 3. two dedicated simulators, ready to shoot
 # 4-5. drive the app, save captures to build/screenshots/captures (below)
-Tools/screenshots/compose_all.sh           # 6. frame + caption          -> build/screenshots/final
+Tools/screenshots/compose_all.sh           # 6. frame + caption          -> fastlane/screenshots/en-AU
 ```
 
 Build the app for the simulator first (AGENTS.md), with the CLIP models fetched. Without them
@@ -155,5 +156,15 @@ Always review the output as a contact sheet. The problems that got fixed there w
 leaving a single word on its own line, and one device sitting higher than the rest because its
 caption fit on one line.
 
-Upload in filename order. The App Store shows the first three in search results, so the
-strongest features go first.
+The output is JPEG, about 9 MB for all ten, against 42 MB as PNG.
+
+## Uploading
+
+Commit `fastlane/screenshots/en-AU/`. The App Store workflow uploads the folder on every run,
+**replacing** the screenshots in App Store Connect, so changes made in the web UI do not survive
+a release. It orders them by filename, which is why the names are numbered. The App Store shows
+the first three in search results, so the strongest features go first.
+
+`en-AU` is the app's primary language. A folder named for a language the listing does not have
+yet makes the workflow add that localization. That is the way to add a language, and also a way
+to add one by accident.

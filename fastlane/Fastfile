@@ -101,7 +101,10 @@ platform :ios do
       # Ignored by deliver for an app's first version, which App Store Connect gives no notes.
       release_notes: { "default" => File.read(File.join(ROOT, "fastlane/release_notes.txt")).strip },
       skip_binary_upload: true,
-      skip_screenshots: true,
+      # The committed set replaces whatever App Store Connect has, so edits made in its web UI
+      # do not survive a release. Made by Tools/screenshots (README.md there).
+      screenshots_path: File.join(ROOT, "fastlane/screenshots"),
+      overwrite_screenshots: true,
       submit_for_review: true,
       automatic_release: true,
       # Re-running for the same version replaces a submission still waiting for review.

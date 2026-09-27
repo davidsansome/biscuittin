@@ -4,7 +4,8 @@
 //
 //   swift Tools/screenshots/compose.swift <capture.png> <out.png> <phone|ipad> "<line 1>" "<line 2>" "<caption>"
 //
-// Usually run through compose_all.sh, which holds the captions.
+// Writes JPEG unless the output ends in .png. Usually run through compose_all.sh, which holds
+// the captions.
 import AppKit
 import CoreGraphics
 
@@ -99,4 +100,8 @@ ctx.restoreGState()
 
 let out = ctx.makeImage()!
 let rep = NSBitmapImageRep(cgImage: out)
-try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: a[2]))
+// JPEG for the committed set: a tenth of the PNG size, and App Store Connect accepts both.
+let data = a[2].lowercased().hasSuffix(".png")
+    ? rep.representation(using: .png, properties: [:])!
+    : rep.representation(using: .jpeg, properties: [.compressionFactor: 0.9])!
+try! data.write(to: URL(fileURLWithPath: a[2]))

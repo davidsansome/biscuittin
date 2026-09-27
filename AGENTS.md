@@ -377,8 +377,9 @@ explanation before the flattering one.
   distribution certificate.
 - The `beta` lane fails if the CLIP models are missing from the archived `.app`, rather than
   shipping a build with no search bar.
-- App Store screenshots: [Tools/screenshots/README.md](Tools/screenshots/README.md) has the
-  whole procedure, including scripts for the photos, simulators and framing.
+- App Store screenshots live in `fastlane/screenshots/en-AU/`, and every App Store run uploads
+  them, replacing what App Store Connect has. [Tools/screenshots/README.md](Tools/screenshots/README.md)
+  has the procedure for remaking them.
 - A newly used required-reason API (`UserDefaults`, file timestamps, disk space, boot time…)
   needs an entry in `BiscuitTin/PrivacyInfo.xcprivacy`, or App Review rejects the
   submission.

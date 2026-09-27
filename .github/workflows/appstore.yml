@@ -1,7 +1,8 @@
 name: App Store
 
 # Run by hand. Submits an existing TestFlight build for review, unchanged; it is released as
-# soon as Apple approves it. Release notes come from fastlane/release_notes.txt.
+# soon as Apple approves it. Release notes come from fastlane/release_notes.txt, and the
+# screenshots in fastlane/screenshots replace the ones in App Store Connect.
 on:
   workflow_dispatch:
     inputs:
