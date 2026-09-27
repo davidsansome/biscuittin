@@ -159,6 +159,7 @@ final class ViewerPagerController: UIViewController {
         ])
 
         toolbar.onBack = { [weak self] in self?.dismissViewer() }
+        toolbar.onLiveText = { [weak self] in self?.toggleLiveTextHighlight() }
         toolbar.onInfo = { [weak self] in self?.presentInfoSheet() }
         toolbar.onRotateLeft = { [weak self] in self?.rotateCurrent(clockwise: false) }
         toolbar.onRotateRight = { [weak self] in self?.rotateCurrent(clockwise: true) }
@@ -206,6 +207,7 @@ final class ViewerPagerController: UIViewController {
         if let leaving = collectionView.cellForItem(at: IndexPath(item: currentIndex, section: 0)) as? ViewerPageCell {
             leaving.videoView.detachPlayer()
             leaving.resetZoom(animated: false)
+            leaving.setCurrentPage(false)
         }
         currentIndex = clamped
         activateCurrentPage()
@@ -217,6 +219,8 @@ final class ViewerPagerController: UIViewController {
         let stub = items[currentIndex]
         toolbar.setRotationAvailable(env.photoActions.canRotate(stub.kind))
         currentCell()?.setChromeVisible(isChromeVisible, animated: false)
+        currentCell()?.setCurrentPage(true)
+        updateLiveTextState()
 
         guard stub.kind == .video, let cell = currentCell() else { return }
         cell.videoView.showLoading()
@@ -243,6 +247,22 @@ final class ViewerPagerController: UIViewController {
             }
         }
         cell.videoView.setLoadTask(task)
+    }
+
+    // MARK: - Live Text (D25)
+
+    private func toggleLiveTextHighlight() {
+        guard let cell = currentCell(), cell.liveTextHasText else { return }
+        cell.isLiveTextHighlighted.toggle()
+        updateLiveTextState()
+    }
+
+    private func updateLiveTextState() {
+        let cell = currentCell()
+        toolbar.setLiveText(available: cell?.liveTextHasText ?? false,
+                            highlighted: cell?.isLiveTextHighlighted ?? false)
+        // A drag that starts on a selection handle belongs to the selection, not the pager.
+        collectionView.isScrollEnabled = !(cell?.hasActiveTextSelection ?? false)
     }
 
     // MARK: - Dismissal (requirement 6)
@@ -483,6 +503,12 @@ extension ViewerPagerController: UICollectionViewDataSource {
                        loader: env.imageLoader,
                        toolbarInset: currentVideoControlInset)
         page.onSingleTap = { [weak self] in self?.toggleChrome() }
+        page.onLiveTextChange = { [weak self, weak page] in
+            guard let self, let page, page === self.currentCell() else { return }
+            self.updateLiveTextState()
+        }
+        // Covers a page (re)created while already current, e.g. after a rotate reloads it.
+        page.setCurrentPage(indexPath.item == currentIndex)
         page.setChromeVisible(isChromeVisible, animated: false)
         return page
     }
@@ -518,6 +544,10 @@ extension ViewerPagerController: UIGestureRecognizerDelegate {
     func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
         guard let pan = gestureRecognizer as? UIPanGestureRecognizer else { return true }
         guard currentCell()?.isAtMinimumZoom ?? true else { return false }
+        // Dragging a selection handle downward would otherwise dismiss the viewer.
+        if let cell = currentCell(), cell.hasActiveTextSelection || cell.isLiveTextHighlighted {
+            return false
+        }
         let velocity = pan.velocity(in: view)
         return abs(velocity.y) > abs(velocity.x) && velocity.y > 0
     }

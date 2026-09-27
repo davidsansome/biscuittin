@@ -1,4 +1,5 @@
 import UIKit
+import VisionKit
 
 /// One full-screen page. Hosts either a zoomable image or a video player, depending on the
 /// asset's `MediaKind` (D3).
@@ -14,6 +15,12 @@ final class ViewerPageCell: UICollectionViewCell {
     private var hasFullResolution = false
     private weak var loader: ImageLoader?
 
+    /// The first full-quality rendition delivered, kept so Live Text can run on it once the
+    /// page becomes current. Degraded frames are too soft to read text from.
+    private var liveTextSource: UIImage?
+    private var liveTextTask: Task<Void, Never>?
+    private var isCurrentPage = false
+
     /// Carries the optimistic rotation (§14 P4).
     ///
     /// Deliberately *not* `photoView.imageView`: that is the scroll view's `viewForZooming`,
@@ -24,6 +31,9 @@ final class ViewerPageCell: UICollectionViewCell {
     fileprivate var previewRotationAngle: CGFloat = 0
 
     var onSingleTap: (() -> Void)?
+    /// Fires when the page's Live Text state changes: analysis finished, highlight mode or
+    /// text selection toggled.
+    var onLiveTextChange: (() -> Void)?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -41,6 +51,7 @@ final class ViewerPageCell: UICollectionViewCell {
         photoView.onSingleTap = { [weak self] in self?.onSingleTap?() }
         videoView.onSingleTap = { [weak self] in self?.onSingleTap?() }
         photoView.onZoomedIn = { [weak self] in self?.requestFullResolution() }
+        photoView.onLiveTextChange = { [weak self] in self?.onLiveTextChange?() }
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -53,6 +64,11 @@ final class ViewerPageCell: UICollectionViewCell {
         fullResolutionToken = nil
         hasFullResolution = false
         stub = nil
+        liveTextTask?.cancel()
+        liveTextTask = nil
+        liveTextSource = nil
+        isCurrentPage = false
+        photoView.setLiveTextAnalysis(nil)
         clearRotationOverlay()
         photoView.setImage(nil, resetZoom: true)
         videoView.detachPlayer()
@@ -77,7 +93,7 @@ final class ViewerPageCell: UICollectionViewCell {
 
         // `.opportunistic` delivers a cached low-resolution frame almost immediately and then
         // upgrades, which is what keeps the page from ever showing empty (§14 P4).
-        token = loader.requestImage(for: stub, variant: .viewerPreview) { [weak self] image, _ in
+        token = loader.requestImage(for: stub, variant: .viewerPreview) { [weak self] image, degraded in
             guard let self, self.stub?.id == stub.id, let image else { return }
             // A late preview must not undo the native-resolution rendition already on screen.
             guard !self.hasFullResolution else { return }
@@ -85,6 +101,7 @@ final class ViewerPageCell: UICollectionViewCell {
                 self.videoView.setPoster(image)
             } else {
                 self.photoView.setImage(image, resetZoom: self.photoView.imageView.image == nil)
+                if !degraded { self.offerLiveTextSource(image) }
             }
         }
     }
@@ -104,6 +121,59 @@ final class ViewerPageCell: UICollectionViewCell {
             guard let self, !degraded, let image, self.stub?.id == stub.id else { return }
             self.hasFullResolution = true
             self.photoView.setImage(image, resetZoom: false)
+            self.offerLiveTextSource(image)
+        }
+    }
+
+    // MARK: - Live Text (D25)
+
+    /// Analysis runs only for the page the user has settled on, never for neighbours being
+    /// prefetched or pages flicked past (§14 P1).
+    func setCurrentPage(_ current: Bool) {
+        isCurrentPage = current
+        if current {
+            analyzeLiveTextIfNeeded()
+        } else {
+            liveTextTask?.cancel()
+            liveTextTask = nil
+            photoView.resetLiveText()
+        }
+    }
+
+    var liveTextHasText: Bool { stub?.kind != .video && photoView.liveTextHasText }
+
+    var isLiveTextHighlighted: Bool {
+        get { photoView.isLiveTextHighlighted }
+        set { photoView.isLiveTextHighlighted = newValue }
+    }
+
+    var hasActiveTextSelection: Bool { photoView.hasActiveTextSelection }
+
+    private func offerLiveTextSource(_ image: UIImage) {
+        guard liveTextSource == nil else { return }
+        liveTextSource = image
+        analyzeLiveTextIfNeeded()
+    }
+
+    private func analyzeLiveTextIfNeeded() {
+        guard isCurrentPage, LiveText.isSupported, let stub, stub.kind != .video,
+              let image = liveTextSource, liveTextTask == nil,
+              !photoView.hasLiveTextAnalysis else { return }
+
+        liveTextTask = Task { [weak self] in
+            let analysis: ImageAnalysis
+            do {
+                analysis = try await LiveText.analyze(image)
+            } catch {
+                guard !Task.isCancelled else { return }
+                Log.device("ui", "Live Text analysis failed for \(stub.id.raw): \(error)")
+                self?.liveTextTask = nil
+                return
+            }
+            guard let self, !Task.isCancelled, self.stub?.id == stub.id else { return }
+            self.liveTextTask = nil
+            self.photoView.setLiveTextAnalysis(analysis)
+            self.onLiveTextChange?()
         }
     }
 

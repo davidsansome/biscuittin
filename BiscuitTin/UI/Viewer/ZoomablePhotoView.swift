@@ -1,4 +1,5 @@
 import UIKit
+import VisionKit
 
 /// One zoomable image page in the viewer (DESIGN.md §13.2).
 ///
@@ -13,6 +14,12 @@ final class ZoomablePhotoView: UIScrollView {
     var onSingleTap: (() -> Void)?
     /// Fires when the user zooms past 1×, so the page can request a full-resolution image.
     var onZoomedIn: (() -> Void)?
+    /// Fires when Live Text's highlight mode or text selection changes.
+    var onLiveTextChange: (() -> Void)?
+
+    /// Lives on the zooming view so highlights and selection track the photo through a pinch.
+    /// Nil where the device cannot run text recognition.
+    private let liveTextInteraction: ImageAnalysisInteraction?
 
     private var hasRequestedFullResolution = false
     private var lastLayoutSize: CGSize = .zero
@@ -30,6 +37,7 @@ final class ZoomablePhotoView: UIScrollView {
     }
 
     override init(frame: CGRect) {
+        liveTextInteraction = LiveText.isSupported ? ImageAnalysisInteraction() : nil
         super.init(frame: frame)
 
         showsVerticalScrollIndicator = false
@@ -48,10 +56,19 @@ final class ZoomablePhotoView: UIScrollView {
         doubleTap.numberOfTapsRequired = 2
         addGestureRecognizer(doubleTap)
 
-        let singleTap = UITapGestureRecognizer(target: self, action: #selector(handleSingleTap))
+        let singleTap = UITapGestureRecognizer(target: self, action: #selector(handleSingleTap(_:)))
         singleTap.numberOfTapsRequired = 1
         singleTap.require(toFail: doubleTap)
         addGestureRecognizer(singleTap)
+
+        if let liveTextInteraction {
+            liveTextInteraction.preferredInteractionTypes = .automatic
+            // VisionKit places its own Live Text button inside the interaction's view, which
+            // here is the zooming view. The viewer toolbar carries the toggle instead.
+            liveTextInteraction.isSupplementaryInterfaceHidden = true
+            liveTextInteraction.delegate = self
+            imageView.addInteraction(liveTextInteraction)
+        }
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -77,6 +94,40 @@ final class ZoomablePhotoView: UIScrollView {
         // laying out only on bounds changes would leave the image view at zero size.
         configureZoomScales(resetToMinimum: resetZoom)
         centerContent()
+        liveTextInteraction?.setContentsRectNeedsUpdate()
+    }
+
+    // MARK: - Live Text
+
+    /// Set once per asset and kept across rendition swaps, not redone for the full-resolution
+    /// image; `setImage` refreshes the contents rect it is laid out through.
+    func setLiveTextAnalysis(_ analysis: ImageAnalysis?) {
+        guard let liveTextInteraction else { return }
+        if analysis == nil {
+            resetLiveText()
+        }
+        liveTextInteraction.analysis = analysis
+    }
+
+    var hasLiveTextAnalysis: Bool { liveTextInteraction?.analysis != nil }
+
+    var liveTextHasText: Bool {
+        liveTextInteraction?.analysis?.hasResults(for: .text) ?? false
+    }
+
+    var isLiveTextHighlighted: Bool {
+        get { liveTextInteraction?.selectableItemsHighlighted ?? false }
+        set { liveTextInteraction?.selectableItemsHighlighted = newValue }
+    }
+
+    var hasActiveTextSelection: Bool {
+        liveTextInteraction?.hasActiveTextSelection ?? false
+    }
+
+    func resetLiveText() {
+        guard let liveTextInteraction, liveTextInteraction.analysis != nil else { return }
+        liveTextInteraction.resetTextSelection()
+        liveTextInteraction.selectableItemsHighlighted = false
     }
 
     func resetZoom(animated: Bool) {
@@ -197,7 +248,17 @@ final class ZoomablePhotoView: UIScrollView {
 
     // MARK: - Gestures
 
-    @objc private func handleSingleTap() {
+    @objc private func handleSingleTap(_ gesture: UITapGestureRecognizer) {
+        // A tap Live Text acts on — clearing a selection, or picking text or a link while items
+        // are highlighted — must not also flip the chrome.
+        if let liveTextInteraction, liveTextInteraction.analysis != nil {
+            let point = gesture.location(in: imageView)
+            if liveTextInteraction.hasActiveTextSelection
+                || (liveTextInteraction.selectableItemsHighlighted
+                    && liveTextInteraction.hasInteractiveItem(at: point)) {
+                return
+            }
+        }
         onSingleTap?()
     }
 
@@ -243,5 +304,27 @@ extension ZoomablePhotoView: UIScrollViewDelegate {
             pendingImage = nil
             setImage(pending, resetZoom: false)
         }
+    }
+}
+
+extension ZoomablePhotoView: ImageAnalysisInteractionDelegate {
+    /// Look Up, Translate and Share present from here; the window's root controller is already
+    /// presenting the viewer, so it cannot.
+    func presentingViewController(for interaction: ImageAnalysisInteraction) -> UIViewController? {
+        var responder: UIResponder? = self
+        while let current = responder {
+            if let controller = current as? UIViewController { return controller }
+            responder = current.next
+        }
+        return nil
+    }
+
+    func interaction(_ interaction: ImageAnalysisInteraction,
+                     highlightSelectedItemsDidChange highlightSelectedItems: Bool) {
+        onLiveTextChange?()
+    }
+
+    func textSelectionDidChange(_ interaction: ImageAnalysisInteraction) {
+        onLiveTextChange?()
     }
 }
