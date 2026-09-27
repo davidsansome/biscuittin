@@ -62,6 +62,12 @@ final class ImmichAuthSession: @unchecked Sendable {
 
     var email: String? { defaults.string(forKey: Key.email) }
 
+    /// Identifies whose server data a cache holds: the same account on the same server.
+    var cacheOwner: String? {
+        guard let baseURL, let email else { return nil }
+        return "\(email.lowercased()) \(baseURL.absoluteString)"
+    }
+
     var credential: ImmichCredential? {
         guard let secret = Keychain.get(Key.token) else { return nil }
         return defaults.string(forKey: Key.credentialKind) == Key.apiKeyKind

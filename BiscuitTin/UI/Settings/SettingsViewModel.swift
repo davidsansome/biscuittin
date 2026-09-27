@@ -117,6 +117,10 @@ final class SettingsViewModel: ObservableObject {
         signInTask = Task { [weak self] in
             guard let self else { return }
             do {
+                if let owner = self.session.cacheOwner,
+                   try await self.remoteLibrary.claimCache(for: owner) {
+                    self.imageCache.clearCache()
+                }
                 try await self.remoteLibrary.syncStream(reset: true) { count in
                     Task { @MainActor [weak self] in self?.syncedCount = count }
                 }
@@ -144,11 +148,20 @@ final class SettingsViewModel: ObservableObject {
         statusMessage = nil
     }
 
+    /// Also drops the server's assets: without a credential their images cannot be fetched, so
+    /// keeping them would fill the grid with photos that open black. Assets with a local copy
+    /// stay, shown from the device library.
     func signOut() {
+        signInTask?.cancel()
         session.signOut()
         state = session.state
         syncedCount = nil
-        Task { await timelineStore.refresh() }
+        lastSyncDate = nil
+        Task { [weak self] in
+            guard let self else { return }
+            try? await self.remoteLibrary.wipeCache()
+            self.imageCache.clearCache()
+        }
     }
 
     /// Removes cached server metadata and thumbnails without touching the device library.
@@ -245,6 +258,7 @@ final class SettingsViewModel: ObservableObject {
                 try await self.remoteLibrary.syncStream(reset: false)
                 await self.timelineStore.refresh()
                 self.lastSyncDate = await self.remoteLibrary.lastSyncDate()
+            } catch is CancellationError {
             } catch {
                 // A 401 has already marked the session expired; show the re-sign-in row.
                 self.state = self.session.state

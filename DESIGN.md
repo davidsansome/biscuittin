@@ -818,9 +818,10 @@ SwiftUI form:
   queued). Shows remaining count + last-sync time.
 - **Free Up Space** (M8, D18): row showing reclaimable estimate ("12.4 GB in 3,412
   items backed up to Immich"); tap → confirmation → batched local delete.
-- Sign Out: clears token, keeps cached metadata/thumbnails (still browsable
-  offline-read-only), disables sync. A separate "Remove server data" button wipes
-  the remote cache tables + thumbnail disk cache.
+- Sign Out: clears token, disables sync, and wipes the remote cache tables +
+  thumbnail disk cache — a server asset cannot be opened without a credential, so it
+  is not shown (Implementation Log, 2026-09-27). Assets with a local copy stay. A
+  separate "Remove server data" button does the same and also forgets the server URL.
 
 ---
 
@@ -1237,6 +1238,23 @@ dots at the edges. The grid still lists every photo in the region.
 ---
 
 ## 21. Implementation Log
+
+### Sign-out drops server assets (2026-09-27)
+
+Sign Out used to keep the remote cache for offline browsing (§13). In practice a signed-out
+grid showed server photos whose thumbnails were cached but whose full images could not be
+fetched, so they opened black; after signing in to another server they stayed indefinitely,
+because a `reset` sync only upserts. Sign Out now wipes the remote tables and the thumbnail
+cache. Assets with a local copy keep showing from PhotoKit.
+
+The wipe keeps the local half of each `facet_links` row: a local checksum is computed only
+while its `backup_state` row has none, so dropping it would leave the photo unlinked from its
+copy on the next server and shown twice. `uploaded` backup rows go back to `pending`, so the
+next server is asked whether it has them rather than assumed to.
+
+An expired session keeps its cache, so sign-in also records its account in `kv`
+(`cache_owner`) and wipes first when a different one signs in. A sync still downloading when
+the user signs out discards its result rather than restoring the wiped rows.
 
 ### Live Text in the viewer (2026-09-27)
 
