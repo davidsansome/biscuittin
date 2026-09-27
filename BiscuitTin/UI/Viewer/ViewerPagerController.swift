@@ -407,7 +407,7 @@ final class ViewerPagerController: UIViewController {
             let noun = count == 1 ? "item" : "\(count) items"
             let alert = UIAlertController(
                 title: "Delete \(noun)?",
-                message: "This deletes from this iPhone and moves the copy on Immich to its trash.",
+                message: "This deletes from this \(DeviceName.current) and moves the copy on Immich to its trash.",
                 preferredStyle: .alert)
             alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in
                 continuation.resume(returning: false)

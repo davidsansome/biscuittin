@@ -9,8 +9,15 @@ import CoreLocation
 struct AssetMetadata: Equatable {
     /// Where a copy of this asset lives, shown as badges in the Availability section.
     enum Source: String, Equatable {
-        case device = "On this iPhone"
-        case immich = "On Immich"
+        case device
+        case immich
+
+        var label: String {
+            switch self {
+            case .device: return "On this \(DeviceName.current)"
+            case .immich: return "On Immich"
+            }
+        }
     }
 
     var fileName: String?

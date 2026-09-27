@@ -97,8 +97,8 @@ struct InfoSheet: View {
                 Text("Unknown").foregroundStyle(.secondary)
             } else {
                 ForEach(viewModel.metadata.sources, id: \.rawValue) { source in
-                    Label(source.rawValue,
-                          systemImage: source == .device ? "iphone" : "icloud")
+                    Label(source.label,
+                          systemImage: source == .device ? DeviceName.symbolName : "icloud")
                 }
             }
         }
