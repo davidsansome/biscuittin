@@ -363,9 +363,9 @@ explanation before the flattering one.
 
 - **TestFlight** (`.github/workflows/testflight.yml`): every push to `main` that passes CI is
   archived, uploaded for internal testers and tagged `build/<N>`. Documentation-only pushes
-  are skipped. The build number is the latest TestFlight build number plus one, set at build
-  time and never committed; `CURRENT_PROJECT_VERSION = 1` in the project is only for local
-  builds.
+  are skipped. The tester changelog is the titles of the last five commits. The build number
+  is the latest TestFlight build number plus one, set at build time and never committed;
+  `CURRENT_PROJECT_VERSION = 1` in the project is only for local builds.
 - **App Store** (`.github/workflows/appstore.yml`, run by hand): submits an existing TestFlight
   build, not a rebuild, for review, and it is released automatically on approval. Update
   `fastlane/release_notes.txt` first. The App Store description, subtitle and promotional

@@ -63,11 +63,16 @@ platform :ios do
     missing = BUNDLED_MODELS.reject { |name| File.exist?(File.join(app_bundle, name)) }
     UI.user_error!("Not bundled: #{missing.join(', ')}. Run Tools/fetch_models.sh.") unless missing.empty?
 
+    # Needs the full history, which the TestFlight workflow checks out for its own tag lookup.
+    changelog = sh("git", "-C", ROOT, "log", "-5", "--no-merges", "--format=- %s", log: false).strip
+
     upload_to_testflight(
       api_key: api_key,
       ipa: lane_context[SharedValues::IPA_OUTPUT_PATH],
+      changelog: changelog,
       # Internal testers need no review; their group's automatic distribution picks the build
-      # up once processing finishes, so there is nothing to wait for here.
+      # up once processing finishes. With a changelog, pilot still waits for the build to
+      # appear in App Store Connect so it can attach it, then stops.
       skip_waiting_for_build_processing: true
     )
 

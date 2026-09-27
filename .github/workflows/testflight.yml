@@ -26,7 +26,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
-          fetch-depth: 0 # tags, for the check below
+          fetch-depth: 0 # tags for the check below, and history for the changelog
 
       # workflow_run cannot filter on paths, so skip documentation-only pushes here.
       - name: Check for app changes since the last build
