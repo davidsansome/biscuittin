@@ -14,10 +14,10 @@ REPO="apple/coreml-mobileclip"
 # Pinned: an unpinned "main" would silently change the embeddings under an existing index.
 # Bumping this is a model upgrade — bump `CLIPModel.version` with it so stored embeddings
 # re-index rather than being compared across models (D22).
-MODEL_REVISION="main"
+MODEL_REVISION="3e0a7bfb9fe83da8a3efaa3fd8f7df24214bb947"
 
 TOKENIZER_REPO="openai/clip-vit-base-patch32"
-TOKENIZER_REVISION="main"
+TOKENIZER_REVISION="3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268"
 
 cd "$(dirname "$0")/.."
 DEST="BiscuitTin/Resources/Models"

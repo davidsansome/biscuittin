@@ -25,6 +25,10 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<!-- HTTPS/TLS only, which is exempt; without this every TestFlight build waits on a manual
+	     export-compliance answer. -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<!-- NSAllowsLocalNetworking alone blocked HTTP to LAN hosts under ordinary DNS names, and iOS

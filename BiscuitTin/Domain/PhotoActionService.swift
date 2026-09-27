@@ -9,7 +9,7 @@ enum PartialRotationError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .serverCopyNotRotated:
-            return "Rotated on this iPhone, but the copy on Immich couldn’t be updated."
+            return "Rotated on this \(DeviceName.current), but the copy on Immich couldn’t be updated."
         }
     }
 }

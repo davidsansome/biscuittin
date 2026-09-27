@@ -69,7 +69,7 @@ private struct ServerPage: View {
                 }
 
                 Text("An account is optional. Biscuit Tin works fully with just the photos on "
-                     + "this iPhone.")
+                     + "this \(DeviceName.current).")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity)
@@ -321,8 +321,8 @@ private struct BackupPage: View {
 
     var body: some View {
         SignInPageLayout(symbol: "arrow.up.circle",
-                         title: "Back Up This iPhone?",
-                         subtitle: "Biscuit Tin can upload photos and videos from this iPhone to "
+                         title: "Back Up This \(DeviceName.current)?",
+                         subtitle: "Biscuit Tin can upload photos and videos from this \(DeviceName.current) to "
                             + "\(model.server?.displayHost ?? "your server").") {
             VStack(spacing: 12) {
                 SignInChoiceCard(symbol: "photo.on.rectangle.angled",

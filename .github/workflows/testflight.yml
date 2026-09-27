@@ -1,0 +1,87 @@
+name: TestFlight
+
+# Every push to main whose CI run passed goes to internal TestFlight testers.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+# Never cancel a running upload. A newer push replaces one that is still only queued, which is
+# what we want: its build contains the older commit too.
+concurrency:
+  group: testflight
+  cancel-in-progress: false
+
+permissions:
+  contents: write # push the build/<N> tag
+
+jobs:
+  upload:
+    name: Archive and upload
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0 # tags, for the check below
+
+      # workflow_run cannot filter on paths, so skip documentation-only pushes here.
+      - name: Check for app changes since the last build
+        id: changes
+        run: |
+          last=$(git describe --tags --abbrev=0 --match 'build/*' 2>/dev/null || true)
+          if [ -n "$last" ] && [ -z "$(git diff --name-only "$last" HEAD -- . ':(exclude)*.md')" ]; then
+            echo "Nothing but documentation has changed since $last"
+            echo "ship=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ship=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        if: steps.changes.outputs.ship == 'true'
+        with:
+          xcode-version: latest-stable
+
+      - uses: ruby/setup-ruby@v1
+        if: steps.changes.outputs.ship == 'true'
+        with:
+          bundler-cache: true
+
+      - name: Cache CLIP models
+        if: steps.changes.outputs.ship == 'true'
+        uses: actions/cache@v4
+        with:
+          path: BiscuitTin/Resources/Models
+          key: clip-models-${{ hashFiles('Tools/fetch_models.sh') }}
+
+      - name: Fetch CLIP models
+        if: steps.changes.outputs.ship == 'true'
+        run: Tools/fetch_models.sh
+
+      - name: Cache Swift packages
+        if: steps.changes.outputs.ship == 'true'
+        uses: actions/cache@v4
+        with:
+          path: build/SourcePackages
+          key: spm-${{ hashFiles('BiscuitTin.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
+
+      - name: Archive and upload to TestFlight
+        if: steps.changes.outputs.ship == 'true'
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          export ASC_KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+          printf '%s\n' "$ASC_KEY_P8" > "$ASC_KEY_PATH"
+          bundle exec fastlane beta
+
+      - name: Upload build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gym-logs
+          path: ~/Library/Logs/gym

@@ -191,6 +191,16 @@ xcrun simctl spawn <UDID> defaults write com.davidsansome.biscuittin "sync.enabl
 Write it through `simctl spawn defaults`, not by editing the plist file — the simulator's
 preference daemon caches and will overwrite a direct file edit on next launch.
 
+**With more than one simulator booted, pass `device` on every call.** Without it, the tool
+picks whichever one it likes. Taps and typing once went to another booted simulator while the
+intended one sat untouched.
+
+**The tool's `screenshot` can lag several actions behind** even when it succeeds. It showed
+the grid while the app was already three screens further on, which made working taps look like
+failures and prompted repeated taps. Treat a `simctl io … screenshot` as the record of what the
+app is showing. Separately, taps made during a transition animation really are dropped: wait a
+second or two after a sheet or screen change, then check.
+
 Useful non-UI shortcuts:
 
 ```bash
@@ -348,6 +358,30 @@ decoded images, memory-mapped files, a cold SQLite page cache.
 
 **A result that is too good is a bug in the measurement.** Reach for the ordering
 explanation before the flattering one.
+
+## Releasing
+
+- **TestFlight** (`.github/workflows/testflight.yml`): every push to `main` that passes CI is
+  archived, uploaded for internal testers and tagged `build/<N>`. Documentation-only pushes
+  are skipped. The build number is the latest TestFlight build number plus one, set at build
+  time and never committed; `CURRENT_PROJECT_VERSION = 1` in the project is only for local
+  builds.
+- **App Store** (`.github/workflows/appstore.yml`, run by hand): submits an existing TestFlight
+  build, not a rebuild, for review, and it is released automatically on approval. Update
+  `fastlane/release_notes.txt` first. The workflow tags `v<version>` and then commits the next
+  `MARKETING_VERSION` to `main`, because App Store Connect refuses uploads to a version once
+  it is approved.
+- Both run `fastlane` (`fastlane/Fastfile`) with one App Store Connect API key in the
+  `ASC_KEY_ID`, `ASC_ISSUER_ID` and `ASC_KEY_P8` secrets. It must have the **Admin** role:
+  signing is cloud-managed via `-allowProvisioningUpdates`, and nothing else holds a
+  distribution certificate.
+- The `beta` lane fails if the CLIP models are missing from the archived `.app`, rather than
+  shipping a build with no search bar.
+- App Store screenshots: [Tools/screenshots/README.md](Tools/screenshots/README.md) has the
+  whole procedure, including scripts for the photos, simulators and framing.
+- A newly used required-reason API (`UserDefaults`, file timestamps, disk space, boot time…)
+  needs an entry in `BiscuitTin/PrivacyInfo.xcprivacy`, or App Review rejects the
+  submission.
 
 ## Conventions
 

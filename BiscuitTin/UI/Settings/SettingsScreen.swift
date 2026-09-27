@@ -41,7 +41,7 @@ struct SettingsScreen: View {
             .confirmationDialog("Free up space?",
                                 isPresented: $viewModel.showsFreeUpSpaceConfirmation,
                                 titleVisibility: .visible) {
-                Button("Remove \(viewModel.freeUpSpacePlan.count) Items From iPhone",
+                Button("Remove \(viewModel.freeUpSpacePlan.count) Items From \(DeviceName.current)",
                        role: .destructive) {
                     viewModel.performFreeUpSpace()
                 }
@@ -107,7 +107,7 @@ struct SettingsScreen: View {
             Text("Immich Server")
         } footer: {
             if !viewModel.isSignedIn {
-                Text("Optional. Biscuit Tin works fully offline with just the photos on this iPhone.")
+                Text("Optional. Biscuit Tin works fully offline with just the photos on this \(DeviceName.current).")
             }
         }
     }
@@ -136,7 +136,7 @@ struct SettingsScreen: View {
     @ViewBuilder
     private var syncSection: some View {
         Section {
-            Toggle("Back Up This iPhone", isOn: Binding(
+            Toggle("Back Up This \(DeviceName.current)", isOn: Binding(
                 get: { viewModel.syncEnabled },
                 set: { viewModel.setSyncEnabled($0) }))
 
@@ -161,7 +161,7 @@ struct SettingsScreen: View {
         } header: {
             Text("Backup")
         } footer: {
-            Text("Uploads photos and videos from this iPhone to your Immich server.")
+            Text("Uploads photos and videos from this \(DeviceName.current) to your Immich server.")
         }
     }
 
@@ -200,7 +200,7 @@ struct SettingsScreen: View {
         } header: {
             Text("Storage")
         } footer: {
-            Text("Removes these items from this iPhone only. They stay on your Immich server "
+            Text("Removes these items from this \(DeviceName.current) only. They stay on your Immich server "
                  + "and remain browsable here.")
         }
     }
