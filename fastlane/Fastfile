@@ -1,0 +1,156 @@
+# Release automation. See "Releasing" in AGENTS.md.
+#
+# Both lanes authenticate with one App Store Connect API key, read from ASC_KEY_ID,
+# ASC_ISSUER_ID and ASC_KEY_PATH (the .p8 file). The key must have the Admin role: signing is
+# cloud-managed by xcodebuild, and App Manager keys cannot create distribution certificates.
+
+require "shellwords"
+
+default_platform(:ios)
+
+APP_ID = "com.davidsansome.biscuittin"
+
+# Ruby in this file runs with fastlane/ as the working directory, while actions resolve paths
+# against the repo root. Absolute paths avoid depending on which one a line is.
+ROOT = File.expand_path("..", __dir__)
+ARCHIVE = File.join(ROOT, "build/Release/BiscuitTin.xcarchive")
+
+# A build without these still archives and passes review, but has no search bar (AGENTS.md).
+BUNDLED_MODELS = %w[
+  mobileclip_s0_image.mlmodelc
+  mobileclip_s0_text.mlmodelc
+  clip_vocab.json
+  clip_merges.txt
+].freeze
+
+platform :ios do
+  private_lane :asc_api_key do
+    app_store_connect_api_key(
+      key_id: ENV.fetch("ASC_KEY_ID"),
+      issuer_id: ENV.fetch("ASC_ISSUER_ID"),
+      key_filepath: ENV.fetch("ASC_KEY_PATH")
+    )
+  end
+
+  desc "Archive with a fresh build number and upload it to TestFlight"
+  lane :beta do
+    api_key = asc_api_key
+    build_number = latest_testflight_build_number(api_key: api_key, initial_build_number: 0).to_i + 1
+
+    xcode_auth = [
+      "-allowProvisioningUpdates",
+      "-authenticationKeyPath", ENV.fetch("ASC_KEY_PATH"),
+      "-authenticationKeyID", ENV.fetch("ASC_KEY_ID"),
+      "-authenticationKeyIssuerID", ENV.fetch("ASC_ISSUER_ID")
+    ].shelljoin
+
+    build_app(
+      project: File.join(ROOT, "BiscuitTin.xcodeproj"),
+      scheme: "BiscuitTin",
+      configuration: "Release",
+      archive_path: ARCHIVE,
+      output_directory: File.join(ROOT, "build/Release"),
+      derived_data_path: File.join(ROOT, "build/DerivedData"),
+      cloned_source_packages_path: File.join(ROOT, "build/SourcePackages"),
+      xcargs: "#{xcode_auth} CURRENT_PROJECT_VERSION=#{build_number}",
+      export_xcargs: xcode_auth,
+      export_method: "app-store",
+      export_options: { signingStyle: "automatic", manageAppVersionAndBuildNumber: false }
+    )
+
+    app_bundle = Dir[File.join(ARCHIVE, "Products/Applications/*.app")].first
+    missing = BUNDLED_MODELS.reject { |name| File.exist?(File.join(app_bundle, name)) }
+    UI.user_error!("Not bundled: #{missing.join(', ')}. Run Tools/fetch_models.sh.") unless missing.empty?
+
+    upload_to_testflight(
+      api_key: api_key,
+      ipa: lane_context[SharedValues::IPA_OUTPUT_PATH],
+      # Internal testers need no review; their group's automatic distribution picks the build
+      # up once processing finishes, so there is nothing to wait for here.
+      skip_waiting_for_build_processing: true
+    )
+
+    sh("git", "-C", ROOT, "tag", "build/#{build_number}")
+    sh("git", "-C", ROOT, "push", "origin", "build/#{build_number}")
+  end
+
+  desc "Submit a TestFlight build for App Store review; it is released automatically once approved"
+  desc "Options: build:<number> (default: the latest processed build)"
+  lane :app_store do |options|
+    api_key = asc_api_key
+    app = Spaceship::ConnectAPI::App.find(APP_ID)
+
+    requested = options[:build].to_s.strip
+    build = if requested.empty?
+              Spaceship::ConnectAPI::Build.all(app_id: app.id, processing_states: "VALID", limit: 1).first
+            else
+              Spaceship::ConnectAPI::Build.all(app_id: app.id, build_number: requested, limit: 1).first
+            end
+    UI.user_error!("No TestFlight build #{requested.empty? ? 'has finished processing' : requested}") unless build
+    UI.user_error!("Build #{build.version} is #{build.processing_state}, not VALID") unless build.processing_state == "VALID"
+    UI.user_error!("Build #{build.version} has expired") if build.expired
+
+    version = build.app_version
+    UI.important("Submitting #{version} (#{build.version})")
+
+    # The binary is promoted as-is rather than rebuilt, so what ships is what testers ran.
+    deliver(
+      api_key: api_key,
+      app_version: version,
+      build_number: build.version,
+      # Ignored by deliver for an app's first version, which App Store Connect gives no notes.
+      release_notes: { "default" => File.read(File.join(ROOT, "fastlane/release_notes.txt")).strip },
+      skip_binary_upload: true,
+      skip_screenshots: true,
+      submit_for_review: true,
+      automatic_release: true,
+      # Re-running for the same version replaces a submission still waiting for review.
+      reject_if_possible: true,
+      submission_information: { add_id_info_uses_idfa: false },
+      run_precheck_before_submit: false,
+      force: true
+    )
+
+    tag_release(version: version, build_number: build.version)
+    bump_marketing_version(version: version)
+  end
+
+  # Tags the commit the submitted build came from. An existing tag is left alone: a re-run
+  # submits the same version again, and moving a published tag would rewrite history.
+  private_lane :tag_release do |options|
+    tag = "v#{options[:version]}"
+    if sh("git", "-C", ROOT, "tag", "--list", tag).strip == tag
+      UI.important("#{tag} already exists; leaving it where it is")
+      next
+    end
+
+    commit = sh("git", "-C", ROOT, "rev-parse", "--verify", "--quiet", "build/#{options[:build_number]}^{commit}",
+                error_callback: ->(_) {}).strip
+    if commit.empty?
+      UI.important("No build/#{options[:build_number]} tag, so #{tag} is not created")
+      next
+    end
+
+    sh("git", "-C", ROOT, "tag", tag, commit)
+    sh("git", "-C", ROOT, "push", "origin", tag)
+  end
+
+  # App Store Connect rejects uploads to a version once it has been approved, so after a
+  # submission TestFlight builds must move on to the next version or they stop uploading.
+  private_lane :bump_marketing_version do |options|
+    version = options[:version]
+    pbxproj = File.join(ROOT, "BiscuitTin.xcodeproj/project.pbxproj")
+    contents = File.read(pbxproj)
+    unless contents.include?("MARKETING_VERSION = #{version};")
+      UI.message("MARKETING_VERSION has already moved past #{version}")
+      next
+    end
+
+    major, minor = version.split(".").map(&:to_i)
+    next_version = "#{major}.#{minor.to_i + 1}"
+
+    File.write(pbxproj, contents.gsub("MARKETING_VERSION = #{version};", "MARKETING_VERSION = #{next_version};"))
+    sh("git", "-C", ROOT, "commit", "-m", "Start version #{next_version}", "--", pbxproj)
+    sh("git", "-C", ROOT, "push", "origin", "HEAD:main")
+  end
+end

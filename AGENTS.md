@@ -349,6 +349,28 @@ decoded images, memory-mapped files, a cold SQLite page cache.
 **A result that is too good is a bug in the measurement.** Reach for the ordering
 explanation before the flattering one.
 
+## Releasing
+
+- **TestFlight** (`.github/workflows/testflight.yml`): every push to `main` that passes CI is
+  archived, uploaded for internal testers and tagged `build/<N>`. Documentation-only pushes
+  are skipped. The build number is the latest TestFlight build number plus one, set at build
+  time and never committed; `CURRENT_PROJECT_VERSION = 1` in the project is only for local
+  builds.
+- **App Store** (`.github/workflows/appstore.yml`, run by hand): submits an existing TestFlight
+  build, not a rebuild, for review, and it is released automatically on approval. Update
+  `fastlane/release_notes.txt` first. The workflow tags `v<version>` and then commits the next
+  `MARKETING_VERSION` to `main`, because App Store Connect refuses uploads to a version once
+  it is approved.
+- Both run `fastlane` (`fastlane/Fastfile`) with one App Store Connect API key in the
+  `ASC_KEY_ID`, `ASC_ISSUER_ID` and `ASC_KEY_P8` secrets. It must have the **Admin** role:
+  signing is cloud-managed via `-allowProvisioningUpdates`, and nothing else holds a
+  distribution certificate.
+- The `beta` lane fails if the CLIP models are missing from the archived `.app`, rather than
+  shipping a build with no search bar.
+- A newly used required-reason API (`UserDefaults`, file timestamps, disk space, boot time…)
+  needs an entry in `BiscuitTin/PrivacyInfo.xcprivacy`, or App Review rejects the
+  submission.
+
 ## Conventions
 
 - Swift Concurrency throughout; `actor` or `@MainActor` types, no Combine except where UIKit
