@@ -3,11 +3,13 @@ import UIKit
 /// The viewer's bottom button bar (requirements 7 and 8).
 ///
 /// Semi-transparent with a vertical gradient — fully clear at the top, ~55 % black at the
-/// bottom — so it reads over any photo without hiding it. Back sits on the left; rotate left,
-/// rotate right, delete, share and info are grouped on the right.
+/// bottom — so it reads over any photo without hiding it. Back sits on the left; Live Text (only
+/// on photos with text in them), rotate left, rotate right, delete, share and info are grouped
+/// on the right.
 final class ViewerToolbar: UIView {
 
     var onBack: (() -> Void)?
+    var onLiveText: (() -> Void)?
     var onRotateLeft: (() -> Void)?
     var onRotateRight: (() -> Void)?
     var onDelete: (() -> Void)?
@@ -16,6 +18,7 @@ final class ViewerToolbar: UIView {
 
     private let gradientLayer = CAGradientLayer()
     private let backButton = UIButton(type: .system)
+    private let liveTextButton = UIButton(type: .system)
     private let rotateLeftButton = UIButton(type: .system)
     private let rotateRightButton = UIButton(type: .system)
     private let deleteButton = UIButton(type: .system)
@@ -38,6 +41,9 @@ final class ViewerToolbar: UIView {
 
         configure(backButton, systemName: "chevron.backward", action: #selector(backTapped),
                   accessibilityLabel: "Back")
+        configure(liveTextButton, systemName: "text.viewfinder", action: #selector(liveTextTapped),
+                  accessibilityLabel: "Live Text")
+        liveTextButton.isHidden = true
         configure(rotateLeftButton, systemName: "rotate.left", action: #selector(rotateLeftTapped),
                   accessibilityLabel: "Rotate left")
         configure(rotateRightButton, systemName: "rotate.right", action: #selector(rotateRightTapped),
@@ -53,7 +59,9 @@ final class ViewerToolbar: UIView {
         rightStack.spacing = 4
         rightStack.alignment = .center
         rightStack.translatesAutoresizingMaskIntoConstraints = false
-        [rotateLeftButton, rotateRightButton, deleteButton, shareButton, infoButton]
+        // Live Text first: it appears and disappears per photo, and at the leading end of a
+        // trailing-pinned stack that moves nothing else.
+        [liveTextButton, rotateLeftButton, rotateRightButton, deleteButton, shareButton, infoButton]
             .forEach(rightStack.addArrangedSubview)
 
         addSubview(backButton)
@@ -109,17 +117,29 @@ final class ViewerToolbar: UIView {
         }
     }
 
+    /// Shown only once the current photo's analysis has found text; filled while highlighted.
+    func setLiveText(available: Bool, highlighted: Bool) {
+        liveTextButton.isHidden = !available
+        guard var config = liveTextButton.configuration else { return }
+        config.background.backgroundColor = highlighted ? UIColor.white.withAlphaComponent(0.28) : .clear
+        config.background.cornerRadius = 10
+        liveTextButton.configuration = config
+        liveTextButton.accessibilityTraits = highlighted ? [.button, .selected] : .button
+    }
+
     /// Touches only count inside the actual controls; the gradient area above them stays
     /// transparent to taps so the chrome toggle keeps working there.
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
-        for control in [backButton, rotateLeftButton, rotateRightButton, deleteButton, shareButton, infoButton]
-        where control.isEnabled && control.frame.contains(convert(point, to: control.superview)) {
+        for control in [backButton, liveTextButton, rotateLeftButton, rotateRightButton, deleteButton,
+                        shareButton, infoButton]
+        where control.isEnabled && !control.isHidden && control.frame.contains(convert(point, to: control.superview)) {
             return true
         }
         return false
     }
 
     @objc private func backTapped() { onBack?() }
+    @objc private func liveTextTapped() { onLiveText?() }
     @objc private func rotateLeftTapped() { onRotateLeft?() }
     @objc private func rotateRightTapped() { onRotateRight?() }
     @objc private func deleteTapped() { onDelete?() }

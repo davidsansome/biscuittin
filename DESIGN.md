@@ -101,6 +101,7 @@ downstream assumes them as written.
 | **D22** | Search model & packaging | **MobileCLIP-S0** CoreML pair (image + text encoder, ~110 MB fp16, 512-dim) from Apple's official `apple/coreml-mobileclip` release, fetched at build time by a `Tools/fetch_models.sh` script (not committed to git) and bundled into the app; CLIP BPE tokenizer implemented in Swift with the vocab bundled. Every embedding row records `model_version`; a model upgrade triggers a staged re-embed. | S0's zero-shot quality ≈ OpenAI ViT-B/16 — *better* than the server's default ViT-B-32 — at a fraction of the latency. Matching the server's exact model buys nothing (embeddings never cross the wire, D21). MobileCLIP2 or S2 are drop-in upgrades behind `model_version` if quality disappoints; decided by measurement, not up front. |
 | **D23** | Embedding store & query path | Embeddings live in a GRDB table keyed by `AssetID.raw`: 512-dim **fp16 blobs** (1 KB/asset). Queries run as a **brute-force cosine scan** via Accelerate in chunks, returning the **top-K (200) ranked** — no similarity threshold, no ANN index. | At 100k assets a full scan is ~50M multiply-adds — milliseconds on any supported device — and fp16 keeps 100k assets ≈ 100 MB on disk, ~1 MB per 1k in the scan cache. CLIP thresholds are notoriously model- and query-dependent; ranking (as Immich itself does) sidesteps tuning. ANN adds build/update complexity that nothing below ~1M vectors needs. |
 | **D24** | Map data path | Capture coordinates live **on `AssetStub`** (two `Float`s, `.nan` for absent) rather than being fetched per asset: filtering by map region is then an in-memory scan over the timeline index. Remote coordinates are promoted from `exif_json` into `latitude`/`longitude` columns on `remote_assets`. Boot cache goes to format v2. | Filtering must keep up with a pan, which rules out a query per map move. Measured first (§20.1): reading `PHAsset.location` during enumeration costs nothing, and 88 % of a real library carries coordinates — the two facts that made carrying them in the stub viable. `Float` gives ~1 m resolution, far finer than a dot needs, and `.nan` encodes absence without a tag byte. Alternative rejected: a separate lazily-populated location table, which is the shape M10's embeddings need but is pure overhead when the source data is already free to read.
+| **D25** | Text in photos (Live Text) | **VisionKit `ImageAnalyzer` + `ImageAnalysisInteraction`** on the viewer's zooming image view. Analysis runs on-device, only for the page the user has settled on, from the first full-quality rendition (the screen-sized preview, normally). VisionKit's own corner button is hidden; a `text.viewfinder` toolbar button appears when the photo has text and toggles highlight mode. Long-press selection works without it. | It is the system Live Text: OCR plus selection handles, Copy, Look Up, Translate and data detectors, with no dependency and no model to ship (D4/D13). Alternatives rejected: Vision `VNRecognizeTextRequest` (OCR only, so the selection UI would have to be rebuilt by hand; still the right tool for any future text *search*, §19.7), Google ML Kit (closed binary, CocoaPods only, no UI), Tesseract (poor on text in ordinary photos). Unsupported below A12, where the button never appears. |
 ---
 
 ## 4. High-Level Architecture
@@ -764,13 +765,21 @@ disabled. Tapping opens Settings. `out_of_scope` assets do **not** count as
   the video controls, when on a video page). The toolbar is a bottom overlay with
   a `CAGradientLayer` background — clear at top → ~55 % black at bottom — content
   inset for the home indicator.
-- **Toolbar layout** (req. 8): `[ back ]  ···spacer···  [ rotate.left ] [ rotate.right ] [ trash ] [ info.circle ]`
+- **Toolbar layout** (req. 8): `[ back ]  ···spacer···  [ text.viewfinder ] [ rotate.left ] [ rotate.right ] [ trash ] [ info.circle ]`
   (SF Symbols, white, 44 pt targets). Rotate buttons are disabled (dimmed) on
   pages whose kind has no rotator yet (video/Live Photo until M9).
 - Delete from viewer: after confirmation (per D11 — deletes locally **and** on the
   server), advance to the next asset, or dismiss if it was the last one.
 - Rotate from viewer: optimistic UI — rotate the displayed image immediately with
   a short animation, then run the real edit; on failure, revert + toast.
+- **Live Text** (D25): once a photo page is current and has a full-quality
+  rendition, VisionKit analyses it on-device. If it finds text, the
+  `text.viewfinder` button appears; tapping it highlights selectable text.
+  Long-press selects text either way, with the system Copy / Look Up / Translate
+  menu. Paging away cancels an in-flight analysis and clears the selection. While
+  text is selected, horizontal paging is disabled and a tap clears the selection
+  rather than toggling the chrome. While text is selected or highlighted, the
+  swipe-down dismissal is off, so dragging a selection handle can't page or dismiss.
 
 ### 13.3 Info sheet (req. 9)
 SwiftUI `.sheet` with medium/large detents. Sections: **File** (filename, date/time,
@@ -1228,6 +1237,23 @@ dots at the edges. The grid still lists every photo in the region.
 ---
 
 ## 21. Implementation Log
+
+### Live Text in the viewer (2026-09-27)
+
+D25. Written and pushed without a build: the session ran on Linux, with no Xcode or
+simulator. Before trusting it, check on a real device:
+
+- It compiles. The VisionKit calls used are `ImageAnalyzer.isSupported`, `analyze(_:configuration:)`,
+  `ImageAnalysis.hasResults(for:)`, and on `ImageAnalysisInteraction`: `analysis`,
+  `selectableItemsHighlighted`, `hasActiveTextSelection`, `hasInteractiveItem(at:)`,
+  `resetTextSelection()` (iOS 17), `isSupplementaryInterfaceHidden`,
+  `setContentsRectNeedsUpdate()`. Delegate methods: `presentingViewController(for:)`,
+  `interaction(_:highlightSelectedItemsDidChange:)`, `textSelectionDidChange(_:)` (iOS 17).
+- Highlights and selection line up with the photo **while zoomed**. The interaction is on the
+  image view that `UIScrollView` transforms, and each rendition swap refreshes its contents rect.
+- Gestures: the chrome tap, double-tap zoom, and dragging selection handles don't fight VisionKit's own recognizers.
+- Whether the simulator supports `ImageAnalyzer` at all. If it doesn't, the button never
+  appears there. That means the simulator doesn't support it; it's not a bug.
 
 
 ### A "queued retry" that DESIGN.md described but nothing implemented (2026-09-23)
