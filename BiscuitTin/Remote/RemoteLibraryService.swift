@@ -362,10 +362,10 @@ actor RemoteLibraryService {
     /// Caveat worth knowing: the rotated copy is a *new* asset id, so server-side album
     /// membership, favourites and ratings for that photo do not carry over.
     func rotateRemote(immichID: String, clockwise: Bool, rotator: any AssetRotator) async throws {
-        guard let record = try record(for: immichID) else { throw ImmichError.notConfigured }
+        let client = try makeClient()
+        let record = try await remoteRecord(for: immichID, client: client)
         let filename = record.fileName ?? "\(immichID).jpg"
 
-        let client = try makeClient()
         let data = try await client.originalData(id: immichID)
         let downloaded = FileManager.default.temporaryDirectory
             .appendingPathComponent("remote-rotate-\(UUID().uuidString)-\(filename)")
@@ -378,6 +378,18 @@ actor RemoteLibraryService {
         try await replaceRemoteFile(oldID: immichID, fileURL: rotated, filename: filename, record: record)
     }
 
+    /// The cached row for `immichID`, or the server's own description of the asset when there
+    /// is none yet.
+    ///
+    /// A photo this device has just uploaded is linked in `facet_links` straight away, so the
+    /// timeline shows it as on the server, but its `remote_assets` row only arrives with the
+    /// next sync stream — which runs on launch, foreground and pull-to-refresh, not after an
+    /// upload. Requiring the cached row made every rotation in that window fail its server leg.
+    func remoteRecord(for immichID: String, client: ImmichClient) async throws -> RemoteAssetRecord {
+        if let cached = try record(for: immichID) { return cached }
+        return RemoteAssetRecord(try await client.assetInfo(id: immichID))
+    }
+
     /// Uploads `fileURL` as `oldID`'s replacement, retires the original, and repoints local
     /// state to the new id. Shared by `rotateRemote` (rotate the remote's own download) and
     /// `reconcileFromLocalFacet` (push a local edit's current rendition) — both end the same
@@ -385,7 +397,8 @@ actor RemoteLibraryService {
     /// replacement is stored.
     private func replaceRemoteFile(oldID: String, fileURL: URL, filename: String,
                                    record: RemoteAssetRecord,
-                                   width: Int? = nil, height: Int? = nil) async throws {
+                                   width: Int? = nil, height: Int? = nil,
+                                   checksumHex: String? = nil) async throws {
         let client = try makeClient()
         let captured = Date(timeIntervalSince1970: record.captureAt)
         let newID = try await client.uploadReplacement(fileURL: fileURL,
@@ -402,7 +415,8 @@ actor RemoteLibraryService {
         // Only trash the original once the replacement is safely stored.
         try await client.deleteAssets(ids: [oldID])
 
-        try await repointAfterRotation(oldID: oldID, newID: newID, record: record, width: width, height: height)
+        try await repointAfterRotation(oldID: oldID, newID: newID, record: record,
+                                       width: width, height: height, checksumHex: checksumHex)
     }
 
     /// Swaps the rotated asset in for the old one locally, so the grid updates without waiting
@@ -416,11 +430,15 @@ actor RemoteLibraryService {
                                       newID: String,
                                       record: RemoteAssetRecord,
                                       width: Int? = nil,
-                                      height: Int? = nil) async throws {
+                                      height: Int? = nil,
+                                      checksumHex: String? = nil) async throws {
         let writer = try database.writer()
         try await writer.write { db in
             var rotated = record
             rotated.immichID = newID
+            // Known when the uploaded bytes were hashed here, and lets a repeated reconcile of
+            // the same rendition see that there is nothing left to push.
+            if let checksumHex { rotated.checksumHex = checksumHex }
             // The checksum changed and the next sync will replace this row with the server's
             // authoritative copy anyway — this is an optimistic bridge until then.
             rotated.width = width ?? record.height
@@ -531,6 +549,13 @@ actor RemoteLibraryService {
                                     editType: .rotation, mediaKind: mediaKind, payload: payload)
     }
 
+    /// Queues a push of the local rendition for an asset whose upload finished after it was
+    /// edited — the server holds the pre-edit bytes, and nothing else would ever correct them.
+    func enqueueLocalReconcile(localIdentifier: String, immichID: String, mediaKind: MediaKind) async throws {
+        try await upsertPendingEdit(localIdentifier: localIdentifier, immichID: immichID,
+                                    editType: .rotation, mediaKind: mediaKind, payload: nil)
+    }
+
     private func upsertPendingEdit(localIdentifier: String?,
                                    immichID: String,
                                    editType: PendingEditRecord.EditType,
@@ -626,16 +651,22 @@ actor RemoteLibraryService {
         guard let phAsset = resolver.resolve(localIdentifier) else {
             return   // Local asset is gone; nothing left to push. Not an error — just moot.
         }
-        guard let immichID = try immichID(forLocalIdentifier: localIdentifier),
-              let record = try record(for: immichID) else {
+        guard let immichID = try immichID(forLocalIdentifier: localIdentifier) else {
             return   // No remote facet either (any more); same as above.
         }
+        let record = try await remoteRecord(for: immichID, client: try makeClient())
 
         let export = try await exporter.export(asset: phAsset)
         defer { try? FileManager.default.removeItem(at: export.fileURL) }
 
+        // Already in step. An edit queued by `SyncEngine` after an upload is a guess from a
+        // moved modification date, which PhotoKit also moves for changes that leave the bytes
+        // alone; replacing anyway would cost a new asset id for nothing.
+        guard export.sha1Hex != record.checksumHex else { return }
+
         try await replaceRemoteFile(oldID: immichID, fileURL: export.fileURL, filename: export.filename,
-                                    record: record, width: phAsset.pixelWidth, height: phAsset.pixelHeight)
+                                    record: record, width: phAsset.pixelWidth, height: phAsset.pixelHeight,
+                                    checksumHex: export.sha1Hex)
     }
 
     private func clearPendingEdit(id: Int64?) async throws {

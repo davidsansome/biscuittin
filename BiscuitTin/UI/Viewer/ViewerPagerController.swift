@@ -398,13 +398,18 @@ final class ViewerPagerController: UIViewController {
                 Log.device("ui", "rotate skipped \(skipped.raw): no rotator for its media kind")
             }
 
-            guard !outcome.succeeded.isEmpty else {
+            // A server-only failure still rotated the photo on this device, so the preview must
+            // stand; reverting it showed the old orientation for an edit that had landed.
+            guard !outcome.succeeded.isEmpty || !outcome.partiallySucceeded.isEmpty else {
                 self.currentCell()?.revertPreviewRotation()
                 let message = Toast.message(for: outcome, verb: "rotated")
                     ?? outcome.firstError?.localizedDescription
                     ?? "Rotation failed."
                 Toast.show(message, in: self.view)
                 return
+            }
+            if let message = Toast.message(for: outcome, verb: "rotated") {
+                Toast.show(message, in: self.view)
             }
             // The real rendition has different dimensions; reload the page so it re-fits.
             self.reloadCurrentPageAfterEdit()

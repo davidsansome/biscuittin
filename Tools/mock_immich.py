@@ -14,11 +14,19 @@ app.immich callback, checking state and the PKCE S256 challenge on the way back
 exactly as the real server does. `--no-password-login` and `--oauth-auto-launch`
 mirror the matching admin settings.
 
+Uploads are remembered, so `GET /api/assets/{id}` describes them the way a real
+server does. `--upload-delay` holds each upload's response back, which keeps the
+window between export and link open long enough to edit the photo by hand;
+`--save-uploads DIR` writes each uploaded file there, to inspect what arrived.
+
 Test credentials: MOCK_EMAIL / MOCK_PASSWORD, or API key MOCK_API_KEY.
 """
 
 import argparse
+import os
+import re
 import secrets
+import time
 
 import base64
 import hashlib
@@ -132,6 +140,28 @@ REQUEST_LOG = []
 # checksum -> server asset id, so bulk-upload-check can report duplicates
 UPLOADED_CHECKSUMS = {}
 UPLOAD_COUNT = []
+# server asset id -> AssetResponseDto, for GET /api/assets/{id}
+UPLOADED_ASSETS = {}
+UPLOAD_DELAY = 0.0
+SAVE_UPLOADS = None
+
+
+def multipart_parts(raw):
+    """(fields, filename, file bytes) from a multipart/form-data body."""
+    boundary = raw.split(b"\r\n", 1)[0]
+    fields, filename, data = {}, None, b""
+    for part in raw.split(boundary)[1:]:
+        if part.startswith(b"--"):
+            break
+        head, _, body = part.partition(b"\r\n\r\n")
+        body = body[:-2] if body.endswith(b"\r\n") else body
+        name = re.search(rb'name="([^"]*)"', head)
+        file_match = re.search(rb'filename="([^"]*)"', head)
+        if file_match:
+            filename, data = file_match.group(1).decode(), body
+        elif name:
+            fields[name.group(1).decode()] = body.decode(errors="replace")
+    return fields, filename, data
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -141,7 +171,7 @@ class Handler(BaseHTTPRequestHandler):
         pass  # keep stdout for our own summary
 
     def _send(self, code, payload, content_type="application/json"):
-        body = json.dumps(payload).encode() if content_type == "application/json" else payload
+        body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -209,6 +239,15 @@ class Handler(BaseHTTPRequestHandler):
             if not self._authorized():
                 return self._send(401, {"message": "unauthorized"})
             return self._send(200, {"id": "user-1", "email": "dave@example.com", "name": "Dave"})
+
+        if path.startswith("/api/assets/") and path.count("/") == 3:
+            if not self._authorized():
+                return self._send(401, {"message": "unauthorized"})
+            asset = UPLOADED_ASSETS.get(path.split("/")[3]) \
+                or next((a for a in ASSETS if a["id"] == path.split("/")[3]), None)
+            if asset is None:
+                return self._send(404, {"message": "Asset not found"})
+            return self._send(200, asset)
 
         if path.startswith("/api/assets/") and path.endswith("/thumbnail"):
             if not self._authorized():
@@ -298,11 +337,44 @@ class Handler(BaseHTTPRequestHandler):
             if not self._authorized():
                 return self._send(401, {"message": "unauthorized"})
             checksum = self.headers.get("x-immich-checksum", "")
-            new_id = f"uploaded-{len(UPLOADED_CHECKSUMS):04d}"
+            if checksum in UPLOADED_CHECKSUMS:
+                # As the real server does: the same bytes again are a duplicate of the asset
+                # already holding them, not a second asset.
+                existing = UPLOADED_CHECKSUMS[checksum]
+                print(f"  UPLOAD duplicate of {existing}", flush=True)
+                return self._send(200, {"id": existing, "status": "duplicate"})
+            new_id = f"uploaded-{len(UPLOAD_COUNT):04d}"
             UPLOADED_CHECKSUMS[checksum] = new_id
             UPLOAD_COUNT.append(new_id)
-            print(f"  UPLOAD #{len(UPLOAD_COUNT)} checksum={checksum[:16]}... "
-                  f"bytes={len(raw)}", flush=True)
+            fields, filename, data = multipart_parts(raw)
+            now = datetime.now(timezone.utc).isoformat()
+            UPLOADED_ASSETS[new_id] = {
+                "id": new_id,
+                "type": "VIDEO" if (filename or "").lower().endswith((".mov", ".mp4")) else "IMAGE",
+                "originalFileName": filename,
+                # Base64, as the real server reports it; the upload header carries hex.
+                "checksum": base64.b64encode(bytes.fromhex(checksum)).decode() if checksum else None,
+                "fileCreatedAt": fields.get("fileCreatedAt"),
+                "fileModifiedAt": fields.get("fileModifiedAt"),
+                "localDateTime": fields.get("fileCreatedAt"),
+                "updatedAt": now,
+                # Metadata extraction has not run on a just-uploaded asset.
+                "width": None,
+                "height": None,
+                "duration": None,
+                "isTrashed": False,
+                "isOffline": False,
+                "livePhotoVideoId": None,
+                "exifInfo": None,
+            }
+            if SAVE_UPLOADS and filename:
+                with open(os.path.join(SAVE_UPLOADS, f"{new_id}-{filename}"), "wb") as f:
+                    f.write(data)
+            print(f"  UPLOAD #{len(UPLOAD_COUNT)} {new_id} {filename} checksum={checksum[:16]}... "
+                  f"bytes={len(data)}", flush=True)
+            if UPLOAD_DELAY:
+                print(f"  holding the response for {UPLOAD_DELAY:g}s", flush=True)
+                time.sleep(UPLOAD_DELAY)
             return self._send(201, {"id": new_id, "status": "created"})
 
         if path == "/api/search/metadata":
@@ -323,9 +395,24 @@ class Handler(BaseHTTPRequestHandler):
 
         return self._send(404, {"message": "not found"})
 
+    def do_PUT(self):
+        path = self.path.split("?")[0]
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length) if length else b"{}"
+        REQUEST_LOG.append(("PUT", path))
+        print(f"PUT  {path}  body={raw[:120]!r}", flush=True)
+        if not self._authorized():
+            return self._send(401, {"message": "Authentication required"})
+        asset = UPLOADED_ASSETS.get(path.split("/")[-1])
+        if asset is None:
+            return self._send(404, {"message": "Asset not found"})
+        return self._send(200, asset)
+
     def do_DELETE(self):
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length) if length else b""
         REQUEST_LOG.append(("DELETE", self.path))
-        print(f"DELETE {self.path}", flush=True)
+        print(f"DELETE {self.path}  body={raw[:120]!r}", flush=True)
         if not self._authorized():
             return self._send(401, {"message": "Authentication required"})
         return self._send(204, b"", content_type="application/json")
@@ -342,7 +429,13 @@ if __name__ == "__main__":
                         help="listen port; a real server's default is 2283")
     parser.add_argument("--no-assets", action="store_true",
                         help="serve an empty library, so no synthetic tiles join the grid")
+    parser.add_argument("--upload-delay", type=float, default=0,
+                        help="seconds to hold each upload's response")
+    parser.add_argument("--save-uploads", metavar="DIR",
+                        help="write each uploaded file into DIR")
     args = parser.parse_args()
+    UPLOAD_DELAY = args.upload_delay
+    SAVE_UPLOADS = args.save_uploads
     PORT = args.port
     if args.no_assets:
         ASSETS = []
