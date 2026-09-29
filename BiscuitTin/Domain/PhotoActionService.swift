@@ -20,6 +20,9 @@ struct ActionOutcome {
     var failures: [(id: AssetID, error: Error)] = []
     /// Rotate only: kinds with no registered rotator yet (D10).
     var skippedUnsupported: [AssetID] = []
+    /// Rotate only: the local copy was rotated but the server copy was not. These are also in
+    /// `failures`, so the toast still reports them, but what is on screen did change.
+    var partiallySucceeded: [AssetID] = []
 
     var isCompleteSuccess: Bool { failures.isEmpty && skippedUnsupported.isEmpty }
     var firstError: Error? { failures.first?.error }
@@ -142,28 +145,30 @@ actor PhotoActionService {
         for (id, error) in results {
             if let error {
                 outcome.failures.append((id, error))
+                guard error is PartialRotationError else { continue }
+                outcome.partiallySucceeded.append(id)
             } else {
                 outcome.succeeded.append(id)
-                if let stub = await timelineStore.asset(for: id)?.stub {
-                    // Dimensions swap on a quarter turn; publishing the updated stub keeps grid
-                    // tiles and the viewer's aspect-fit correct without a full rebuild.
-                    rotatedStubs.append(AssetStub(id: stub.id,
-                                                  captureDate: stub.captureDate,
-                                                  hasLocal: stub.hasLocal,
-                                                  hasRemote: stub.hasRemote,
-                                                  kind: stub.kind,
-                                                  durationSeconds: stub.durationSeconds,
-                                                  pixelWidth: stub.pixelHeight,
-                                                  pixelHeight: stub.pixelWidth,
-                                                  latitude: stub.latitude,
-                                                  longitude: stub.longitude))
-                }
+            }
+            if let stub = await timelineStore.asset(for: id)?.stub {
+                // Dimensions swap on a quarter turn; publishing the updated stub keeps grid
+                // tiles and the viewer's aspect-fit correct without a full rebuild.
+                rotatedStubs.append(AssetStub(id: stub.id,
+                                              captureDate: stub.captureDate,
+                                              hasLocal: stub.hasLocal,
+                                              hasRemote: stub.hasRemote,
+                                              kind: stub.kind,
+                                              durationSeconds: stub.durationSeconds,
+                                              pixelWidth: stub.pixelHeight,
+                                              pixelHeight: stub.pixelWidth,
+                                              latitude: stub.latitude,
+                                              longitude: stub.longitude))
             }
         }
 
         // Invalidate *before* publishing: the update makes the grid reconfigure those cells
         // immediately, and they must not re-request through a cached pre-edit PHAsset.
-        invalidateCaches(for: outcome.succeeded)
+        invalidateCaches(for: outcome.succeeded + outcome.partiallySucceeded)
         if !rotatedStubs.isEmpty {
             await timelineStore.applyChange(.update(rotatedStubs))
         }
@@ -186,7 +191,16 @@ actor PhotoActionService {
             rotatedSomething = true
         }
 
-        if let immichID = asset.immichID, let remoteLibrary {
+        // Looked up again *after* the local edit: a photo whose upload has just finished is
+        // linked in `facet_links` before the timeline marks it as on the server, so the resolved
+        // asset can lack an Immich id it already has. Asking only now means an upload that links
+        // later has already seen this edit, and `SyncEngine` pushes it (D22).
+        var immichID = asset.immichID
+        if immichID == nil, let localIdentifier = asset.localIdentifier, let remoteLibrary {
+            immichID = try? await remoteLibrary.immichID(forLocalIdentifier: localIdentifier)
+        }
+
+        if let immichID, let remoteLibrary {
             do {
                 try await remoteLibrary.rotateRemote(immichID: immichID,
                                                      clockwise: clockwise,

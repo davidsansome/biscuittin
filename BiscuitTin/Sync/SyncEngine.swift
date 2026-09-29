@@ -45,6 +45,8 @@ actor SyncEngine {
 
     private var isRunning = false
     private var uploadsInFlight = 0
+    /// Set when an upload landed bytes older than the asset it came from; see `upload`.
+    private var queuedEditDuringUpload = false
 
     init(database: AppDatabase,
          session: ImmichAuthSession,
@@ -142,6 +144,13 @@ actor SyncEngine {
 
                 let after = try await outstandingCount()
                 if after >= before { break }   // no progress this round: stop rather than spin
+            }
+
+            // Straight away rather than on the next foreground: the server was reachable a
+            // moment ago, and until this runs it shows the photo as it was before the edit.
+            if queuedEditDuringUpload {
+                queuedEditDuringUpload = false
+                await remoteLibrary.retryPendingEdits()
             }
         } catch is CancellationError {
             // Leave state as-is; the next kick resumes.
@@ -316,6 +325,7 @@ actor SyncEngine {
     private func upload(asset: PHAsset, identifier: String, client: ImmichClient) async -> Bool {
         do {
             try await mark(identifier, state: .uploading, error: nil)
+            let modifiedBeforeExport = asset.modificationDate
             let export = try await exporter.export(asset: asset)
             defer { try? FileManager.default.removeItem(at: export.fileURL) }
 
@@ -344,6 +354,8 @@ actor SyncEngine {
                             immich_id = excluded.immich_id
                         """, arguments: [export.sha1Hex, identifier, remoteID])
                 }
+                await queueReconcileIfEdited(identifier: identifier, immichID: remoteID,
+                                             kind: AssetStub(asset).kind, since: modifiedBeforeExport)
             }
             Log.sync.info("Uploaded \(export.filename, privacy: .public) (\(export.byteCount) bytes)")
             return response?.id != nil
@@ -353,6 +365,32 @@ actor SyncEngine {
             try? await bumpFailure(identifier, error: error.localizedDescription)
         }
         return false
+    }
+
+    /// Catches an edit made while the upload was in flight, such as a rotation from the viewer.
+    ///
+    /// The export was taken before the edit, so the server now holds the old rendition. The
+    /// edit itself had no server leg to run — the asset was not linked yet — and an uploaded
+    /// asset is never uploaded again, so without this the two copies would stay different for
+    /// good. Checked only after the link is written: an edit from then on finds the link and
+    /// updates the server itself (`PhotoActionService.rotateOne`).
+    ///
+    /// Never throws: the upload itself succeeded, and failing it here would send it round again.
+    private func queueReconcileIfEdited(identifier: String, immichID: String,
+                                        kind: MediaKind, since baseline: Date?) async {
+        // Fetched afresh: the resolver's cached `PHAsset` is a snapshot from before the edit.
+        guard let current = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
+                .firstObject?.modificationDate,
+              baseline.map({ current > $0 }) ?? true else { return }
+
+        Log.sync.info("\(identifier, privacy: .public) changed during its upload; queueing a server update")
+        do {
+            try await remoteLibrary.enqueueLocalReconcile(localIdentifier: identifier, immichID: immichID,
+                                                          mediaKind: kind)
+            queuedEditDuringUpload = true
+        } catch {
+            Log.sync.error("Couldn't queue a server update: \(error.localizedDescription, privacy: .public)")
+        }
     }
 
     // MARK: - State helpers
