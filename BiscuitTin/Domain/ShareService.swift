@@ -19,8 +19,9 @@ import Photos
 ///
 /// A remote-only image fetches the full-resolution rendition and shares the decoded `UIImage`
 /// instead — a concrete image type every share target already understands. Remote-only video
-/// isn't shareable yet — `VideoPlaybackProvider` has no client for Immich's `/video/playback`
-/// endpoint (§10.1, M5 note), so there is nothing to share.
+/// isn't shareable yet. Playback streams it, but sharing needs the whole file, and
+/// `ImmichClient.originalData` holds an original in memory, which a multi-gigabyte video
+/// cannot afford. It needs a download to disk first.
 actor ShareService {
     enum ShareError: Error, LocalizedError {
         case remoteVideoUnsupported

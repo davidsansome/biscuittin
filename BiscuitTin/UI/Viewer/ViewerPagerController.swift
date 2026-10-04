@@ -51,7 +51,8 @@ final class ViewerPagerController: UIViewController {
         self.env = env
         self.library = library
         self.metadataService = MetadataService(resolver: env.assetResolver)
-        self.videoProvider = VideoPlaybackProvider(resolver: env.assetResolver)
+        self.videoProvider = VideoPlaybackProvider(resolver: env.assetResolver,
+                                                    session: env.immichSession)
         self.items = items
         self.currentIndex = max(0, min(startIndex, max(0, items.count - 1)))
         self.transitionSource = source

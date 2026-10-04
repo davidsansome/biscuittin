@@ -1304,8 +1304,6 @@ one.
 ### 22.4 Not built
 
 - Partner photos in the main timeline (`inTimeline`), described in §22.1.
-- Playing a partner's videos. Remote-only video playback is not implemented for anyone yet
-  (`VideoPlaybackProvider`, §10.1).
 - Avatars. `UserV1` carries `hasProfileImage`, but the button and menu use SF Symbols.
 
 **Not yet verified against a real server with a partner share.** The line shapes and ack
@@ -1322,8 +1320,38 @@ assumptions (AGENTS.md).
 Built as described in §22, which is placed before this log so that the log stays last.
 `Tools/mock_immich.py` now models the partner part of `sync/stream`: `--partners N` sets how
 many partners share with the user, plus one share in the other direction that the app must
-ignore. Acks are kept per checkpoint, and sync refuses API keys as the real server does. The
-mock still does not model the user's own asset stream.
+ignore. Acks are kept per checkpoint, and sync refuses API keys as the real server does.
+### Remote video playback (2026-10-04)
+
+Before this change, a video that existed only on the server could not play. §10.1 planned
+the playback path and `ImmichClient` already had `playbackURL(id:)` and `playbackHeaders()`,
+but `VideoPlaybackProvider` never used them. It threw for every remote-only video, and the
+viewer said "This video isn't available."
+
+It now builds an `AVURLAsset` on `/api/assets/{id}/video/playback` and passes the credential
+in the `AVURLAssetHTTPHeaderFieldsKey` option. That one mechanism covers both session tokens
+and API keys, and AVFoundation sends the headers on every range request it makes. The key is
+not among AVFoundation's published constants. Two public alternatives were rejected:
+- **Query parameters.** Immich accepts `sessionKey`/`apiKey` this way, but it writes the
+  secret into server and proxy access logs.
+- **`AVURLAssetHTTPCookiesKey`.** It works for the `immich_access_token` cookie, but API keys
+  have no cookie form.
+
+A resource-loader delegate would avoid private keys entirely, but it would proxy every byte
+through the app.
+
+The asset's `isPlayable` is loaded before the item is handed to the player. Without that, an
+unreachable server or a rejected credential left the page on a spinner forever; now it shows
+the page's error message.
+
+Verified in the simulator against `Tools/mock_immich.py`. The mock now sends its synthetic
+assets through `sync/stream` and serves a real H.264 clip with HTTP range support. The 37 s
+clip played with every range request authenticated; the same request without the header gets a
+401. With the mock stopped, the page showed the error message. **Not yet run against a real
+server.**
+
+Sharing a remote-only video is still unsupported. It needs the whole file, and
+`ImmichClient.originalData` holds an original in memory, so it needs a download to disk first.
 
 
 ### Sign-out drops server assets (2026-09-27)
