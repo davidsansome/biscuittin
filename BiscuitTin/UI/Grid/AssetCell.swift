@@ -49,12 +49,15 @@ final class AssetCell: UICollectionViewCell {
         setSelected(false, animated: false)
     }
 
-    func configure(stub: AssetStub, loader: ImageLoader, tileSize: CGSize, isSelected: Bool) {
+    /// - Parameter showsCloudBadge: false where every tile is a server photo — a partner's
+    ///   library (§22) — so the badge would mark everything and distinguish nothing.
+    func configure(stub: AssetStub, loader: ImageLoader, tileSize: CGSize, isSelected: Bool,
+                   showsCloudBadge: Bool = true) {
         self.loader = loader
         representedID = stub.id
 
         setVideoChrome(visible: stub.kind == .video, duration: stub.durationSeconds)
-        setCloudBadge(visible: stub.isRemoteOnly)
+        setCloudBadge(visible: showsCloudBadge && stub.isRemoteOnly)
         setSelected(isSelected, animated: false)
 
         let scale = traitCollection.displayScale > 0 ? traitCollection.displayScale : 2

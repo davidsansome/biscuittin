@@ -8,13 +8,13 @@ final class InfoViewModel: ObservableObject {
     @Published private(set) var isLoading = true
 
     private let stub: AssetStub
-    private let timelineStore: TimelineStore
+    private let resolveAsset: () async -> Asset?
     private let metadataService: MetadataService
     private var loadTask: Task<Void, Never>?
 
-    init(stub: AssetStub, timelineStore: TimelineStore, metadataService: MetadataService) {
+    init(stub: AssetStub, resolveAsset: @escaping () async -> Asset?, metadataService: MetadataService) {
         self.stub = stub
-        self.timelineStore = timelineStore
+        self.resolveAsset = resolveAsset
         self.metadataService = metadataService
         self.metadata = AssetMetadata(stub: stub)
     }
@@ -25,7 +25,7 @@ final class InfoViewModel: ObservableObject {
         guard loadTask == nil else { return }
         loadTask = Task { [weak self] in
             guard let self else { return }
-            guard let asset = await self.timelineStore.asset(for: self.stub.id) else {
+            guard let asset = await self.resolveAsset() else {
                 self.isLoading = false
                 return
             }

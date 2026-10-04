@@ -50,6 +50,11 @@ actor RemoteLibraryService {
 
     /// Emitted after each committed batch so the timeline can re-merge.
     nonisolated let changes: AsyncStream<RemoteChange>
+
+    /// Posted when partner sharing data (§22) may have changed: who shares with the user, or
+    /// what is in their libraries. Kept off `changes`, which drives the timeline — a partner's
+    /// photos are not part of it and must not cost it a rebuild.
+    static let partnersDidChangeNotification = Notification.Name("RemoteLibraryService.partnersDidChange")
     private let changesContinuation: AsyncStream<RemoteChange>.Continuation
 
     private let database: AppDatabase
@@ -119,7 +124,9 @@ actor RemoteLibraryService {
         let client = try makeClient()
         let body: Data
         do {
-            body = try await client.syncStream(types: [.assets, .assetExifs], reset: reset)
+            body = try await client.syncStream(types: [.assets, .assetExifs, .authUsers, .users, .partners,
+                                                       .partnerAssets, .partnerAssetExifs],
+                                               reset: reset)
         } catch ImmichError.unauthorized {
             session.markExpired()
             throw ImmichError.unauthorized
@@ -128,16 +135,15 @@ actor RemoteLibraryService {
         var upserts: [String: Immich.SyncAssetV2] = [:]
         var exifs: [String: Immich.SyncAssetExifV1] = [:]
         var deletedIDs: [String] = []
-        // A per-type watermark, not a per-line receipt — acking the last id of a type
-        // acknowledges every line of that type before it too (verified against a live server).
-        var lastAckByType: [String: String] = [:]
+        var partnerBatch = PartnerSyncBatch()
+        var acks = Immich.SyncAcks()
 
         for lineData in body.split(separator: UInt8(ascii: "\n")) where !lineData.isEmpty {
             try Task.checkCancellation()
             guard let header = try? JSONDecoder().decode(Immich.SyncLineHeader.self, from: lineData) else {
                 continue
             }
-            lastAckByType[header.type] = header.ack
+            acks.record(header.ack)
 
             switch header.type {
             case "AssetV2":
@@ -153,8 +159,10 @@ actor RemoteLibraryService {
                     .decode(Immich.SyncLine<Immich.SyncAssetDeleteV1>.self, from: lineData) else { continue }
                 deletedIDs.append(line.data.assetId)
             default:
-                // "SyncCompleteV1" (end-of-batch marker) and anything not requested/handled yet —
-                // degrade gracefully rather than fail the whole batch (see file header comment).
+                if partnerBatch.add(type: header.type, line: Data(lineData)) { continue }
+                // "SyncCompleteV1" (end-of-batch marker), "SyncAckV1" (end of a partner's
+                // backfill) and anything not requested/handled yet — degrade gracefully rather
+                // than fail the whole batch (see file header comment).
                 continue
             }
             progress?(upserts.count)
@@ -163,14 +171,20 @@ actor RemoteLibraryService {
         // Signing out mid-download wipes the cache; applying this afterwards would put the
         // signed-out server's assets back.
         guard session.isConfigured else { throw CancellationError() }
-        try apply(upserts: upserts, exifs: exifs, deletedIDs: deletedIDs)
+        try apply(upserts: upserts, exifs: exifs, deletedIDs: deletedIDs, partners: partnerBatch)
 
-        // At most 3 entries (one per requested type), always well under the server's 1000-ack cap.
-        if !lastAckByType.isEmpty {
-            try await client.syncAck(Array(lastAckByType.values))
+        // One entry per checkpoint the stream touched — a dozen or so, well under the server's
+        // 1000-ack cap.
+        if !acks.all.isEmpty {
+            try await client.syncAck(acks.all)
         }
         try setCursor(Cursor.lastSyncedAt, to: Immich.iso8601String(from: Date()))
         Log.immich.info("Sync stream applied \(upserts.count) upserts, \(deletedIDs.count) deletes")
+        if !partnerBatch.isEmpty {
+            Log.device("immich", "Sync stream applied partner data: \(partnerBatch.assets.count) assets, "
+                       + "\(partnerBatch.shares.count) shares")
+            postPartnersDidChange()
+        }
         // Every yield costs the timeline a rebuild.
         let changedIDs = Set(upserts.keys).union(exifs.keys).union(deletedIDs)
         if !changedIDs.isEmpty {
@@ -182,11 +196,13 @@ actor RemoteLibraryService {
 
     private func apply(upserts: [String: Immich.SyncAssetV2],
                        exifs: [String: Immich.SyncAssetExifV1],
-                       deletedIDs: [String]) throws {
-        guard !upserts.isEmpty || !exifs.isEmpty || !deletedIDs.isEmpty else { return }
+                       deletedIDs: [String],
+                       partners: PartnerSyncBatch) throws {
+        guard !upserts.isEmpty || !exifs.isEmpty || !deletedIDs.isEmpty || !partners.isEmpty else { return }
         let writer = try database.writer()
 
         try writer.write { db in
+            try PartnerStore.apply(partners, in: db)
             for (id, asset) in upserts {
                 guard asset.visibility == .timeline else {
                     // Matches the old `isVisible: true` search filter (D9): archived, hidden and
@@ -302,6 +318,24 @@ actor RemoteLibraryService {
             }
             return stubs
         }
+    }
+
+    // MARK: - Partner sharing (§22)
+
+    /// Everyone sharing their library with the signed-in user, by name.
+    func partners() throws -> [Partner] {
+        guard !hasNoCache else { return [] }
+        return try database.writer().read { db in try PartnerStore.partners(in: db) }
+    }
+
+    /// One partner's visible assets, newest first.
+    func partnerStubs(ownerID: String) throws -> [AssetStub] {
+        guard !hasNoCache else { return [] }
+        return try database.writer().read { db in try PartnerStore.stubs(ownerID: ownerID, in: db) }
+    }
+
+    private nonisolated func postPartnersDidChange() {
+        NotificationCenter.default.post(name: Self.partnersDidChangeNotification, object: self)
     }
 
     /// For writers outside this actor — `SyncEngine` links facets as it checksums and uploads.
@@ -482,6 +516,7 @@ actor RemoteLibraryService {
     func wipeCache() throws {
         try database.writer().write { db in try Self.wipe(db) }
         changesContinuation.yield(.all)
+        postPartnersDidChange()
     }
 
     /// Wipes the cache unless it was filled by `owner`, then records `owner` as filling it.
@@ -502,12 +537,16 @@ actor RemoteLibraryService {
                            arguments: [Cursor.cacheOwner, owner])
             return true
         }
-        if wiped { changesContinuation.yield(.all) }
+        if wiped {
+            changesContinuation.yield(.all)
+            postPartnersDidChange()
+        }
         return wiped
     }
 
     private static func wipe(_ db: Database) throws {
         try db.execute(sql: "DELETE FROM remote_assets")
+        try PartnerStore.wipe(db)
         try db.execute(sql: "DELETE FROM kv")
         try db.execute(sql: "DELETE FROM pending_edits")
         // The local half of a link is kept: a local checksum is computed only while its

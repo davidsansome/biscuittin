@@ -170,6 +170,47 @@ final class AppDatabase: @unchecked Sendable {
             try db.create(index: "idx_links_immich", on: "facet_links", columns: ["immich_id"])
         }
 
+        migrator.registerMigration("v6-partner-sharing") { db in
+            // Partners' libraries (§22) are kept apart from `remote_assets`: everything that
+            // reads that table — the timeline merge, facet links, Free Up Space, search — is
+            // about the user's own library, and must not have to filter partners out.
+            // Same columns as `remote_assets` plus the owner, so `RemoteAssetRecord` reads both.
+            try db.create(table: "partner_assets") { t in
+                t.primaryKey("immich_id", .text)
+                t.column("owner_id", .text).notNull()
+                t.column("checksum_hex", .text).notNull()
+                t.column("device_asset_id", .text)
+                t.column("device_id", .text)
+                t.column("type", .text).notNull()
+                t.column("live_photo_video_id", .text)
+                t.column("duration_seconds", .double).notNull().defaults(to: 0)
+                t.column("file_name", .text)
+                t.column("capture_at", .double).notNull()
+                t.column("width", .integer)
+                t.column("height", .integer)
+                t.column("is_trashed", .integer).notNull().defaults(to: 0)
+                t.column("exif_json", .text)
+                t.column("latitude", .double)
+                t.column("longitude", .double)
+                t.column("updated_at", .double).notNull()
+            }
+            try db.execute(sql: "CREATE INDEX idx_partner_owner_capture ON partner_assets(owner_id, capture_at DESC)")
+
+            // Only shares *with* the signed-in user; the other direction has nothing to browse.
+            try db.create(table: "partners") { t in
+                t.primaryKey("shared_by_id", .text)
+                t.column("in_timeline", .boolean).notNull().defaults(to: false)
+            }
+
+            // Names arrive on their own lines, not with the share, and possibly in an earlier
+            // sync than the share itself — so every user the server reports is kept.
+            try db.create(table: "immich_users") { t in
+                t.primaryKey("id", .text)
+                t.column("name", .text).notNull()
+                t.column("email", .text)
+            }
+        }
+
         return migrator
     }
 }

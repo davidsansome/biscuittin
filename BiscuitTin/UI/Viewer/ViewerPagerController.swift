@@ -11,7 +11,15 @@ final class ViewerPagerController: UIViewController {
 
     // MARK: - Dependencies
 
+    /// Whose photos these are. The user's own can be rotated and deleted; a partner's (§22)
+    /// belong to someone else, so the viewer only looks, shares and shows info.
+    enum Library {
+        case own
+        case partner
+    }
+
     private let env: AppEnvironment
+    private let library: Library
     private let metadataService: MetadataService
     private let videoProvider: VideoPlaybackProvider
 
@@ -38,8 +46,10 @@ final class ViewerPagerController: UIViewController {
     init(env: AppEnvironment,
          items: [AssetStub],
          startIndex: Int,
-         source: ViewerTransitionSource?) {
+         source: ViewerTransitionSource?,
+         library: Library = .own) {
         self.env = env
+        self.library = library
         self.metadataService = MetadataService(resolver: env.assetResolver)
         self.videoProvider = VideoPlaybackProvider(resolver: env.assetResolver)
         self.items = items
@@ -167,6 +177,7 @@ final class ViewerPagerController: UIViewController {
         toolbar.onRotateRight = { [weak self] in self?.rotateCurrent(clockwise: true) }
         toolbar.onDelete = { [weak self] in self?.deleteCurrent() }
         toolbar.onShare = { [weak self] in self?.shareCurrent() }
+        toolbar.setEditingAvailable(library == .own)
     }
 
     private func configureDismissGesture() {
@@ -289,7 +300,7 @@ final class ViewerPagerController: UIViewController {
 
         let task = Task { [weak self, weak cell] in
             guard let self else { return }
-            guard let asset = await self.env.timelineStore.asset(for: stub.id) else { return }
+            guard let asset = await self.asset(for: stub) else { return }
             do {
                 let item = try await self.videoProvider.playerItem(for: asset)
                 try Task.checkCancellation()
@@ -374,7 +385,7 @@ final class ViewerPagerController: UIViewController {
     /// Optimistic: the on-screen image turns immediately and the real edit runs behind it,
     /// reverting with a toast on failure (§14 P4). No `await` precedes the visible effect.
     private func rotateCurrent(clockwise: Bool) {
-        guard items.indices.contains(currentIndex) else { return }
+        guard library == .own, items.indices.contains(currentIndex) else { return }
         let stub = items[currentIndex]
         guard env.photoActions.canRotate(stub.kind) else {
             Toast.show("This item can’t be rotated yet.", in: view)
@@ -417,7 +428,7 @@ final class ViewerPagerController: UIViewController {
     }
 
     private func deleteCurrent() {
-        guard items.indices.contains(currentIndex) else { return }
+        guard library == .own, items.indices.contains(currentIndex) else { return }
         let stub = items[currentIndex]
 
         Task { [weak self] in
@@ -443,7 +454,15 @@ final class ViewerPagerController: UIViewController {
 
         Task { [weak self] in
             guard let self else { return }
-            let (items, failures) = await self.env.shareService.activityItems(for: [stub.id])
+            let shared: (items: [Any], failures: [(id: AssetID, error: Error)])
+            switch self.library {
+            case .own:
+                shared = await self.env.shareService.activityItems(for: [stub.id])
+            case .partner:
+                let assets = await self.asset(for: stub).map { [$0] } ?? []
+                shared = await self.env.shareService.activityItems(for: assets)
+            }
+            let (items, failures) = shared
             guard !items.isEmpty else {
                 let message = (failures.first?.error as? LocalizedError)?.errorDescription
                     ?? failures.first?.error.localizedDescription
@@ -518,7 +537,7 @@ final class ViewerPagerController: UIViewController {
 
         // Opens immediately with the stub-derived subset and fills in as sources resolve.
         let viewModel = InfoViewModel(stub: stub,
-                                      timelineStore: env.timelineStore,
+                                      resolveAsset: { [weak self] in await self?.asset(for: stub) },
                                       metadataService: metadataService)
         let host = UIHostingController(rootView: InfoSheet(viewModel: viewModel))
         if let sheet = host.sheetPresentationController {
@@ -526,6 +545,18 @@ final class ViewerPagerController: UIViewController {
             sheet.prefersGrabberVisible = true
         }
         present(host, animated: true)
+    }
+
+    /// The full asset behind a page. A partner's asset is not in the timeline, but it never has
+    /// a local copy, so the stub alone describes it.
+    private func asset(for stub: AssetStub) async -> Asset? {
+        switch library {
+        case .own:
+            return await env.timelineStore.asset(for: stub.id)
+        case .partner:
+            guard let immichID = stub.id.immichID else { return nil }
+            return Asset(id: stub.id, facets: [.remote(immichID: immichID)], stub: stub)
+        }
     }
 
     // MARK: - Transition geometry

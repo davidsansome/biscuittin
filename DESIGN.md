@@ -1237,7 +1237,94 @@ dots at the edges. The grid still lists every photo in the region.
 
 ---
 
+## 22. Partner sharing
+
+Added 2026-10-04. Immich's partner sharing lets one user see another's whole library. Biscuit
+Tin shows each partner's library on a screen of its own.
+
+### 22.1 Where it lives
+
+A **person button in the home grid's nav bar**, between the grouping menu and the map. It is
+only there while someone shares with the user, so people without Immich, or without a
+partner, never see it. With one partner it opens their library directly (`person` glyph).
+With several it shows a "Shared with You" menu of names (`person.2`), which saves a list
+screen that would hold nothing but those names. The library is **pushed** onto the home
+navigation stack, so Back and the edge swipe return to the user's own photos.
+
+Rejected:
+- **A tab bar**, which would be a structural change for a feature many users never have.
+- **A row in Settings**, because partners' photos are content, not configuration.
+- **Merging partners into the main timeline** (Immich's `inTimeline` option). The request was
+  a separate screen, and a merged timeline would have to keep partner photos out of delete,
+  rotate, backup, Free Up Space and search. `partners.in_timeline` is stored, so this can be
+  added later.
+
+### 22.2 Data path: sync, not on-demand REST
+
+Partner data comes through the same `sync/stream` call as the user's own library (D9), which
+now also requests `AuthUsersV1`, `UsersV1`, `PartnersV1`, `PartnerAssetsV2` and
+`PartnerAssetExifsV1`. The rows go into separate tables (`partner_assets`, `partners`,
+`immich_users`; migration `v6-partner-sharing`). Everything that reads `remote_assets` is
+about the user's own library, and with separate tables none of it has to filter partners out.
+
+Fetching `timeline/buckets?userId=` when the screen opens was rejected, because it would gate
+the screen on the network (§14 P5) and would not work offline. The sync path makes a partner's
+library open instantly and stay browsable offline, as the user's own server photos do.
+
+Details checked against the v3.2.4 server source (`sync.service.ts`):
+- `PartnerV1` lines report shares in **both** directions. Only `sharedWithId == me` has a
+  library to browse, so the user's own id is needed. It comes from the `AuthUserV1` line and
+  is kept in `kv` (`auth_user_id`), because that line is acked and not sent again.
+- When a share ends, the server sends only a `PartnerDeleteV1` line, with no per-asset deletes,
+  so that line drops the partner's assets. If the partner shares again, the server backfills
+  their library.
+- A new partner's history arrives as `PartnerAssetBackfillV2` lines, with acks of the form
+  `Type|createId|updateId`. A `SyncAckV1` line acked as
+  `PartnerAssetBackfillV2|createId|complete` closes the backfill. The server keeps **one
+  checkpoint per ack prefix**, not per line type, so `Immich.SyncAcks` keys acks by prefix.
+  Keyed by line type, the mid-backfill ack and the completion ack would both be sent in
+  dictionary order, and the backfill could replay on every sync.
+- Sync endpoints refuse API keys (`Sync endpoints cannot be used with API keys`). This
+  feature, like server sync generally, needs a password or OAuth sign-in.
+
+### 22.3 The screen is the real grid
+
+As with the map (§20.3), the partner screen is a `GridViewController` with mode
+`.partner(Partner)`. It subscribes to `PartnerLibrary.snapshots(of:grouping:)` instead of the
+timeline, so the screen gets the same background snapshot building, prefetching, pinch
+columns, date scrubber, pull-to-refresh and zoom transition. Partner-sharing changes are
+posted as `RemoteLibraryService.partnersDidChangeNotification` rather than on `changes`, so a
+partner sync never triggers a rebuild of the user's own timeline.
+
+The screen is read-only: it has no multi-select, and the viewer (`Library.partner`) hides
+rotate and delete. Share and Info still work. There is no search, because the CLIP index
+covers only the user's own library. Cloud badges are hidden because every tile would carry
+one.
+
+### 22.4 Not built
+
+- Partner photos in the main timeline (`inTimeline`), described in §22.1.
+- Playing a partner's videos. Remote-only video playback is not implemented for anyone yet
+  (`VideoPlaybackProvider`, §10.1).
+- Avatars. `UserV1` carries `hasProfileImage`, but the button and menu use SF Symbols.
+
+**Not yet verified against a real server with a partner share.** The line shapes and ack
+semantics come from the v3.2.4 OpenAPI spec and server source. The end-to-end run used
+`Tools/mock_immich.py`, which was written for this change, so it cannot falsify its own
+assumptions (AGENTS.md).
+
+---
+
 ## 21. Implementation Log
+
+### Partner sharing (2026-10-04)
+
+Built as described in §22, which is placed before this log so that the log stays last.
+`Tools/mock_immich.py` now models the partner part of `sync/stream`: `--partners N` sets how
+many partners share with the user, plus one share in the other direction that the app must
+ignore. Acks are kept per checkpoint, and sync refuses API keys as the real server does. The
+mock still does not model the user's own asset stream.
+
 
 ### Sign-out drops server assets (2026-09-27)
 
