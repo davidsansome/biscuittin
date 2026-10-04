@@ -6,7 +6,12 @@ public server/ping|version|features|config endpoints, `.well-known/immich`,
 server/about requiring auth, login rejecting a wrong password with 401, and
 API keys in `x-api-key`. Assets are synthetic, with solid-colour PNG thumbnails
 so remote tiles are visually distinguishable from local ones. `sync/stream`
-answers with no changes; the asset stream itself is not modelled.
+sends them as `AssetV2`/`AssetExifV1` lines until acked, keeping one checkpoint
+per ack prefix as the real server does; `reset: true` clears the checkpoints.
+
+`/video/playback` serves a real H.264 clip for the synthetic video, honouring
+HTTP range requests the way AVPlayer issues them. The clip is made with ffmpeg
+at startup, or taken from `--video FILE`.
 
 OAuth is off by default, as on a stock server. `--oauth` turns it on and serves
 a stand-in identity provider at /mock-idp/authorize that redirects to the
@@ -136,6 +141,49 @@ def build_assets():
 
 
 ASSETS = build_assets()
+# Checkpoint type -> last ack, as the server keeps per session.
+SYNC_CHECKPOINTS = {}
+VIDEO_PATH = None
+
+
+def sync_lines(types):
+    """Every asset line not yet acked, in the server's order: assets, then their EXIF."""
+    lines = []
+    if "AssetsV2" in types:
+        for asset in ASSETS:
+            lines.append({"type": "AssetV2", "ack": f"AssetV2|{asset['id']}", "data": {
+                "id": asset["id"], "ownerId": "user-1",
+                "originalFileName": asset["originalFileName"], "thumbhash": None,
+                "checksum": asset["checksum"], "fileCreatedAt": asset["fileCreatedAt"],
+                "fileModifiedAt": asset["fileModifiedAt"], "createdAt": asset["updatedAt"],
+                "localDateTime": asset["localDateTime"], "duration": asset["duration"],
+                "type": asset["type"], "deletedAt": None, "isFavorite": False,
+                "visibility": "timeline", "livePhotoVideoId": None, "stackId": None,
+                "libraryId": None, "width": asset["width"], "height": asset["height"],
+                "isEdited": False}})
+    if "AssetExifsV1" in types:
+        for asset in ASSETS:
+            exif = asset["exifInfo"]
+            lines.append({"type": "AssetExifV1", "ack": f"AssetExifV1|{asset['id']}", "data": {
+                "assetId": asset["id"], "orientation": "1", "modifyDate": None, "timeZone": None,
+                "projectionType": None, "profileDescription": None, "rating": None, "fps": None,
+                **exif}})
+    unacked = [line for line in lines if line["ack"].split("|")[0] not in SYNC_CHECKPOINTS]
+    unacked.append({"type": "SyncCompleteV1", "ack": "SyncCompleteV1|now", "data": {}})
+    return unacked
+
+
+def make_video():
+    """A short real clip, so AVPlayer has something genuine to decode."""
+    path = os.path.join(os.environ.get("TMPDIR", "/tmp"), "mock-immich-playback.mp4")
+    if not os.path.exists(path):
+        import subprocess
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi",
+                        "-i", "testsrc=duration=37:size=1280x720:rate=30",
+                        "-f", "lavfi", "-i", "sine=frequency=440:duration=37",
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                        "-movflags", "+faststart", "-shortest", path], check=True)
+    return path
 REQUEST_LOG = []
 # checksum -> server asset id, so bulk-upload-check can report duplicates
 UPLOADED_CHECKSUMS = {}
@@ -177,6 +225,32 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_range(self, file_path, content_type):
+        """Serves a file whole or by `Range: bytes=a-b`, as Immich does for playback."""
+        with open(file_path, "rb") as f:
+            data = f.read()
+        match = re.match(r"bytes=(\d*)-(\d*)", self.headers.get("Range", ""))
+        if not match:
+            self.send_response(200)
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        start = int(match.group(1)) if match.group(1) else len(data) - int(match.group(2))
+        end = int(match.group(2)) if match.group(1) and match.group(2) else len(data) - 1
+        end = min(end, len(data) - 1)
+        chunk = data[start:end + 1]
+        print(f"  range {start}-{end}/{len(data)}", flush=True)
+        self.send_response(206)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
+        self.send_header("Content-Length", str(len(chunk)))
+        self.end_headers()
+        self.wfile.write(chunk)
 
     def _authorized(self):
         if EXPIRE_SESSIONS:
@@ -249,6 +323,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, {"message": "Asset not found"})
             return self._send(200, asset)
 
+        if path.startswith("/api/assets/") and path.endswith("/video/playback"):
+            if not self._authorized():
+                return self._send(401, {"message": "unauthorized"})
+            return self._send_range(VIDEO_PATH, "video/mp4")
+
         if path.startswith("/api/assets/") and path.endswith("/thumbnail"):
             if not self._authorized():
                 return self._send(401, {"message": "unauthorized"})
@@ -309,11 +388,19 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/sync/stream":
             if not self._authorized():
                 return self._send(401, {"message": "Authentication required"})
-            return self._send(200, b"", content_type="application/jsonlines+json")
+            body = json.loads(raw or b"{}")
+            if body.get("reset"):
+                SYNC_CHECKPOINTS.clear()
+            lines = sync_lines(body.get("types", []))
+            print(f"  sync/stream: {len(lines)} lines", flush=True)
+            payload = "".join(json.dumps(line) + "\n" for line in lines).encode()
+            return self._send(200, payload, content_type="application/jsonlines+json")
 
         if path == "/api/sync/ack":
             if not self._authorized():
                 return self._send(401, {"message": "Authentication required"})
+            for ack in json.loads(raw or b"{}").get("acks", []):
+                SYNC_CHECKPOINTS[ack.split("|")[0]] = ack
             return self._send(204, b"", content_type="application/json")
 
         if path == "/api/assets/bulk-upload-check":
@@ -433,7 +520,10 @@ if __name__ == "__main__":
                         help="seconds to hold each upload's response")
     parser.add_argument("--save-uploads", metavar="DIR",
                         help="write each uploaded file into DIR")
+    parser.add_argument("--video", metavar="FILE",
+                        help="clip to serve from /video/playback (default: made with ffmpeg)")
     args = parser.parse_args()
+    VIDEO_PATH = args.video or make_video()
     UPLOAD_DELAY = args.upload_delay
     SAVE_UPLOADS = args.save_uploads
     PORT = args.port

@@ -1239,6 +1239,39 @@ dots at the edges. The grid still lists every photo in the region.
 
 ## 21. Implementation Log
 
+### Remote video playback (2026-10-04)
+
+Before this change, a video that existed only on the server could not play. §10.1 planned
+the playback path and `ImmichClient` already had `playbackURL(id:)` and `playbackHeaders()`,
+but `VideoPlaybackProvider` never used them. It threw for every remote-only video, and the
+viewer said "This video isn't available."
+
+It now builds an `AVURLAsset` on `/api/assets/{id}/video/playback` and passes the credential
+in the `AVURLAssetHTTPHeaderFieldsKey` option. That one mechanism covers both session tokens
+and API keys, and AVFoundation sends the headers on every range request it makes. The key is
+not among AVFoundation's published constants. Two public alternatives were rejected:
+- **Query parameters.** Immich accepts `sessionKey`/`apiKey` this way, but it writes the
+  secret into server and proxy access logs.
+- **`AVURLAssetHTTPCookiesKey`.** It works for the `immich_access_token` cookie, but API keys
+  have no cookie form.
+
+A resource-loader delegate would avoid private keys entirely, but it would proxy every byte
+through the app.
+
+The asset's `isPlayable` is loaded before the item is handed to the player. Without that, an
+unreachable server or a rejected credential left the page on a spinner forever; now it shows
+the page's error message.
+
+Verified in the simulator against `Tools/mock_immich.py`. The mock now sends its synthetic
+assets through `sync/stream` and serves a real H.264 clip with HTTP range support. The 37 s
+clip played with every range request authenticated; the same request without the header gets a
+401. With the mock stopped, the page showed the error message. **Not yet run against a real
+server.**
+
+Sharing a remote-only video is still unsupported. It needs the whole file, and
+`ImmichClient.originalData` holds an original in memory, so it needs a download to disk first.
+
+
 ### Sign-out drops server assets (2026-09-27)
 
 Sign Out used to keep the remote cache for offline browsing (§13). In practice a signed-out
