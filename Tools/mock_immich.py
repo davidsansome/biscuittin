@@ -8,7 +8,11 @@ API keys in `x-api-key`. Assets are synthetic, with solid-colour PNG thumbnails
 so remote tiles are visually distinguishable from local ones. `sync/stream`
 sends them as `AssetV2`/`AssetExifV1` lines until acked, keeping one checkpoint
 per ack prefix as the real server does; `reset: true` clears the checkpoints.
-As on a real server, sync refuses API keys.
+As on a real server, sync refuses API keys. `--sync-reset` starts the session with a
+pending sync reset, as a server does once a session's checkpoint is older than its
+30-day audit retention: every non-reset stream is answered with a lone `SyncResetV1`
+line until a `reset: true` stream, or an ack of that line, clears it and the
+checkpoints (v3.2.4's `SyncService`).
 
 Partner sharing is modelled too: a partner ("Alice") shares a library with the
 signed-in user, and the user shares with someone else ("Bob"), so the app must
@@ -56,6 +60,8 @@ MOCK_PASSWORD = "biscuit"
 MOCK_API_KEY = "mock-api-key"
 # Rejects every credential, as a server does once a session has been revoked.
 EXPIRE_SESSIONS = False
+# A pending sync reset for the (single) session; see --sync-reset.
+PENDING_SYNC_RESET = False
 FEATURES = {"oauth": False, "oauthAutoLaunch": False, "passwordLogin": True}
 # code -> (state, code_challenge), issued by the stand-in identity provider
 OAUTH_CODES = {}
@@ -436,6 +442,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"message": "not found"})
 
     def do_POST(self):
+        global PENDING_SYNC_RESET
         path = self.path.split("?")[0]
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b"{}"
@@ -489,6 +496,12 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(raw or b"{}")
             if body.get("reset"):
                 SYNC_CHECKPOINTS.clear()
+                PENDING_SYNC_RESET = False
+            if PENDING_SYNC_RESET:
+                line = json.dumps({"type": "SyncResetV1", "data": {}, "ack": "SyncResetV1|reset"})
+                print("  sync/stream: SyncResetV1", flush=True)
+                return self._send(200, (line + "\n").encode(),
+                                  content_type="application/jsonlines+json")
             lines = sync_lines(body.get("types", []))
             print(f"  sync/stream: {len(lines)} lines "
                   f"({sum(1 for l in lines if l['type'] == 'PartnerAssetV2')} partner assets)", flush=True)
@@ -501,6 +514,12 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get("x-api-key"):
                 return self._send(403, {"message": "Sync endpoints cannot be used with API keys"})
             for ack in json.loads(raw or b"{}").get("acks", []):
+                if ack.startswith("SyncResetV1|"):
+                    # As the real server: a reset ack drops every checkpoint, and the rest of
+                    # the batch with it.
+                    SYNC_CHECKPOINTS.clear()
+                    PENDING_SYNC_RESET = False
+                    break
                 SYNC_CHECKPOINTS[ack.split("|")[0]] = ack
             print(f"  sync/ack: checkpoints now {sorted(SYNC_CHECKPOINTS)}", flush=True)
             return self._send(204, b"", content_type="application/json")
@@ -622,6 +641,8 @@ if __name__ == "__main__":
                         help="seconds to hold each upload's response")
     parser.add_argument("--save-uploads", metavar="DIR",
                         help="write each uploaded file into DIR")
+    parser.add_argument("--sync-reset", action="store_true",
+                        help="answer sync streams with SyncResetV1 until the app replays")
     parser.add_argument("--partners", type=int, default=1, choices=range(len(PARTNERS) + 1),
                         help="how many partners share their library with the user")
     parser.add_argument("--video", metavar="FILE",
@@ -635,6 +656,7 @@ if __name__ == "__main__":
     if args.no_assets:
         ASSETS = []
     EXPIRE_SESSIONS = args.expire_sessions
+    PENDING_SYNC_RESET = args.sync_reset
     FEATURES.update(oauth=args.oauth, oauthAutoLaunch=args.oauth_auto_launch,
                     passwordLogin=not args.no_password_login)
     print(f"Features: {FEATURES}", flush=True)

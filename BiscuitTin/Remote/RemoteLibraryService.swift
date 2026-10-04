@@ -117,11 +117,83 @@ actor RemoteLibraryService {
     /// weekly hard-delete sweep alike (D9) — an `AssetDeleteV1` line removes its row immediately,
     /// on whichever call first reports it.
     func syncStream(reset: Bool = false, progress: (@Sendable (Int) -> Void)? = nil) async throws {
+        let session = session
+        try await syncStream(client: try makeClient(), reset: reset, progress: progress,
+                             isSignedIn: { session.isConfigured })
+    }
+
+    /// `isSignedIn` is checked between download and apply; it is a parameter only so tests can
+    /// run this without a Keychain token.
+    func syncStream(client: ImmichClient,
+                    reset: Bool,
+                    progress: (@Sendable (Int) -> Void)? = nil,
+                    isSignedIn: () -> Bool) async throws {
         guard !isSyncing else { return }
         isSyncing = true
         defer { isSyncing = false }
 
-        let client = try makeClient()
+        var batch = try await fetchSyncBatch(client: client, reset: reset, progress: progress)
+        if batch.serverRequestedReset {
+            // Sent alone, in place of any changes, when the session's checkpoint is older than the
+            // server's 30-day audit retention: deletes from before then can no longer be reported,
+            // so only a full replay can be trusted. A `reset: true` request clears the server-side
+            // reset itself, which is why the `SyncResetV1` line is never acked — acking it would
+            // also discard the checkpoints this replay is about to ack.
+            Log.immich.info("Server requested a sync reset; replaying the whole library")
+            batch = try await fetchSyncBatch(client: client, reset: true, progress: progress)
+            guard !batch.serverRequestedReset else {
+                throw ImmichError.decoding("Sync reset requested again by a reset sync")
+            }
+        }
+        // A reset replay lists every asset the server still has, but reports only the deletes still
+        // in its audit table; anything deleted before that is removed only by replacing the cache.
+        let replacesCache = batch.didReset
+
+        // Signing out mid-download wipes the cache; applying this afterwards would put the
+        // signed-out server's assets back.
+        guard isSignedIn() else { throw CancellationError() }
+        try apply(upserts: batch.upserts, exifs: batch.exifs, deletedIDs: batch.deletedIDs,
+                  partners: batch.partners, replacingCache: replacesCache)
+
+        // One entry per checkpoint the stream touched — a dozen or so, well under the server's
+        // 1000-ack cap.
+        if !batch.acks.all.isEmpty {
+            try await client.syncAck(batch.acks.all)
+        }
+        try setCursor(Cursor.lastSyncedAt, to: Immich.iso8601String(from: Date()))
+        Log.immich.info("Sync stream applied \(batch.upserts.count) upserts, \(batch.deletedIDs.count) deletes\(replacesCache ? " (replaced cache)" : "")")
+        if !batch.partners.isEmpty {
+            Log.device("immich", "Sync stream applied partner data: \(batch.partners.assets.count) assets, "
+                       + "\(batch.partners.shares.count) shares")
+        }
+        if replacesCache || !batch.partners.isEmpty {
+            postPartnersDidChange()
+        }
+        if replacesCache {
+            changesContinuation.yield(.all)
+            return
+        }
+        // Every yield costs the timeline a rebuild.
+        let changedIDs = Set(batch.upserts.keys).union(batch.exifs.keys).union(batch.deletedIDs)
+        if !changedIDs.isEmpty {
+            changesContinuation.yield(.assets(changedIDs))
+        }
+    }
+
+    private struct SyncBatch {
+        var upserts: [String: Immich.SyncAssetV2] = [:]
+        var exifs: [String: Immich.SyncAssetExifV1] = [:]
+        var deletedIDs: [String] = []
+        var partners = PartnerSyncBatch()
+        var acks = Immich.SyncAcks()
+        /// The server answered with `SyncResetV1` instead of changes.
+        var serverRequestedReset = false
+        /// This batch is a full replay from a `reset: true` request.
+        var didReset = false
+    }
+
+    private func fetchSyncBatch(client: ImmichClient, reset: Bool,
+                                progress: (@Sendable (Int) -> Void)?) async throws -> SyncBatch {
         let body: Data
         do {
             body = try await client.syncStream(types: [.assets, .assetExifs, .authUsers, .users, .partners,
@@ -132,64 +204,40 @@ actor RemoteLibraryService {
             throw ImmichError.unauthorized
         }
 
-        var upserts: [String: Immich.SyncAssetV2] = [:]
-        var exifs: [String: Immich.SyncAssetExifV1] = [:]
-        var deletedIDs: [String] = []
-        var partnerBatch = PartnerSyncBatch()
-        var acks = Immich.SyncAcks()
-
+        var batch = SyncBatch(didReset: reset)
         for lineData in body.split(separator: UInt8(ascii: "\n")) where !lineData.isEmpty {
             try Task.checkCancellation()
             guard let header = try? JSONDecoder().decode(Immich.SyncLineHeader.self, from: lineData) else {
                 continue
             }
-            acks.record(header.ack)
 
             switch header.type {
+            case "SyncResetV1":
+                batch.serverRequestedReset = true
+                continue
             case "AssetV2":
                 guard let line = try? JSONDecoder()
-                    .decode(Immich.SyncLine<Immich.SyncAssetV2>.self, from: lineData) else { continue }
-                upserts[line.data.id] = line.data
+                    .decode(Immich.SyncLine<Immich.SyncAssetV2>.self, from: lineData) else { break }
+                batch.upserts[line.data.id] = line.data
             case "AssetExifV1":
                 guard let line = try? JSONDecoder()
-                    .decode(Immich.SyncLine<Immich.SyncAssetExifV1>.self, from: lineData) else { continue }
-                exifs[line.data.assetId] = line.data
+                    .decode(Immich.SyncLine<Immich.SyncAssetExifV1>.self, from: lineData) else { break }
+                batch.exifs[line.data.assetId] = line.data
             case "AssetDeleteV1":
                 guard let line = try? JSONDecoder()
-                    .decode(Immich.SyncLine<Immich.SyncAssetDeleteV1>.self, from: lineData) else { continue }
-                deletedIDs.append(line.data.assetId)
+                    .decode(Immich.SyncLine<Immich.SyncAssetDeleteV1>.self, from: lineData) else { break }
+                batch.deletedIDs.append(line.data.assetId)
             default:
-                if partnerBatch.add(type: header.type, line: Data(lineData)) { continue }
+                if batch.partners.add(type: header.type, line: Data(lineData)) { break }
                 // "SyncCompleteV1" (end-of-batch marker), "SyncAckV1" (end of a partner's
                 // backfill) and anything not requested/handled yet — degrade gracefully rather
                 // than fail the whole batch (see file header comment).
-                continue
+                break
             }
-            progress?(upserts.count)
+            batch.acks.record(header.ack)
+            progress?(batch.upserts.count)
         }
-
-        // Signing out mid-download wipes the cache; applying this afterwards would put the
-        // signed-out server's assets back.
-        guard session.isConfigured else { throw CancellationError() }
-        try apply(upserts: upserts, exifs: exifs, deletedIDs: deletedIDs, partners: partnerBatch)
-
-        // One entry per checkpoint the stream touched — a dozen or so, well under the server's
-        // 1000-ack cap.
-        if !acks.all.isEmpty {
-            try await client.syncAck(acks.all)
-        }
-        try setCursor(Cursor.lastSyncedAt, to: Immich.iso8601String(from: Date()))
-        Log.immich.info("Sync stream applied \(upserts.count) upserts, \(deletedIDs.count) deletes")
-        if !partnerBatch.isEmpty {
-            Log.device("immich", "Sync stream applied partner data: \(partnerBatch.assets.count) assets, "
-                       + "\(partnerBatch.shares.count) shares")
-            postPartnersDidChange()
-        }
-        // Every yield costs the timeline a rebuild.
-        let changedIDs = Set(upserts.keys).union(exifs.keys).union(deletedIDs)
-        if !changedIDs.isEmpty {
-            changesContinuation.yield(.assets(changedIDs))
-        }
+        return batch
     }
 
     // MARK: - Persistence
@@ -197,11 +245,15 @@ actor RemoteLibraryService {
     private func apply(upserts: [String: Immich.SyncAssetV2],
                        exifs: [String: Immich.SyncAssetExifV1],
                        deletedIDs: [String],
-                       partners: PartnerSyncBatch) throws {
-        guard !upserts.isEmpty || !exifs.isEmpty || !deletedIDs.isEmpty || !partners.isEmpty else { return }
+                       partners: PartnerSyncBatch,
+                       replacingCache: Bool) throws {
+        guard replacingCache || !upserts.isEmpty || !exifs.isEmpty || !deletedIDs.isEmpty
+                || !partners.isEmpty else { return }
         let writer = try database.writer()
 
+        // One transaction with the upserts, so the grid never sees the cache empty.
         try writer.write { db in
+            if replacingCache { try Self.clearServerAssets(db) }
             try PartnerStore.apply(partners, in: db)
             for (id, asset) in upserts {
                 guard asset.visibility == .timeline else {
@@ -545,15 +597,9 @@ actor RemoteLibraryService {
     }
 
     private static func wipe(_ db: Database) throws {
-        try db.execute(sql: "DELETE FROM remote_assets")
-        try PartnerStore.wipe(db)
+        try clearServerAssets(db)
         try db.execute(sql: "DELETE FROM kv")
         try db.execute(sql: "DELETE FROM pending_edits")
-        // The local half of a link is kept: a local checksum is computed only while its
-        // backup_state row has none, so dropping it would leave the photo unlinked from its
-        // server copy on the next server and shown twice.
-        try db.execute(sql: "DELETE FROM facet_links WHERE local_identifier IS NULL")
-        try db.execute(sql: "UPDATE facet_links SET immich_id = NULL")
         // Uploaded to a server this cache no longer describes. Pending re-checks each against
         // whichever server comes next, which skips the ones it already has.
         try db.execute(sql: """
@@ -563,6 +609,19 @@ actor RemoteLibraryService {
                              BackupStateRecord.State.uploaded.rawValue,
                              BackupStateRecord.State.uploading.rawValue,
                              BackupStateRecord.State.failed.rawValue])
+    }
+
+    /// Drops every cached server asset, all partner data, and the server half of every link.
+    /// Shared by `wipe` and a reset replay; backup state is deliberately not touched here — on the *same* server, a
+    /// photo uploaded and then deleted there must stay uploaded, or backup would restore it.
+    private static func clearServerAssets(_ db: Database) throws {
+        try db.execute(sql: "DELETE FROM remote_assets")
+        try PartnerStore.wipe(db)
+        // The local half of a link is kept: a local checksum is computed only while its
+        // backup_state row has none, so dropping it would leave the photo unlinked from its
+        // server copy and shown twice.
+        try db.execute(sql: "DELETE FROM facet_links WHERE local_identifier IS NULL")
+        try db.execute(sql: "UPDATE facet_links SET immich_id = NULL")
     }
 
     // MARK: - Pending edits (D22)

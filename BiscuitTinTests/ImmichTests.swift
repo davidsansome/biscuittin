@@ -600,19 +600,33 @@ final class ImmichTests: XCTestCase {
 actor RequestRecorder {
     private(set) var lastRequest: URLRequest?
     private(set) var lastBody: Data?
+    /// Every request body in order, keyed by path.
+    private(set) var bodies: [(path: String, body: Data?)] = []
     private var stubs: [String: (Int, Data)] = [:]
+    private var queued: [String: [(Int, Data)]] = [:]
 
     func stub(path: String, json: String, status: Int = 200) {
         stubs[path] = (status, Data(json.utf8))
     }
 
+    /// Served once each, in order, before falling back to `stub(path:)`.
+    func enqueue(path: String, json: String, status: Int = 200) {
+        queued[path, default: []].append((status, Data(json.utf8)))
+    }
+
     func record(_ request: URLRequest, body: Data?) {
         lastRequest = request
         lastBody = body
+        bodies.append((request.url?.path ?? "", body))
     }
 
     func response(for path: String) -> (Int, Data) {
-        stubs[path] ?? (404, Data("{}".utf8))
+        if var pending = queued[path], !pending.isEmpty {
+            let next = pending.removeFirst()
+            queued[path] = pending
+            return next
+        }
+        return stubs[path] ?? (404, Data("{}".utf8))
     }
 }
 
