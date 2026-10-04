@@ -6,7 +6,11 @@ public server/ping|version|features|config endpoints, `.well-known/immich`,
 server/about requiring auth, login rejecting a wrong password with 401, and
 API keys in `x-api-key`. Assets are synthetic, with solid-colour PNG thumbnails
 so remote tiles are visually distinguishable from local ones. `sync/stream`
-answers with no changes; the asset stream itself is not modelled.
+answers with no changes; the asset stream itself is not modelled. `--sync-reset`
+starts the session with a pending sync reset, as a server does once a session's
+checkpoint is older than its 30-day audit retention: every non-reset stream is
+answered with a lone `SyncResetV1` line until a `reset: true` stream, or an ack of
+that line, clears it (v3.2.4's `SyncService`).
 
 OAuth is off by default, as on a stock server. `--oauth` turns it on and serves
 a stand-in identity provider at /mock-idp/authorize that redirects to the
@@ -45,6 +49,8 @@ MOCK_PASSWORD = "biscuit"
 MOCK_API_KEY = "mock-api-key"
 # Rejects every credential, as a server does once a session has been revoked.
 EXPIRE_SESSIONS = False
+# A pending sync reset for the (single) session; see --sync-reset.
+PENDING_SYNC_RESET = False
 FEATURES = {"oauth": False, "oauthAutoLaunch": False, "passwordLogin": True}
 # code -> (state, code_challenge), issued by the stand-in identity provider
 OAUTH_CODES = {}
@@ -261,6 +267,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"message": "not found"})
 
     def do_POST(self):
+        global PENDING_SYNC_RESET
         path = self.path.split("?")[0]
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b"{}"
@@ -309,11 +316,19 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/sync/stream":
             if not self._authorized():
                 return self._send(401, {"message": "Authentication required"})
+            if json.loads(raw or b"{}").get("reset"):
+                PENDING_SYNC_RESET = False
+            if PENDING_SYNC_RESET:
+                line = json.dumps({"type": "SyncResetV1", "data": {}, "ack": "SyncResetV1|reset"})
+                return self._send(200, (line + "\n").encode(),
+                                  content_type="application/jsonlines+json")
             return self._send(200, b"", content_type="application/jsonlines+json")
 
         if path == "/api/sync/ack":
             if not self._authorized():
                 return self._send(401, {"message": "Authentication required"})
+            if any(ack.startswith("SyncResetV1|") for ack in json.loads(raw or b"{}").get("acks", [])):
+                PENDING_SYNC_RESET = False
             return self._send(204, b"", content_type="application/json")
 
         if path == "/api/assets/bulk-upload-check":
@@ -433,6 +448,8 @@ if __name__ == "__main__":
                         help="seconds to hold each upload's response")
     parser.add_argument("--save-uploads", metavar="DIR",
                         help="write each uploaded file into DIR")
+    parser.add_argument("--sync-reset", action="store_true",
+                        help="answer sync streams with SyncResetV1 until the app replays")
     args = parser.parse_args()
     UPLOAD_DELAY = args.upload_delay
     SAVE_UPLOADS = args.save_uploads
@@ -440,6 +457,7 @@ if __name__ == "__main__":
     if args.no_assets:
         ASSETS = []
     EXPIRE_SESSIONS = args.expire_sessions
+    PENDING_SYNC_RESET = args.sync_reset
     FEATURES.update(oauth=args.oauth, oauthAutoLaunch=args.oauth_auto_launch,
                     passwordLogin=not args.no_password_login)
     print(f"Features: {FEATURES}", flush=True)
