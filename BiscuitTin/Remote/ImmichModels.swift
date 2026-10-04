@@ -304,6 +304,14 @@ enum Immich {
     enum SyncRequestType: String, Encodable {
         case assets = "AssetsV2"
         case assetExifs = "AssetExifsV1"
+        // Partner sharing (§22). `AuthUsersV1` is only here to learn the signed-in user's own
+        // id: `PartnerV1` lines name both ends of a share, and only the shares *with* this user
+        // are libraries it can browse. `UsersV1` supplies the partners' names.
+        case authUsers = "AuthUsersV1"
+        case users = "UsersV1"
+        case partners = "PartnersV1"
+        case partnerAssets = "PartnerAssetsV2"
+        case partnerAssetExifs = "PartnerAssetExifsV1"
     }
 
     struct SyncStreamRequest: Encodable {
@@ -334,6 +342,8 @@ enum Immich {
 
     struct SyncAssetV2: Decodable {
         let id: String
+        /// Only read for partner assets (§22): which partner's library the asset belongs to.
+        let ownerId: String?
         let originalFileName: String?
         let checksum: String?
         let fileCreatedAt: String?
@@ -379,6 +389,50 @@ enum Immich {
 
     struct SyncAssetDeleteV1: Decodable {
         let assetId: String
+    }
+
+    /// `AuthUserV1` and `UserV1` lines, reduced to what partner sharing reads. The auth-user
+    /// line describes the signed-in user; user lines describe every user on the server.
+    struct SyncUserV1: Decodable {
+        let id: String
+        let name: String
+        let email: String?
+    }
+
+    struct SyncUserDeleteV1: Decodable {
+        let userId: String
+    }
+
+    /// One direction of a partner share: `sharedById`'s library is visible to `sharedWithId`.
+    /// The stream reports shares in both directions involving the signed-in user.
+    struct SyncPartnerV1: Decodable {
+        let sharedById: String
+        let sharedWithId: String
+        let inTimeline: Bool?
+    }
+
+    struct SyncPartnerDeleteV1: Decodable {
+        let sharedById: String
+        let sharedWithId: String
+    }
+
+    /// The acks to send after a batch: the last one seen for each server-side checkpoint.
+    ///
+    /// A watermark, not a per-line receipt — acking the last id of a type acknowledges every
+    /// line of that type before it too (verified against a live server). Acks are
+    /// `Type|updateId[|extra]` and the server keeps one checkpoint per leading `Type`, which is
+    /// not always the line's own `type`: the `SyncAckV1` line that closes a partner's backfill
+    /// acks as `PartnerAssetBackfillV2`. Keyed by line type instead, both would be sent, in no
+    /// particular order, and the mid-backfill position could land after the completion — so the
+    /// backfill would replay on every sync.
+    struct SyncAcks {
+        private var latestByCheckpoint: [String: String] = [:]
+
+        mutating func record(_ ack: String) {
+            latestByCheckpoint[String(ack.prefix { $0 != "|" })] = ack
+        }
+
+        var all: [String] { Array(latestByCheckpoint.values) }
     }
 
     // MARK: - Mutations

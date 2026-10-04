@@ -125,6 +125,13 @@ final class StartupSequencer: ObservableObject {
         await timelineStore.refresh()
     }
 
+    /// Pull-to-refresh on a partner's library (§22): the same sync, without rebuilding the
+    /// user's own timeline, which a partner's screen does not show.
+    func pullToRefreshPartners() async {
+        guard hasStarted else { return }
+        await runRemoteSync()
+    }
+
     /// Re-checks authorization after the user returns from the Settings app.
     func refreshAuthorization() {
         let status = localLibrary.authorizationStatus

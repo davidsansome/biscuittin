@@ -35,7 +35,8 @@ final class SyncResetTests: XCTestCase {
     }
 
     /// `gone` was hard-deleted on the server more than 30 days ago; `kept` still exists. `L1` is
-    /// a local photo that was uploaded as `gone`, `L2` one uploaded as `kept`.
+    /// a local photo that was uploaded as `gone`, `L2` one uploaded as `kept`. `alice` stopped
+    /// sharing her library just as long ago.
     private func seedStaleCache() throws {
         try database.writer().write { db in
             for (id, checksum) in [("gone", "aa"), ("kept", "bb"), ("gone-remote-only", "cc")] {
@@ -50,6 +51,12 @@ final class SyncResetTests: XCTestCase {
             try BackupStateRecord(localIdentifier: "L1", checksumHex: "aa", state: .uploaded).insert(db)
             try BackupStateRecord(localIdentifier: "L2", checksumHex: "bb", state: .uploaded).insert(db)
             try db.execute(sql: "INSERT INTO kv (key, value) VALUES ('cache_owner', 'me')")
+            try db.execute(sql: "INSERT INTO partners (shared_by_id) VALUES ('alice')")
+            try db.execute(sql: "INSERT INTO immich_users (id, name) VALUES ('alice', 'Alice')")
+            try db.execute(sql: """
+                INSERT INTO partner_assets (immich_id, owner_id, checksum_hex, type, capture_at, updated_at)
+                VALUES ('alice-photo', 'alice', 'dd', 'IMAGE', 0, 0)
+                """)
         }
     }
 
@@ -66,6 +73,15 @@ final class SyncResetTests: XCTestCase {
     private func remoteIDs() throws -> [String] {
         try database.writer().read { db in
             try String.fetchAll(db, sql: "SELECT immich_id FROM remote_assets ORDER BY immich_id")
+        }
+    }
+
+    private func partnerRowCount() throws -> Int {
+        try database.writer().read { db in
+            try Int.fetchOne(db, sql: """
+                SELECT (SELECT COUNT(*) FROM partners) + (SELECT COUNT(*) FROM immich_users)
+                     + (SELECT COUNT(*) FROM partner_assets)
+                """) ?? 0
         }
     }
 
@@ -110,6 +126,7 @@ final class SyncResetTests: XCTestCase {
         XCTAssertEqual(states.map { $0["state"] as String }, ["uploaded", "uploaded"],
                        "re-queuing L1 would re-upload a photo deliberately deleted on the server")
         XCTAssertEqual(owner, "me", "same server, so the cache keeps its owner")
+        XCTAssertEqual(try partnerRowCount(), 0, "the replay reports no share from alice")
 
         let acked = try await acks(recorder)
         XCTAssertEqual(Set(acked), ["AssetV2|0002", "SyncCompleteV1|0003"])
@@ -129,6 +146,7 @@ final class SyncResetTests: XCTestCase {
         let requests = try await streamRequests(recorder)
         XCTAssertEqual(requests, [false])
         XCTAssertEqual(try remoteIDs(), ["gone", "gone-remote-only", "kept"])
+        XCTAssertEqual(try partnerRowCount(), 3)
     }
 
     /// Sign-in asks for a replay itself; that one is just as authoritative about what is gone.

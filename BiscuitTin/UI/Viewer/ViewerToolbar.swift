@@ -117,6 +117,11 @@ final class ViewerToolbar: UIView {
         }
     }
 
+    /// Hides the controls that change a photo, for a library the user does not own (§22).
+    func setEditingAvailable(_ available: Bool) {
+        [rotateLeftButton, rotateRightButton, deleteButton].forEach { $0.isHidden = !available }
+    }
+
     /// Shown only once the current photo's analysis has found text; filled while highlighted.
     func setLiveText(available: Bool, highlighted: Bool) {
         liveTextButton.isHidden = !available

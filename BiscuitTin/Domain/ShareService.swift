@@ -58,7 +58,8 @@ actor ShareService {
 
         for id in ids {
             do {
-                items.append(try await activityItem(for: id))
+                guard let asset = await timelineStore.asset(for: id) else { throw ShareError.unresolvable }
+                items.append(try await activityItem(for: asset))
             } catch {
                 failures.append((id, error))
             }
@@ -66,9 +67,22 @@ actor ShareService {
         return (items, failures)
     }
 
-    private func activityItem(for id: AssetID) async throws -> Any {
-        guard let asset = await timelineStore.asset(for: id) else { throw ShareError.unresolvable }
+    /// For assets resolved by the caller — a partner's (§22), which the timeline does not hold.
+    func activityItems(for assets: [Asset]) async -> (items: [Any], failures: [(id: AssetID, error: Error)]) {
+        var items = [Any]()
+        var failures = [(id: AssetID, error: Error)]()
 
+        for asset in assets {
+            do {
+                items.append(try await activityItem(for: asset))
+            } catch {
+                failures.append((asset.id, error))
+            }
+        }
+        return (items, failures)
+    }
+
+    private func activityItem(for asset: Asset) async throws -> Any {
         if let localIdentifier = asset.localIdentifier, let phAsset = resolver.resolve(localIdentifier) {
             return try await shareProvider(for: phAsset)
         }

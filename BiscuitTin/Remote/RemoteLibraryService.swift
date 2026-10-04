@@ -50,6 +50,11 @@ actor RemoteLibraryService {
 
     /// Emitted after each committed batch so the timeline can re-merge.
     nonisolated let changes: AsyncStream<RemoteChange>
+
+    /// Posted when partner sharing data (§22) may have changed: who shares with the user, or
+    /// what is in their libraries. Kept off `changes`, which drives the timeline — a partner's
+    /// photos are not part of it and must not cost it a rebuild.
+    static let partnersDidChangeNotification = Notification.Name("RemoteLibraryService.partnersDidChange")
     private let changesContinuation: AsyncStream<RemoteChange>.Continuation
 
     private let database: AppDatabase
@@ -148,14 +153,22 @@ actor RemoteLibraryService {
         // signed-out server's assets back.
         guard isSignedIn() else { throw CancellationError() }
         try apply(upserts: batch.upserts, exifs: batch.exifs, deletedIDs: batch.deletedIDs,
-                  replacingCache: replacesCache)
+                  partners: batch.partners, replacingCache: replacesCache)
 
-        // At most 3 entries (one per requested type), always well under the server's 1000-ack cap.
-        if !batch.lastAckByType.isEmpty {
-            try await client.syncAck(Array(batch.lastAckByType.values))
+        // One entry per checkpoint the stream touched — a dozen or so, well under the server's
+        // 1000-ack cap.
+        if !batch.acks.all.isEmpty {
+            try await client.syncAck(batch.acks.all)
         }
         try setCursor(Cursor.lastSyncedAt, to: Immich.iso8601String(from: Date()))
         Log.immich.info("Sync stream applied \(batch.upserts.count) upserts, \(batch.deletedIDs.count) deletes\(replacesCache ? " (replaced cache)" : "")")
+        if !batch.partners.isEmpty {
+            Log.device("immich", "Sync stream applied partner data: \(batch.partners.assets.count) assets, "
+                       + "\(batch.partners.shares.count) shares")
+        }
+        if replacesCache || !batch.partners.isEmpty {
+            postPartnersDidChange()
+        }
         if replacesCache {
             changesContinuation.yield(.all)
             return
@@ -171,9 +184,8 @@ actor RemoteLibraryService {
         var upserts: [String: Immich.SyncAssetV2] = [:]
         var exifs: [String: Immich.SyncAssetExifV1] = [:]
         var deletedIDs: [String] = []
-        // A per-type watermark, not a per-line receipt — acking the last id of a type
-        // acknowledges every line of that type before it too (verified against a live server).
-        var lastAckByType: [String: String] = [:]
+        var partners = PartnerSyncBatch()
+        var acks = Immich.SyncAcks()
         /// The server answered with `SyncResetV1` instead of changes.
         var serverRequestedReset = false
         /// This batch is a full replay from a `reset: true` request.
@@ -184,7 +196,9 @@ actor RemoteLibraryService {
                                 progress: (@Sendable (Int) -> Void)?) async throws -> SyncBatch {
         let body: Data
         do {
-            body = try await client.syncStream(types: [.assets, .assetExifs], reset: reset)
+            body = try await client.syncStream(types: [.assets, .assetExifs, .authUsers, .users, .partners,
+                                                       .partnerAssets, .partnerAssetExifs],
+                                               reset: reset)
         } catch ImmichError.unauthorized {
             session.markExpired()
             throw ImmichError.unauthorized
@@ -214,11 +228,13 @@ actor RemoteLibraryService {
                     .decode(Immich.SyncLine<Immich.SyncAssetDeleteV1>.self, from: lineData) else { break }
                 batch.deletedIDs.append(line.data.assetId)
             default:
-                // "SyncCompleteV1" (end-of-batch marker) and anything not requested/handled yet —
-                // degrade gracefully rather than fail the whole batch (see file header comment).
+                if batch.partners.add(type: header.type, line: Data(lineData)) { break }
+                // "SyncCompleteV1" (end-of-batch marker), "SyncAckV1" (end of a partner's
+                // backfill) and anything not requested/handled yet — degrade gracefully rather
+                // than fail the whole batch (see file header comment).
                 break
             }
-            batch.lastAckByType[header.type] = header.ack
+            batch.acks.record(header.ack)
             progress?(batch.upserts.count)
         }
         return batch
@@ -229,13 +245,16 @@ actor RemoteLibraryService {
     private func apply(upserts: [String: Immich.SyncAssetV2],
                        exifs: [String: Immich.SyncAssetExifV1],
                        deletedIDs: [String],
+                       partners: PartnerSyncBatch,
                        replacingCache: Bool) throws {
-        guard replacingCache || !upserts.isEmpty || !exifs.isEmpty || !deletedIDs.isEmpty else { return }
+        guard replacingCache || !upserts.isEmpty || !exifs.isEmpty || !deletedIDs.isEmpty
+                || !partners.isEmpty else { return }
         let writer = try database.writer()
 
         // One transaction with the upserts, so the grid never sees the cache empty.
         try writer.write { db in
             if replacingCache { try Self.clearServerAssets(db) }
+            try PartnerStore.apply(partners, in: db)
             for (id, asset) in upserts {
                 guard asset.visibility == .timeline else {
                     // Matches the old `isVisible: true` search filter (D9): archived, hidden and
@@ -351,6 +370,24 @@ actor RemoteLibraryService {
             }
             return stubs
         }
+    }
+
+    // MARK: - Partner sharing (§22)
+
+    /// Everyone sharing their library with the signed-in user, by name.
+    func partners() throws -> [Partner] {
+        guard !hasNoCache else { return [] }
+        return try database.writer().read { db in try PartnerStore.partners(in: db) }
+    }
+
+    /// One partner's visible assets, newest first.
+    func partnerStubs(ownerID: String) throws -> [AssetStub] {
+        guard !hasNoCache else { return [] }
+        return try database.writer().read { db in try PartnerStore.stubs(ownerID: ownerID, in: db) }
+    }
+
+    private nonisolated func postPartnersDidChange() {
+        NotificationCenter.default.post(name: Self.partnersDidChangeNotification, object: self)
     }
 
     /// For writers outside this actor — `SyncEngine` links facets as it checksums and uploads.
@@ -531,6 +568,7 @@ actor RemoteLibraryService {
     func wipeCache() throws {
         try database.writer().write { db in try Self.wipe(db) }
         changesContinuation.yield(.all)
+        postPartnersDidChange()
     }
 
     /// Wipes the cache unless it was filled by `owner`, then records `owner` as filling it.
@@ -551,7 +589,10 @@ actor RemoteLibraryService {
                            arguments: [Cursor.cacheOwner, owner])
             return true
         }
-        if wiped { changesContinuation.yield(.all) }
+        if wiped {
+            changesContinuation.yield(.all)
+            postPartnersDidChange()
+        }
         return wiped
     }
 
@@ -570,11 +611,12 @@ actor RemoteLibraryService {
                              BackupStateRecord.State.failed.rawValue])
     }
 
-    /// Drops every cached server asset and the server half of every link. Shared by `wipe` and
-    /// a reset replay; backup state is deliberately not touched here — on the *same* server, a
+    /// Drops every cached server asset, all partner data, and the server half of every link.
+    /// Shared by `wipe` and a reset replay; backup state is deliberately not touched here — on the *same* server, a
     /// photo uploaded and then deleted there must stay uploaded, or backup would restore it.
     private static func clearServerAssets(_ db: Database) throws {
         try db.execute(sql: "DELETE FROM remote_assets")
+        try PartnerStore.wipe(db)
         // The local half of a link is kept: a local checksum is computed only while its
         // backup_state row has none, so dropping it would leave the photo unlinked from its
         // server copy and shown twice.
