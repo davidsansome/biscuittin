@@ -12,11 +12,15 @@ final class GridViewController: UIViewController {
     /// Where this grid is being used. The home screen owns the timeline and its chrome; the map
     /// panel (§20) is handed a filtered snapshot and must not draw a search bar, a date scrubber
     /// or navigation items of its own.
-    enum Mode {
+    enum Mode: Equatable {
         /// Home screen: subscribes to the timeline, full chrome.
         case timeline
         /// A panel inside another screen, driven entirely by `showExternalSnapshot`.
         case map
+        /// A partner's library (§22), pushed from the home screen. Read-only: no multi-select,
+        /// and the viewer offers no rotate or delete. No search either — the index covers only
+        /// the user's own photos.
+        case partner(Partner)
     }
 
     private typealias DataSource = UICollectionViewDiffableDataSource<String, AssetID>
@@ -98,6 +102,14 @@ final class GridViewController: UIViewController {
     private var selectionToolbarBottom: NSLayoutConstraint?
     private var defaultRightBarButtonItem: UIBarButtonItem?
     private var mapBarButtonItem: UIBarButtonItem?
+    /// Shown only while someone shares a library with the user (§22), so it costs nothing to
+    /// everyone else.
+    private var partnersBarButtonItem: UIBarButtonItem?
+    private var partners: [Partner] = []
+    private var partnersTask: Task<Void, Never>?
+    /// Whether the first snapshot has arrived, so an empty partner library is not reported as
+    /// empty before it has been read.
+    private var hasReceivedSnapshot = false
 
     private let dateScrubber = DateScrubber()
 
@@ -150,6 +162,7 @@ final class GridViewController: UIViewController {
 
     deinit {
         snapshotTask?.cancel()
+        partnersTask?.cancel()
         fullBuildTask?.cancel()
         patchTask?.cancel()
     }
@@ -165,6 +178,14 @@ final class GridViewController: UIViewController {
         configureCollectionView()
         configureDataSource()
         configureStatusViews()
+
+        if case let .partner(partner) = mode {
+            title = partner.name
+            configureDateScrubber()
+            subscribeToSnapshots(env.partnerLibrary.snapshots(of: partner, grouping: env.settings.grouping))
+            updateStatusViews()
+            return
+        }
 
         guard mode == .timeline else {
             // The map panel gets its content pushed in; everything below drives or decorates the
@@ -182,7 +203,7 @@ final class GridViewController: UIViewController {
         observeStartupPhase()
 
         // Subscribe before kicking the boot cache so the very first snapshot is not missed.
-        subscribeToSnapshots()
+        subscribeToSnapshots(env.timelineStore.snapshots)
         Task { await env.timelineStore.loadBootSnapshot() }
     }
 
@@ -214,6 +235,8 @@ final class GridViewController: UIViewController {
             provenance: timeline.provenance == .bootCache ? "boot-cache" : "live")
         // The grid is genuinely on screen now: everything deferred by D19 may start.
         env.startup.firstFrameDidRender()
+        // Reading partners opens the database, which D19 keeps off the launch path.
+        observePartners()
     }
 
     override func viewDidLayoutSubviews() {
@@ -243,9 +266,8 @@ final class GridViewController: UIViewController {
         collectionView.delegate = self
         view.addSubview(collectionView)
 
-        // Only the home screen owns a live server connection; the map panel is fed a filtered
-        // snapshot and has nothing of its own to refresh (D9).
-        if mode == .timeline {
+        // The map panel is fed a filtered snapshot and has nothing of its own to refresh (D9).
+        if mode != .map {
             let refresh = UIRefreshControl()
             refresh.addAction(UIAction { [weak self] _ in self?.handlePullToRefresh() }, for: .valueChanged)
             collectionView.refreshControl = refresh
@@ -268,7 +290,8 @@ final class GridViewController: UIViewController {
             cell.configure(stub: stub,
                            loader: self.env.imageLoader,
                            tileSize: self.currentTileSize(),
-                           isSelected: self.selection.isActive && self.selection.contains(stub.id))
+                           isSelected: self.selection.isActive && self.selection.contains(stub.id),
+                           showsCloudBadge: !self.isPartnerLibrary)
             return cell
         }
 
@@ -295,7 +318,7 @@ final class GridViewController: UIViewController {
                                            action: #selector(presentMap))
         mapBarButtonItem?.accessibilityLabel = "Map"
         // `rightBarButtonItems` is ordered right-to-left, so the map sits outermost.
-        navigationItem.rightBarButtonItems = [mapBarButtonItem, item].compactMap { $0 }
+        navigationItem.rightBarButtonItems = defaultRightBarButtonItems
         navigationItem.leftBarButtonItems = [
             UIBarButtonItem(image: UIImage(systemName: "gearshape"),
                             style: .plain,
@@ -356,6 +379,73 @@ final class GridViewController: UIViewController {
         backupIndicatorButton.accessibilityLabel = status.remainingCount > 0
             ? "\(status.remainingCount) items waiting to back up"
             : "All items backed up"
+    }
+
+    /// The non-selecting right-hand items, outermost first.
+    private var defaultRightBarButtonItems: [UIBarButtonItem] {
+        [mapBarButtonItem, partnersBarButtonItem, defaultRightBarButtonItem].compactMap { $0 }
+    }
+
+    private var isPartnerLibrary: Bool {
+        if case .partner = mode { return true }
+        return false
+    }
+
+    // MARK: - Partner sharing (§22)
+
+    /// Keeps the partners button in step with who shares with the user. Each sync that touches
+    /// partner data re-reads the list, and so does a sign-in or sign-out, which wipe it.
+    private func observePartners() {
+        guard mode == .timeline, partnersTask == nil else { return }
+        partnersTask = Task { [weak self] in
+            let changes = NotificationCenter.default.notifications(
+                named: RemoteLibraryService.partnersDidChangeNotification)
+            var iterator = changes.makeAsyncIterator()
+            repeat {
+                guard let library = self?.env.partnerLibrary else { return }
+                let partners = await library.partners()
+                self?.updatePartners(partners)
+            } while await iterator.next() != nil
+        }
+    }
+
+    private func updatePartners(_ new: [Partner]) {
+        guard new != partners else { return }
+        partners = new
+        partnersBarButtonItem = makePartnersBarButtonItem()
+        if !selection.isActive {
+            navigationItem.rightBarButtonItems = defaultRightBarButtonItems
+        }
+    }
+
+    /// One partner opens straight away; several are listed in a menu, which saves an
+    /// intermediate screen with nothing on it but names.
+    private func makePartnersBarButtonItem() -> UIBarButtonItem? {
+        guard !partners.isEmpty else { return nil }
+        let image = UIImage(systemName: partners.count == 1 ? "person" : "person.2")
+        let item: UIBarButtonItem
+        if partners.count == 1, let partner = partners.first {
+            item = UIBarButtonItem(image: image, primaryAction: UIAction { [weak self] _ in
+                self?.openPartnerLibrary(partner)
+            })
+            item.accessibilityLabel = "\(partner.name)’s photos"
+        } else {
+            let actions = partners.map { partner in
+                UIAction(title: partner.name, image: UIImage(systemName: "person")) { [weak self] _ in
+                    self?.openPartnerLibrary(partner)
+                }
+            }
+            item = UIBarButtonItem(image: image, menu: UIMenu(title: "Shared with You", children: actions))
+            item.accessibilityLabel = "Partners’ photos"
+        }
+        return item
+    }
+
+    /// Pushed rather than presented: it is another grid of photos, and the back button and
+    /// edge swipe are how the user returns to their own.
+    private func openPartnerLibrary(_ partner: Partner) {
+        let library = GridViewController(env: env, mode: .partner(partner))
+        navigationController?.pushViewController(library, animated: true)
     }
 
     /// Full screen: the map owns the whole window, and its own close button dismisses it
@@ -558,7 +648,7 @@ final class GridViewController: UIViewController {
         navigationItem.rightBarButtonItems = active
             ? [UIBarButtonItem(title: "Cancel", style: .done, target: self,
                                action: #selector(cancelSelection))]
-            : [mapBarButtonItem, defaultRightBarButtonItem].compactMap { $0 }
+            : defaultRightBarButtonItems
         title = active
             ? (selection.isEmpty ? "Select Items" : "\(selection.count) Selected")
             : "Photos"
@@ -706,10 +796,12 @@ final class GridViewController: UIViewController {
 
     // MARK: - Snapshot plumbing
 
-    private func subscribeToSnapshots() {
+    private func subscribeToSnapshots(_ snapshots: AsyncStream<TimelineSnapshot>) {
+        // Holds self weakly between snapshots: a partner's library is popped and must be freed,
+        // which in turn cancels this task and ends the stream.
         snapshotTask = Task { [weak self] in
-            guard let self else { return }
-            for await snapshot in self.env.timelineStore.snapshots {
+            for await snapshot in snapshots {
+                guard let self else { return }
                 await MainActor.run { self.apply(snapshot) }
             }
         }
@@ -717,21 +809,29 @@ final class GridViewController: UIViewController {
 
     /// Pull-to-refresh (D9): a manual `sync/stream` catch-up, including any server-side deletes.
     private func handlePullToRefresh() {
+        let isPartnerLibrary = isPartnerLibrary
         Task { [weak self] in
-            guard let self else { return }
-            await self.env.startup.pullToRefresh()
-            await MainActor.run { self.collectionView.refreshControl?.endRefreshing() }
+            guard let startup = self?.env.startup else { return }
+            if isPartnerLibrary {
+                await startup.pullToRefreshPartners()
+            } else {
+                await startup.pullToRefresh()
+            }
+            await MainActor.run { self?.collectionView.refreshControl?.endRefreshing() }
         }
     }
 
     private func apply(_ new: TimelineSnapshot) {
         let previous = patchTarget ?? fullTimeline
+        hasReceivedSnapshot = true
 
         // §14 P1 is about photos being visible, not just a view existing. Measured from the
         // live timeline even mid-search: it is a launch metric, not a display one.
-        LaunchClock.reportFirstContent(
-            itemCount: new.totalCount,
-            provenance: new.provenance == .bootCache ? "boot-cache" : "live")
+        if mode == .timeline {
+            LaunchClock.reportFirstContent(
+                itemCount: new.totalCount,
+                provenance: new.provenance == .bootCache ? "boot-cache" : "live")
+        }
 
         let isFirstPaint = previous.totalCount == 0
         let groupingChanged = new.grouping != previous.grouping
@@ -1090,7 +1190,8 @@ final class GridViewController: UIViewController {
         for case let cell as AssetCell in collectionView.visibleCells {
             guard let indexPath = collectionView.indexPath(for: cell),
                   let stub = displayed.stub(at: indexPath) else { continue }
-            cell.configure(stub: stub, loader: env.imageLoader, tileSize: tileSize, isSelected: false)
+            cell.configure(stub: stub, loader: env.imageLoader, tileSize: tileSize, isSelected: false,
+                           showsCloudBadge: !isPartnerLibrary)
         }
     }
 
@@ -1106,6 +1207,14 @@ final class GridViewController: UIViewController {
     private func updateStatusViews() {
         let phase = env.startup.phase
         let isEmpty = displayed.isEmpty
+
+        if case let .partner(partner) = mode {
+            statusLabel.text = !isEmpty ? nil
+                : hasReceivedSnapshot ? "\(partner.name) hasn’t shared any photos yet." : "Loading…"
+            statusLabel.isHidden = !isEmpty
+            settingsButton.isHidden = true
+            return
+        }
 
         // A search with no matches is not an empty library; saying so would read as data loss.
         if searchSession.isSearching {
@@ -1227,7 +1336,8 @@ extension GridViewController {
         let viewer = ViewerPagerController(env: env,
                                            items: items,
                                            startIndex: startIndex,
-                                           source: self)
+                                           source: self,
+                                           library: isPartnerLibrary ? .partner : .own)
         present(viewer, animated: true)
     }
 }

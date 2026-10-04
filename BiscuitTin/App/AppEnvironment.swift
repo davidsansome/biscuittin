@@ -25,6 +25,7 @@ final class AppEnvironment: ObservableObject {
     let searchIndexer: SearchIndexer
     let immichSession: ImmichAuthSession
     let remoteLibrary: RemoteLibraryService
+    let partnerLibrary: PartnerLibrary
     let remoteImages: RemoteImageFetcher
     let exporter: LocalAssetExporter
     let syncEngine: SyncEngine
@@ -72,6 +73,7 @@ final class AppEnvironment: ObservableObject {
         self.rotators = rotators
         self.immichSession = immichSession
         self.remoteLibrary = remoteLibrary
+        self.partnerLibrary = PartnerLibrary(remoteLibrary: remoteLibrary)
         self.remoteImages = remoteImages
         self.exporter = exporter
         self.syncEngine = syncEngine

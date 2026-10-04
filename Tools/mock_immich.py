@@ -8,6 +8,12 @@ API keys in `x-api-key`. Assets are synthetic, with solid-colour PNG thumbnails
 so remote tiles are visually distinguishable from local ones. `sync/stream`
 sends them as `AssetV2`/`AssetExifV1` lines until acked, keeping one checkpoint
 per ack prefix as the real server does; `reset: true` clears the checkpoints.
+As on a real server, sync refuses API keys.
+
+Partner sharing is modelled too: a partner ("Alice") shares a library with the
+signed-in user, and the user shares with someone else ("Bob"), so the app must
+tell the two directions apart. `--partners N` changes how many partners share
+with the user (0 hides the feature).
 
 `/video/playback` serves a real H.264 clip for the synthetic video, honouring
 HTTP range requests the way AVPlayer issues them. The clip is made with ffmpeg
@@ -147,7 +153,7 @@ VIDEO_PATH = None
 
 
 def sync_lines(types):
-    """Every asset line not yet acked, in the server's order: assets, then their EXIF."""
+    """Every line not yet acked: the user's assets and their EXIF, then partner sharing."""
     lines = []
     if "AssetsV2" in types:
         for asset in ASSETS:
@@ -168,6 +174,7 @@ def sync_lines(types):
                 "assetId": asset["id"], "orientation": "1", "modifyDate": None, "timeZone": None,
                 "projectionType": None, "profileDescription": None, "rating": None, "fps": None,
                 **exif}})
+    lines += partner_sync_lines(types)
     unacked = [line for line in lines if line["ack"].split("|")[0] not in SYNC_CHECKPOINTS]
     unacked.append({"type": "SyncCompleteV1", "ack": "SyncCompleteV1|now", "data": {}})
     return unacked
@@ -184,6 +191,95 @@ def make_video():
                         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
                         "-movflags", "+faststart", "-shortest", path], check=True)
     return path
+
+# Partner sharing, in v3.2.4's sync-line shapes. Ids only need to be stable strings here.
+USER_ID = "user-1"
+PARTNERS = [("partner-alice", "Alice", "alice@example.com"),
+            ("partner-carol", "Carol", "carol@example.com")]
+PARTNER_COUNT = 1
+# Someone the user shares *with*. Their library is not visible to the user.
+SHARED_WITH = ("partner-bob", "Bob", "bob@example.com")
+
+
+def build_partner_assets(owner_id, count):
+    now = datetime.now(timezone.utc)
+    assets = []
+    for i in range(count):
+        captured = now - timedelta(days=i * 3 + 1, hours=i)
+        is_video = (i == 4)
+        assets.append({
+            "id": f"{owner_id}-asset-{i:02d}",
+            "ownerId": owner_id,
+            "originalFileName": f"{owner_id}-{i:02d}.{'mp4' if is_video else 'jpg'}",
+            "thumbhash": None,
+            "checksum": base64.b64encode(hashlib.sha1(f"{owner_id}-{i}".encode()).digest()).decode(),
+            "fileCreatedAt": captured.isoformat(),
+            "fileModifiedAt": captured.isoformat(),
+            "createdAt": now.isoformat(),
+            "localDateTime": captured.isoformat(),
+            "duration": 12000 if is_video else None,
+            "type": "VIDEO" if is_video else "IMAGE",
+            "deletedAt": None,
+            "isFavorite": False,
+            # One archived asset, which must not show.
+            "visibility": "archive" if i == 7 else "timeline",
+            "livePhotoVideoId": None,
+            "stackId": None,
+            "libraryId": None,
+            "width": 1920 if is_video else 3000,
+            "height": 1080 if is_video else 4000,
+            "isEdited": False,
+        })
+    return assets
+
+
+def user_line(entity_type, user_id, name, email):
+    return {"type": entity_type, "ack": f"{entity_type}|{user_id}",
+            "data": {"id": user_id, "name": name, "email": email, "avatarColor": None,
+                     "deletedAt": None, "hasProfileImage": False,
+                     "profileChangedAt": "2026-01-01T00:00:00.000Z"}}
+
+
+def partner_sync_lines(types):
+    """Every partner-sharing line, acked or not."""
+    partners = PARTNERS[:PARTNER_COUNT]
+    lines = []
+    if "AuthUsersV1" in types:
+        lines.append(user_line("AuthUserV1", USER_ID, "Dave", MOCK_EMAIL))
+    if "UsersV1" in types:
+        lines.append(user_line("UserV1", USER_ID, "Dave", MOCK_EMAIL))
+        for user in partners + [SHARED_WITH]:
+            lines.append(user_line("UserV1", *user))
+    if "PartnersV1" in types:
+        for partner_id, _, _ in partners:
+            lines.append({"type": "PartnerV1", "ack": f"PartnerV1|{partner_id}",
+                          "data": {"sharedById": partner_id, "sharedWithId": USER_ID,
+                                   "inTimeline": False}})
+        lines.append({"type": "PartnerV1", "ack": f"PartnerV1|{SHARED_WITH[0]}",
+                      "data": {"sharedById": USER_ID, "sharedWithId": SHARED_WITH[0],
+                               "inTimeline": False}})
+    partner_assets = [a for partner_id, _, _ in partners for a in build_partner_assets(partner_id, 18)]
+    if "PartnerAssetsV2" in types:
+        # A first request has no upsert checkpoint, so the server sends every asset as an
+        # upsert and records the backfills as already complete.
+        for asset in partner_assets:
+            lines.append({"type": "PartnerAssetV2", "ack": f"PartnerAssetV2|{asset['id']}",
+                          "data": asset})
+    if "PartnerAssetExifsV1" in types:
+        for i, asset in enumerate(partner_assets):
+            lines.append({"type": "PartnerAssetExifV1", "ack": f"PartnerAssetExifV1|{asset['id']}",
+                          "data": {"assetId": asset["id"], "description": None,
+                                   "exifImageWidth": asset["width"], "exifImageHeight": asset["height"],
+                                   "fileSizeInByte": 2_000_000, "orientation": "1",
+                                   "dateTimeOriginal": asset["fileCreatedAt"], "modifyDate": None,
+                                   "timeZone": None, "latitude": 51.5 + i * 0.01,
+                                   "longitude": -0.12 + i * 0.01, "projectionType": None,
+                                   "city": "London", "state": None, "country": "United Kingdom",
+                                   "make": "Partner", "model": "Phone", "lensModel": None,
+                                   "fNumber": 1.8, "focalLength": 5.1, "iso": 64,
+                                   "exposureTime": "1/120", "profileDescription": None,
+                                   "rating": None, "fps": None}})
+    return lines
 REQUEST_LOG = []
 # checksum -> server asset id, so bulk-upload-check can report duplicates
 UPLOADED_CHECKSUMS = {}
@@ -388,19 +484,25 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/sync/stream":
             if not self._authorized():
                 return self._send(401, {"message": "Authentication required"})
+            if self.headers.get("x-api-key"):
+                return self._send(403, {"message": "Sync endpoints cannot be used with API keys"})
             body = json.loads(raw or b"{}")
             if body.get("reset"):
                 SYNC_CHECKPOINTS.clear()
             lines = sync_lines(body.get("types", []))
-            print(f"  sync/stream: {len(lines)} lines", flush=True)
+            print(f"  sync/stream: {len(lines)} lines "
+                  f"({sum(1 for l in lines if l['type'] == 'PartnerAssetV2')} partner assets)", flush=True)
             payload = "".join(json.dumps(line) + "\n" for line in lines).encode()
             return self._send(200, payload, content_type="application/jsonlines+json")
 
         if path == "/api/sync/ack":
             if not self._authorized():
                 return self._send(401, {"message": "Authentication required"})
+            if self.headers.get("x-api-key"):
+                return self._send(403, {"message": "Sync endpoints cannot be used with API keys"})
             for ack in json.loads(raw or b"{}").get("acks", []):
                 SYNC_CHECKPOINTS[ack.split("|")[0]] = ack
+            print(f"  sync/ack: checkpoints now {sorted(SYNC_CHECKPOINTS)}", flush=True)
             return self._send(204, b"", content_type="application/json")
 
         if path == "/api/assets/bulk-upload-check":
@@ -520,9 +622,12 @@ if __name__ == "__main__":
                         help="seconds to hold each upload's response")
     parser.add_argument("--save-uploads", metavar="DIR",
                         help="write each uploaded file into DIR")
+    parser.add_argument("--partners", type=int, default=1, choices=range(len(PARTNERS) + 1),
+                        help="how many partners share their library with the user")
     parser.add_argument("--video", metavar="FILE",
                         help="clip to serve from /video/playback (default: made with ffmpeg)")
     args = parser.parse_args()
+    PARTNER_COUNT = args.partners
     VIDEO_PATH = args.video or make_video()
     UPLOAD_DELAY = args.upload_delay
     SAVE_UPLOADS = args.save_uploads
