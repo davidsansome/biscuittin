@@ -95,8 +95,8 @@ struct SettingsScreen: View {
                     Button("Cancel") { viewModel.cancelSignIn() }
                         .buttonStyle(.borderless)
                 }
-                if let count = viewModel.syncedCount {
-                    Text("\(count) items catalogued")
+                if let progress = viewModel.syncProgress {
+                    Text(Self.progressText(progress))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -110,6 +110,14 @@ struct SettingsScreen: View {
                 Text("Optional. Biscuit Tin works fully offline with just the photos on this \(DeviceName.current).")
             }
         }
+    }
+
+    /// A partner's library can dwarf the user's own and arrives in the same download, so it is
+    /// counted too — otherwise a long sign-in sync reads "0 items" throughout.
+    static func progressText(_ progress: SyncProgress) -> String {
+        let own = "\(progress.assets.formatted()) items catalogued"
+        guard progress.partnerAssets > 0 else { return own }
+        return "\(own), plus \(progress.partnerAssets.formatted()) shared with you"
     }
 
     private var accountRow: some View {

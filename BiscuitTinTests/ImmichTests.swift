@@ -280,7 +280,7 @@ final class ImmichTests: XCTestCase {
                                   tokenProvider: { "tok" })
 
         await recorder.stub(path: "/api/sync/stream", json: "")
-        _ = try await client.syncStream(types: [.assets, .assetExifs], reset: true)
+        for try await _ in try await client.syncStream(types: [.assets, .assetExifs], reset: true) {}
 
         let request = await recorder.lastRequest
         XCTAssertEqual(request?.httpMethod, "POST")
@@ -292,6 +292,40 @@ final class ImmichTests: XCTestCase {
         let decoded = try JSONDecoder().decode(DecodedSyncStreamRequest.self, from: body)
         XCTAssertEqual(decoded.types, ["AssetsV2", "AssetExifsV1"])
         XCTAssertTrue(decoded.reset)
+    }
+
+    /// Lines must come out whole however the body is cut into network chunks.
+    func testLineSplitterJoinsLinesAcrossChunks() {
+        var splitter = NDJSONLineSplitter()
+        XCTAssertEqual(splitter.append(Data("{\"a\":1}\n{\"b\"".utf8)), [Data("{\"a\":1}".utf8)])
+        XCTAssertEqual(splitter.append(Data(":2}".utf8)), [], "no newline yet, so the line is not complete")
+        XCTAssertEqual(splitter.append(Data("\n\n{\"c\":3}\n{\"d\":4}".utf8)),
+                       [Data("{\"b\":2}".utf8), Data("{\"c\":3}".utf8)], "blank lines are dropped")
+        XCTAssertEqual(splitter.finish(), [Data("{\"d\":4}".utf8)],
+                       "a final line without a trailing newline is still a line")
+        XCTAssertEqual(splitter.finish(), [])
+    }
+
+    func testSyncStreamYieldsLinesAndReportsAuthFailures() async throws {
+        let recorder = RequestRecorder()
+        let client = ImmichClient(baseURL: URL(string: "https://s.example.com")!,
+                                  session: StubURLProtocol.makeSession(recorder),
+                                  tokenProvider: { "tok" })
+        await recorder.enqueue(path: "/api/sync/stream", json: "{\"n\":1}\n{\"n\":2}")
+        await recorder.enqueue(path: "/api/sync/stream", json: #"{"message":"Invalid user token"}"#, status: 401)
+
+        var lines: [Data] = []
+        for try await batch in try await client.syncStream(types: [.assets], reset: false) {
+            lines += batch
+        }
+        XCTAssertEqual(lines, [Data("{\"n\":1}".utf8), Data("{\"n\":2}".utf8)])
+
+        do {
+            for try await batch in try await client.syncStream(types: [.assets], reset: false) {
+                XCTFail("a 401 body is not sync lines: \(batch)")
+            }
+            XCTFail("expected the 401 to be thrown")
+        } catch ImmichError.unauthorized {}
     }
 
     func testSyncAckPostsAckIDs() async throws {

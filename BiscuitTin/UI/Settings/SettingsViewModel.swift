@@ -15,7 +15,7 @@ final class SettingsViewModel: ObservableObject {
     @Published private(set) var isWorking = false
     @Published private(set) var statusMessage: String?
     @Published private(set) var errorMessage: String?
-    @Published private(set) var syncedCount: Int?
+    @Published private(set) var syncProgress: SyncProgress?
     @Published private(set) var lastSyncDate: Date?
 
     private let session: ImmichAuthSession
@@ -121,8 +121,8 @@ final class SettingsViewModel: ObservableObject {
                    try await self.remoteLibrary.claimCache(for: owner) {
                     self.imageCache.clearCache()
                 }
-                try await self.remoteLibrary.syncStream(reset: true) { count in
-                    Task { @MainActor [weak self] in self?.syncedCount = count }
+                try await self.remoteLibrary.syncStream(reset: true) { progress in
+                    Task { @MainActor [weak self] in self?.syncProgress = progress }
                 }
 
                 // No explicit timeline refresh here. `syncStream` already yields on the remote
@@ -155,7 +155,7 @@ final class SettingsViewModel: ObservableObject {
         signInTask?.cancel()
         session.signOut()
         state = session.state
-        syncedCount = nil
+        syncProgress = nil
         lastSyncDate = nil
         Task { [weak self] in
             guard let self else { return }
@@ -175,7 +175,7 @@ final class SettingsViewModel: ObservableObject {
             self.imageCache.clearCache()
             await self.timelineStore.refresh()
             self.serverURL = nil
-            self.syncedCount = nil
+            self.syncProgress = nil
             self.lastSyncDate = nil
             self.isWorking = false
         }

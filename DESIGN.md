@@ -82,7 +82,7 @@ downstream assumes them as written.
 | **D6** | Timeline construction | **In-memory merged index** of lightweight `AssetStub` structs (~56 bytes each) sorted by capture date desc, bucketed on demand by day/week/month, published as immutable snapshots. Two additions for performance: **(a)** the index is **persisted as a boot cache** and loaded before anything else at launch (D19); **(b)** library/sync changes are applied **incrementally** to the index, not by full rebuild (D20) — full rebuild remains as the reconciliation fallback. | 200k stubs ≈ 12 MB — acceptable. If profiling shows problems at extreme sizes, the `TimelineStore` API is designed so a windowed implementation can replace the in-memory one without touching the UI. |
 | **D7** | Immich auth | Three ways in, one stored credential: **email + password** (`POST /api/auth/login`), **OAuth** (`POST /api/oauth/authorize` → `ASWebAuthenticationSession` → `POST /api/oauth/callback`, with on-device state + PKCE S256), or a user-created **API key**. The token or key is **stored in Keychain**; the password never is. Requests carry `Authorization: Bearer <token>` or `x-api-key: <key>` via `ImmichCredential`. | Matches requirement 13. OAuth and API keys were added with the sign-in flow (Implementation Log, 2026-09-23): servers with `passwordLogin: false` were otherwise impossible to sign in to. |
 | **D8** | Immich API surface & versioning | Target **Immich v3.1.0** (current release, confirmed at review); require **server ≥ v3.0** via `GET /api/server/about` at login, failing settings validation with a clear message on older servers. | Implementers **must validate every endpoint path, field, and multipart shape against the v3.1.0 OpenAPI spec** — Immich serves it at `/api/docs` on the target server. The endpoint tables in §7 are the contract to verify, not a substitute for the spec. |
-| **D9** | Remote metadata sync strategy | Both full and incremental sync go through **`POST /api/sync/stream`** (`types: [AssetsV2, AssetExifsV1]`), whose cursor Immich tracks server-side per access token: `reset: true` replays the whole library (first sign-in), `reset: false` replays only what changed (foreground, pull-to-refresh, Settings "Refresh Now"). Hard deletes arrive as explicit `AssetDeleteV1` lines in that same stream, so there is **no separate reconciliation sweep** — a delete is visible on the very next sync, not gated behind a weekly cursor. A `reset: true` replay — asked for at sign-in, or by the server with a lone `SyncResetV1` line once the session's checkpoint outlives its 30-day audit retention — **replaces** the cached server rows rather than merging into them (Implementation Log, 2026-10-04). Acks are a per-type watermark (`POST /api/sync/ack`), so at most 3 are ever sent regardless of library size. | Superseded the original paged-`search/metadata` design (below) once the dedicated sync endpoints were confirmed stable against a real v3.1.0 server — see Implementation Log, 2026-09-23. `RemoteLibraryService.syncStream` is still the sole point of contact, so nothing above it changed. Original v1 design, kept for context: full sync paged `search/metadata` (`updatedAfter` cursor for delta), with deletions caught only by a periodic full-ID sweep — weekly, or in principle on pull-to-refresh, though no such control was ever wired up, so in practice a hard delete could sit unsynced for up to 7 days. |
+| **D9** | Remote metadata sync strategy | Both full and incremental sync go through **`POST /api/sync/stream`** (`types: [AssetsV2, AssetExifsV1]`), whose cursor Immich tracks server-side per access token: `reset: true` replays the whole library (first sign-in), `reset: false` replays only what changed (foreground, pull-to-refresh, Settings "Refresh Now"). Hard deletes arrive as explicit `AssetDeleteV1` lines in that same stream, so there is **no separate reconciliation sweep** — a delete is visible on the very next sync, not gated behind a weekly cursor. A `reset: true` replay — asked for at sign-in, or by the server with a lone `SyncResetV1` line once the session's checkpoint outlives its 30-day audit retention — **replaces** the cached server rows rather than merging into them (Implementation Log, 2026-10-04). The stream is applied **as it downloads**, committed and acked in chunks about every 2 s, and a replay removes whatever it did not mention only at its end, so the grid never empties meanwhile (Implementation Log, 2026-10-05). Acks are a per-checkpoint watermark (`POST /api/sync/ack`), so each chunk sends only a handful regardless of library size. | Superseded the original paged-`search/metadata` design (below) once the dedicated sync endpoints were confirmed stable against a real v3.1.0 server — see Implementation Log, 2026-09-23. `RemoteLibraryService.syncStream` is still the sole point of contact, so nothing above it changed. Original v1 design, kept for context: full sync paged `search/metadata` (`updatedAfter` cursor for delta), with deletions caught only by a periodic full-ID sweep — weekly, or in principle on pull-to-refresh, though no such control was ever wired up, so in practice a hard delete could sit unsynced for up to 7 days. |
 | **D10** | Rotation architecture | Rotation is a **per-facet physical operation dispatched by `MediaKind` to a per-kind strategy** behind one `AssetRotator` protocol. **v1 ships the image strategy**; the video and Live Photo strategies ship in **M9**, but their approach is decided now: **videos rotate losslessly** by rewriting the track transform (remux via `AVMutableMovie`, no re-encode) — locally written as a PhotoKit content-editing output, remotely as download → remux → `PUT /api/assets/{id}/original`; **Live Photos rotate via `PHLivePhotoEditingContext`** (keeps still + paired video consistent) locally, with the remote still replaced like an image. Images: local → PhotoKit content edit (Core Image re-encode); remote → download, rotate pixels, replace-original. Both facets are always updated; remote failure → partial-success toast + queued retry (D22 — the queue is what actually catches the remote copy up once the server is reachable again, not just a phrase for the toast). Until M9, non-image rotations are skipped with a reported count. | Immich has no server-side rotate. Pixel rotation (images) keeps Immich thumbnails correct; transform-remux (video) avoids re-encoding multi-GB files and is lossless. The strategy protocol is the day-one commitment; per-kind implementations are additive. |
 | **D11** | Delete semantics | The delete button (grid multi-select and viewer) **always deletes everywhere**: local facet via `PHAssetChangeRequest.deleteAssets` (iOS shows its own system confirmation) and remote facet via `DELETE /api/assets` (Immich moves to trash — recoverable server-side). Mixed-facet and remote-only deletes get **one app confirmation dialog** stating exactly what will happen. Local-only deletion is **never** offered through the delete button — it exists only as the separate "Free up space" feature (D18). | Confirmed at review: delete means delete, everywhere; freeing device space is a distinct, clearly-labeled operation. |
 | **D12** | Upload sync mechanics | `BGProcessingTask` + **background `URLSession`** upload tasks; dedup before upload via `POST /api/assets/bulk-upload-check` with SHA-1 checksums; checksums computed streaming and cached in SQLite. Sync also runs opportunistically while the app is foregrounded. Videos upload through the same pipeline. | Background URLSession survives suspension; bulk-upload-check avoids re-uploading assets that already exist server-side (critical for first-run against an existing library). |
@@ -353,7 +353,8 @@ actor ImmichClient {
 
     // Sync (D9) — what RemoteLibraryService.syncStream actually drives; searchAssets above is
     // no longer on the sync path (kept as a general-purpose, independently-tested primitive).
-    func syncStream(types: [SyncRequestType], reset: Bool) async throws -> Data // POST /api/sync/stream (NDJSON)
+    func syncStream(types: [SyncRequestType], reset: Bool) async throws
+        -> AsyncThrowingStream<[Data], Error>                                   // POST /api/sync/stream (NDJSON lines, as they download)
     func syncAck(_ acks: [String]) async throws                                 // POST /api/sync/ack
 
     // Binary
@@ -395,7 +396,8 @@ Notes for implementers:
 ```swift
 actor RemoteLibraryService {
     var isConfigured: Bool                              // has base URL + token
-    func syncStream(reset: Bool) async throws           // sync/stream + apply + ack (D9)
+    func syncStream(reset: Bool,                        // sync/stream, applied + acked in chunks (D9)
+                    progress: ((SyncProgress) -> Void)?) async throws
     var changes: AsyncStream<Void>                       // a batch committed → TimelineStore re-merges
 
     // Pending-edit retry queue (D22)
@@ -810,7 +812,9 @@ SwiftUI form:
   3. **Backup scope** (D17) as cards: all (with the local item count), new only, or just
      browse. Skipped when a scope was already chosen (e.g. re-signing in after expiry).
   Sign-in stores the credential, then the initial `syncStream(reset: true)` runs in the
-  settings model with a progress row; the rest of the app stays fully usable meanwhile.
+  settings model with a progress row; the rest of the app stays fully usable meanwhile. The row
+  counts the user's own items and, separately, items partners share (§22), which arrive in the
+  same download and can be far more numerous.
 - **Sync**: toggle (req. 14) — first enable without a chosen scope re-asks the
   scope question. Below the toggle: a scope row showing "All items" or
   "New items only (since 18 Aug 2026)" with an **Upgrade to all items** button
@@ -1286,6 +1290,9 @@ Details checked against the v3.2.4 server source (`sync.service.ts`):
   dictionary order, and the backfill could replay on every sync.
 - Sync endpoints refuse API keys (`Sync endpoints cannot be used with API keys`). This
   feature, like server sync generally, needs a password or OAuth sign-in.
+- A partner's library can be far larger than the user's own, and it comes in the same
+  download. Because the stream is applied in chunks as it arrives (D9), the partners button
+  appears within seconds of sign-in and the library fills in behind it.
 
 ### 22.3 The screen is the real grid
 
@@ -1314,6 +1321,43 @@ assumptions (AGENTS.md).
 ---
 
 ## 21. Implementation Log
+
+### Sync applied as it downloads (2026-10-05)
+
+On a real v3.0.3 server, signing in to an account whose partner shares 113,040 assets showed
+**no partners button for minutes**: no button, no progress, no error. `syncStream` read the
+whole `sync/stream` body into memory and wrote it in one transaction, and the partner change
+notification fired only after that. The download took minutes, and all that time the database
+held nothing at all. The settings progress row counted only the user's own assets, so for an
+account with none it read "0 items catalogued" throughout. Against the 815-asset test partner
+the same wait was under a second, so every earlier run looked correct. That a sync was still
+running, not failing, showed up only by reading the database (no `last_synced_at`, no
+`auth_user_id`) and then watching the log line arrive.
+
+* **`ImmichClient.syncStream` yields lines as they arrive.** A per-task
+  `URLSessionDataDelegate` cuts the body into lines (`NDJSONLineSplitter`). It does not use
+  `URLSession.bytes`, which yields one byte per iteration, far too slow for a body past a
+  hundred megabytes. Holding the whole body in memory goes away too.
+* **`RemoteLibraryService` commits, announces and then acks a chunk about every 2 s**, with
+  a 20,000-line cap per chunk to bound memory. Commits are cut by time because each one costs the
+  timeline a rebuild. Acking only after the write means an interrupted sync resumes from the
+  last stored chunk.
+* **A replay no longer clears the cache up front.** In one transaction that was invisible, but
+  committed in chunks it would empty the grid for the whole download. Instead the replay
+  remembers the ids it mentions, and its final transaction drops every server row,
+  partner row and server half of a link that it did not mention. That leaves exactly what
+  clear-then-apply did. Backup state is still not touched.
+* **An interrupted replay is finished by another replay.** Its early chunks are stored and
+  acked, but the sweep never ran, so `kv.unfinished_replay` is set with the first chunk and
+  cleared by the sweep. While it is set, the next sync asks for `reset: true` even if the caller
+  asked for an incremental one. Otherwise rows deleted on the server before the replay would
+  never be mentioned again and would stay forever.
+* **The sign-in progress row counts partner assets separately** (`SyncProgress`).
+
+Testing caveat: a `URLProtocol` stub that fails straight after loading data has the data
+discarded by URLSession. The delegate never sees it, which is not what a real dropped
+connection does. The interrupted-replay test therefore interrupts by failing the first chunk's
+ack instead.
 
 ### Partner sharing (2026-10-04)
 
