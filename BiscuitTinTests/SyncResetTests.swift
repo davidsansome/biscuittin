@@ -21,11 +21,12 @@ final class SyncResetTests: XCTestCase {
         try super.tearDownWithError()
     }
 
-    private func makeService() -> RemoteLibraryService {
+    private func makeService(maxLinesPerCommit: Int = 20_000) -> RemoteLibraryService {
         RemoteLibraryService(database: database,
                              session: ImmichAuthSession(defaults: UserDefaults(suiteName: "sync-reset-tests-\(UUID())")!),
                              resolver: PHAssetResolver(),
-                             exporter: LocalAssetExporter())
+                             exporter: LocalAssetExporter(),
+                             maxLinesPerCommit: maxLinesPerCommit)
     }
 
     private func makeClient(_ recorder: RequestRecorder) -> ImmichClient {
@@ -65,6 +66,19 @@ final class SyncResetTests: XCTestCase {
         {"type":"AssetV2","ack":"AssetV2|0002","data":{"id":"kept","originalFileName":"x.jpg",\
         "checksum":"uw==","fileCreatedAt":"2026-08-18T10:00:00.000Z","fileModifiedAt":null,\
         "localDateTime":"2026-08-18T10:00:00.000Z","duration":null,"type":"IMAGE",\
+        "deletedAt":null,"visibility":"timeline","livePhotoVideoId":null,"width":100,"height":100}}
+        """
+    private static let freshLine = """
+        {"type":"AssetV2","ack":"AssetV2|0004","data":{"id":"fresh","originalFileName":"y.jpg",\
+        "checksum":"3Q==","fileCreatedAt":"2026-08-19T10:00:00.000Z","fileModifiedAt":null,\
+        "localDateTime":"2026-08-19T10:00:00.000Z","duration":null,"type":"IMAGE",\
+        "deletedAt":null,"visibility":"timeline","livePhotoVideoId":null,"width":100,"height":100}}
+        """
+    private static let alicePhotoLine = """
+        {"type":"PartnerAssetV2","ack":"PartnerAssetV2|0005","data":{"id":"alice-photo",\
+        "ownerId":"alice","originalFileName":"z.jpg","checksum":"3Q==",\
+        "fileCreatedAt":"2026-08-20T10:00:00.000Z","fileModifiedAt":null,\
+        "localDateTime":"2026-08-20T10:00:00.000Z","duration":null,"type":"IMAGE",\
         "deletedAt":null,"visibility":"timeline","livePhotoVideoId":null,"width":100,"height":100}}
         """
     private static let completeLine = #"{"type":"SyncCompleteV1","ack":"SyncCompleteV1|0003","data":{}}"#
@@ -178,5 +192,85 @@ final class SyncResetTests: XCTestCase {
         XCTAssertEqual(try remoteIDs(), ["gone", "gone-remote-only", "kept"])
         let acked = try await acks(recorder)
         XCTAssertEqual(acked, [])
+    }
+
+    // MARK: - Chunked commits
+
+    /// A large sync is stored and acked while it downloads rather than after the last byte, so
+    /// each chunk lands in the cache and on the server cursor before the next arrives.
+    func testChunksAreStoredAndAckedAsTheyArrive() async throws {
+        let recorder = RequestRecorder()
+        await recorder.stub(path: "/api/sync/stream",
+                            json: [Self.keptLine, Self.freshLine, Self.completeLine].joined(separator: "\n"))
+        await recorder.stub(path: "/api/sync/ack", json: "", status: 204)
+
+        try await makeService(maxLinesPerCommit: 1)
+            .syncStream(client: makeClient(recorder), reset: false, isSignedIn: { true })
+
+        XCTAssertEqual(try remoteIDs(), ["fresh", "kept"])
+        let ackRequests = await recorder.bodies.filter { $0.path == "/api/sync/ack" }.count
+        XCTAssertEqual(ackRequests, 3, "one ack per committed chunk")
+        let acked = try await acks(recorder)
+        XCTAssertEqual(Set(acked), ["AssetV2|0002", "AssetV2|0004", "SyncCompleteV1|0003"])
+    }
+
+    /// A replay cut off part-way — here by its first ack failing — has stored its first chunk
+    /// but never reached the sweep, so `gone` is still cached. The next sync, though asked for
+    /// incrementally, must replay again: an incremental one would never mention `gone`, and it
+    /// would stay forever.
+    func testInterruptedReplayIsFinishedByAnotherReplay() async throws {
+        try seedStaleCache()
+        let recorder = RequestRecorder()
+        await recorder.stub(path: "/api/sync/stream", json: Self.keptLine + "\n" + Self.completeLine)
+        await recorder.enqueue(path: "/api/sync/ack", json: "{}", status: 503)
+        await recorder.stub(path: "/api/sync/ack", json: "", status: 204)
+        let service = makeService(maxLinesPerCommit: 1)
+
+        do {
+            try await service.syncStream(client: makeClient(recorder), reset: true, isSignedIn: { true })
+            XCTFail("expected the failed ack to propagate")
+        } catch ImmichError.http(status: 503) {}
+        XCTAssertEqual(try remoteIDs(), ["gone", "gone-remote-only", "kept"],
+                       "the grid must not empty while a replay downloads")
+
+        try await service.syncStream(client: makeClient(recorder), reset: false, isSignedIn: { true })
+
+        let requests = try await streamRequests(recorder)
+        XCTAssertEqual(requests, [true, true])
+        XCTAssertEqual(try remoteIDs(), ["kept"])
+        XCTAssertEqual(try partnerRowCount(), 0)
+        let unfinished = try await database.writer().read { db in
+            try String.fetchOne(db, sql: "SELECT value FROM kv WHERE key = 'unfinished_replay'")
+        }
+        XCTAssertNil(unfinished, "a finished replay must not force the next sync to replay")
+    }
+
+    /// A partner's library arrives in the same download and can dwarf the user's own, so the
+    /// sign-in progress counts it separately rather than reading "0 items" throughout.
+    func testProgressCountsPartnerAssetsSeparately() async throws {
+        let recorder = RequestRecorder()
+        await recorder.stub(path: "/api/sync/stream",
+                            json: [Self.keptLine, Self.alicePhotoLine, Self.completeLine].joined(separator: "\n"))
+        await recorder.stub(path: "/api/sync/ack", json: "", status: 204)
+        let latest = ProgressBox()
+
+        try await makeService().syncStream(client: makeClient(recorder), reset: false,
+                                           progress: { latest.value = $0 }, isSignedIn: { true })
+
+        XCTAssertEqual(latest.value, SyncProgress(assets: 1, partnerAssets: 1))
+        XCTAssertEqual(SettingsScreen.progressText(SyncProgress(assets: 1_234, partnerAssets: 0)),
+                       "\(1_234.formatted()) items catalogued")
+        XCTAssertEqual(SettingsScreen.progressText(SyncProgress(assets: 0, partnerAssets: 113_040)),
+                       "0 items catalogued, plus \(113_040.formatted()) shared with you")
+    }
+}
+
+private final class ProgressBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: SyncProgress?
+
+    var value: SyncProgress? {
+        get { lock.withLock { stored } }
+        set { lock.withLock { stored = newValue } }
     }
 }

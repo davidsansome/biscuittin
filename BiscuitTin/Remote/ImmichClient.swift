@@ -108,15 +108,21 @@ actor ImmichClient {
 
     // MARK: - Sync (D9)
 
-    /// Raw NDJSON body of a `sync/stream` batch — one line per change since the cursor Immich
-    /// tracks server-side for this access token, or the whole history when `reset` is true.
-    /// Returned undecoded: `RemoteLibraryService` routes each line by its own `type` field.
-    func syncStream(types: [Immich.SyncRequestType], reset: Bool) async throws -> Data {
+    /// The NDJSON lines of a `sync/stream` batch as they download — one line per change since the
+    /// cursor Immich tracks server-side for this access token, or the whole history when `reset`
+    /// is true. Lines are left undecoded: `RemoteLibraryService` routes each by its own `type`.
+    ///
+    /// Streamed rather than returned whole because a full replay of a large library (or a
+    /// partner's) runs to hundreds of thousands of lines and minutes of transfer, and nothing
+    /// could be shown until the last byte arrived. HTTP and transport failures surface as the
+    /// same `ImmichError`s as every other call, thrown from the iteration.
+    func syncStream(types: [Immich.SyncRequestType],
+                    reset: Bool) async throws -> AsyncThrowingStream<[Data], Error> {
         var request = try makeRequest(path: "/api/sync/stream", method: "POST",
                                       body: Immich.SyncStreamRequest(types: types, reset: reset),
                                       timeout: Self.binaryTimeout)
         await applyCredential(to: &request)
-        return try await dataForRequest(request)
+        return LineStreamDelegate.lines(for: request, session: session)
     }
 
     /// Advances the server-side cursor so acknowledged lines are not sent again. At most one ack
@@ -358,27 +364,38 @@ actor ImmichClient {
         do {
             let (data, response) = try await session.data(for: request)
             guard let http = response as? HTTPURLResponse else { return data }
-            switch http.statusCode {
-            case 200..<300:
-                return data
-            case 401, 403:
-                throw ImmichError.unauthorized
-            case 400:
-                // Immich explains a 400 in `message` ("OAuth is not enabled"), which is the only
-                // actionable part of the response.
-                if let message = try? JSONDecoder().decode(Immich.ErrorBody.self, from: data).message {
-                    throw ImmichError.rejected(message)
-                }
-                throw ImmichError.http(status: 400)
-            default:
-                throw ImmichError.http(status: http.statusCode)
-            }
-        } catch let error as ImmichError {
-            throw error
-        } catch let error as URLError where error.code == .cancelled {
-            throw CancellationError()
+            if let error = Self.error(forStatus: http.statusCode, body: data) { throw error }
+            return data
         } catch {
-            throw ImmichError.unreachable
+            throw Self.mapTransportError(error)
+        }
+    }
+
+    /// nil for a success status.
+    fileprivate static func error(forStatus status: Int, body: Data) -> ImmichError? {
+        switch status {
+        case 200..<300:
+            return nil
+        case 401, 403:
+            return .unauthorized
+        case 400:
+            // Immich explains a 400 in `message` ("OAuth is not enabled"), which is the only
+            // actionable part of the response.
+            if let message = try? JSONDecoder().decode(Immich.ErrorBody.self, from: body).message {
+                return .rejected(message)
+            }
+            return .http(status: 400)
+        default:
+            return .http(status: status)
+        }
+    }
+
+    fileprivate static func mapTransportError(_ error: Error) -> Error {
+        switch error {
+        case let error as ImmichError: error
+        case let error as URLError where error.code == .cancelled: CancellationError()
+        case is CancellationError: error
+        default: ImmichError.unreachable
         }
     }
 
@@ -389,6 +406,83 @@ actor ImmichClient {
             throw ImmichError.decoding(String(describing: error))
         }
     }
+}
+
+/// Cuts a byte stream into newline-separated lines, holding a line split across two network
+/// chunks until its end arrives. Empty lines are dropped.
+struct NDJSONLineSplitter {
+    private var partial = Data()
+
+    mutating func append(_ data: Data) -> [Data] {
+        partial.append(data)
+        guard let lastNewline = partial.lastIndex(of: Self.newline) else { return [] }
+        let lines = partial[..<lastNewline].split(separator: Self.newline).map { Data($0) }
+        partial = Data(partial[partial.index(after: lastNewline)...])
+        return lines
+    }
+
+    /// Whatever followed the last newline: the server need not end its final line with one.
+    mutating func finish() -> [Data] {
+        defer { partial = Data() }
+        return partial.isEmpty ? [] : [partial]
+    }
+
+    private static let newline = UInt8(ascii: "\n")
+}
+
+/// Feeds a data task's body to an `AsyncThrowingStream` as complete lines.
+///
+/// A per-task delegate rather than `URLSession.bytes(for:)`: that yields one byte per
+/// iteration, which is far too slow for a body that can run past a hundred megabytes.
+private final class LineStreamDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    // URLSession calls one task's delegate methods serially, so this state needs no lock.
+    private let continuation: AsyncThrowingStream<[Data], Error>.Continuation
+    private var splitter = NDJSONLineSplitter()
+    private var status: Int?
+    /// The body of a failure response, kept whole for `ImmichClient.error(forStatus:body:)`.
+    private var errorBody = Data()
+
+    private init(continuation: AsyncThrowingStream<[Data], Error>.Continuation) {
+        self.continuation = continuation
+    }
+
+    static func lines(for request: URLRequest, session: URLSession) -> AsyncThrowingStream<[Data], Error> {
+        AsyncThrowingStream { continuation in
+            let task = session.dataTask(with: request)
+            task.delegate = LineStreamDelegate(continuation: continuation)
+            continuation.onTermination = { _ in task.cancel() }
+            task.resume()
+        }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        status = (response as? HTTPURLResponse)?.statusCode
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard isSuccess else {
+            errorBody.append(data)
+            return
+        }
+        let lines = splitter.append(data)
+        if !lines.isEmpty { continuation.yield(lines) }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error {
+            continuation.finish(throwing: ImmichClient.mapTransportError(error))
+        } else if let status, let failure = ImmichClient.error(forStatus: status, body: errorBody) {
+            continuation.finish(throwing: failure)
+        } else {
+            let rest = splitter.finish()
+            if !rest.isEmpty { continuation.yield(rest) }
+            continuation.finish()
+        }
+    }
+
+    private var isSuccess: Bool { status.map { (200..<300).contains($0) } ?? true }
 }
 
 /// Streams a multipart body to a temp file so large uploads never sit in memory.

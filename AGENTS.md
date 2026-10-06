@@ -107,6 +107,12 @@ The pattern: each one produced correct-looking code with no crash in tests, and 
 something outside the process (the OS scheduler, a relaunch, a real server string) was involved.
 When a milestone integrates with something external, drive it for real before believing it.
 
+**A small test library hides anything that scales with size.** Partner sharing passed every
+check against a test partner with 815 assets, then showed nothing for minutes against a real
+partner with 113,040: the sync was applied only after the whole download. "The button doesn't
+appear" was really "it hasn't appeared yet". Before concluding something is broken, check
+whether a sync is still running: `last_synced_at` in `kv` is set only when one completes.
+
 **A mock you wrote yourself cannot falsify your own assumptions.** `Tools/mock_immich.py` spoke
 this app's conventions — hex checksums, duration strings, unauthenticated `server/about` — so it
 confirmed the client against itself and stayed green through every one of those bugs. It has

@@ -171,6 +171,15 @@ enum PartnerStore {
             """, arguments: [ownerID]).map(RemoteAssetRecord.stub(row:))
     }
 
+    /// The end of a full replay: drops every partner row it did not mention. Each argument is a
+    /// subquery listing the ids it did. A share that ended long ago is reported by no line at
+    /// all, so this is the only way its library leaves the cache.
+    static func removeUnmentioned(assets: String, partners: String, users: String, in db: Database) throws {
+        try db.execute(sql: "DELETE FROM partner_assets WHERE immich_id NOT IN (\(assets))")
+        try db.execute(sql: "DELETE FROM partners WHERE shared_by_id NOT IN (\(partners))")
+        try db.execute(sql: "DELETE FROM immich_users WHERE id NOT IN (\(users))")
+    }
+
     static func wipe(_ db: Database) throws {
         try db.execute(sql: "DELETE FROM partner_assets")
         try db.execute(sql: "DELETE FROM partners")
