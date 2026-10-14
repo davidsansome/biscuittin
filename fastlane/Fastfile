@@ -4,6 +4,7 @@
 # ASC_ISSUER_ID and ASC_KEY_PATH (the .p8 file). The key must have the Admin role: signing is
 # cloud-managed by xcodebuild, and App Manager keys cannot create distribution certificates.
 
+require "digest"
 require "shellwords"
 
 default_platform(:ios)
@@ -22,6 +23,31 @@ BUNDLED_MODELS = %w[
   clip_vocab.json
   clip_merges.txt
 ].freeze
+
+# SHA-1s of the code signing identities in this machine's keychains.
+def local_signing_identities
+  `security find-identity -v -p codesigning`.scan(/^\s*\d+\) ([0-9A-F]{40}) /).flatten
+end
+
+# A fresh runner has no signing identity, so the archive's automatic signing creates a new Apple
+# Development certificate on every run, and once the account's limit on those is reached every
+# archive fails. The export re-signs with the cloud-managed distribution certificate, so the
+# development one is useless after the run. Only certificates whose private key is on this
+# runner are revoked, never one belonging to someone's Mac.
+def revoke_development_certificates(sha1s)
+  return if sha1s.empty?
+
+  types = Spaceship::ConnectAPI::Certificate::CertificateType
+  Spaceship::ConnectAPI::Certificate.all(filter: { certificateType: [types::DEVELOPMENT, types::IOS_DEVELOPMENT].join(",") }).each do |cert|
+    next unless sha1s.include?(Digest::SHA1.hexdigest(cert.certificate_content.unpack1("m")).upcase)
+
+    UI.message("Revoking #{cert.name} #{cert.serial_number}, created by this run's archive")
+    cert.delete!
+  end
+rescue StandardError => e
+  # Runs in an ensure, where raising would replace the archive's own error.
+  UI.error("Could not revoke this run's development certificate: #{e.message}")
+end
 
 platform :ios do
   private_lane :asc_api_key do
@@ -44,20 +70,25 @@ platform :ios do
       "-authenticationKeyIssuerID", ENV.fetch("ASC_ISSUER_ID")
     ].shelljoin
 
-    build_app(
-      project: File.join(ROOT, "BiscuitTin.xcodeproj"),
-      scheme: "BiscuitTin",
-      configuration: "Release",
-      archive_path: ARCHIVE,
-      output_directory: File.join(ROOT, "build/Release"),
-      derived_data_path: File.join(ROOT, "build/DerivedData"),
-      cloned_source_packages_path: File.join(ROOT, "build/SourcePackages"),
-      # gym appends xcargs to the -exportArchive command as well, which carries the auth flags
-      # there too. Repeating them in export_xcargs makes xcodebuild reject the duplicates.
-      xcargs: "#{xcode_auth} CURRENT_PROJECT_VERSION=#{build_number}",
-      export_method: "app-store",
-      export_options: { signingStyle: "automatic", manageAppVersionAndBuildNumber: false }
-    )
+    identities_before = local_signing_identities
+    begin
+      build_app(
+        project: File.join(ROOT, "BiscuitTin.xcodeproj"),
+        scheme: "BiscuitTin",
+        configuration: "Release",
+        archive_path: ARCHIVE,
+        output_directory: File.join(ROOT, "build/Release"),
+        derived_data_path: File.join(ROOT, "build/DerivedData"),
+        cloned_source_packages_path: File.join(ROOT, "build/SourcePackages"),
+        # gym appends xcargs to the -exportArchive command as well, which carries the auth flags
+        # there too. Repeating them in export_xcargs makes xcodebuild reject the duplicates.
+        xcargs: "#{xcode_auth} CURRENT_PROJECT_VERSION=#{build_number}",
+        export_method: "app-store",
+        export_options: { signingStyle: "automatic", manageAppVersionAndBuildNumber: false }
+      )
+    ensure
+      revoke_development_certificates(local_signing_identities - identities_before)
+    end
 
     app_bundle = Dir[File.join(ARCHIVE, "Products/Applications/*.app")].first
     missing = BUNDLED_MODELS.reject { |name| File.exist?(File.join(app_bundle, name)) }

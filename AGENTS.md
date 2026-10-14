@@ -387,6 +387,10 @@ explanation before the flattering one.
   `ASC_KEY_ID`, `ASC_ISSUER_ID` and `ASC_KEY_P8` secrets. It must have the **Admin** role:
   signing is cloud-managed via `-allowProvisioningUpdates`, and nothing else holds a
   distribution certificate.
+- Each `beta` run's archive makes a throwaway Apple Development certificate on the empty
+  runner, and the lane revokes it afterwards. Before that, they built up until Apple's limit
+  failed every archive with "Your account has reached the maximum number of certificates". If
+  that error comes back, revoke the stale CI certificates in the developer portal.
 - The `beta` lane fails if the CLIP models are missing from the archived `.app`, rather than
   shipping a build with no search bar.
 - App Store screenshots live in `fastlane/screenshots/en-AU/`, and every App Store run uploads
