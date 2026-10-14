@@ -127,6 +127,7 @@ final class GridViewController: UIViewController {
         return label
     }()
 
+    private let backupInfoBar = BackupInfoBar()
     private lazy var backupIndicatorButton = UIButton(type: .system)
     private lazy var backupIndicatorItem: UIBarButtonItem = {
         let item = UIBarButtonItem(customView: backupIndicatorButton)
@@ -200,6 +201,7 @@ final class GridViewController: UIViewController {
         configureSelection()
         configureDateScrubber()
         configureSearch()
+        configureBackupInfoBar()
         observeStartupPhase()
 
         // Subscribe before kicking the boot cache so the very first snapshot is not missed.
@@ -351,6 +353,8 @@ final class GridViewController: UIViewController {
         config.imagePadding = 4
         config.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 6, bottom: 4, trailing: 6)
 
+        updateBackupInfoBar()
+
         if env.immichSession.state == .expired {
             backupIndicatorItem.isHidden = false
             config.image = UIImage(systemName: "exclamationmark.icloud",
@@ -379,6 +383,51 @@ final class GridViewController: UIViewController {
         backupIndicatorButton.accessibilityLabel = status.remainingCount > 0
             ? "\(status.remainingCount) items waiting to back up"
             : "All items backed up"
+    }
+
+    /// Sits just below the navigation bar. It extends the safe area rather than overlapping the
+    /// grid, so the collection view's insets, the date scrubber and the empty-state label all
+    /// stay clear of it without knowing it exists.
+    private func configureBackupInfoBar() {
+        backupInfoBar.translatesAutoresizingMaskIntoConstraints = false
+        backupInfoBar.isHidden = true
+        backupInfoBar.addAction(UIAction { [weak self] _ in self?.presentSettings() }, for: .touchUpInside)
+        view.addSubview(backupInfoBar)
+        NSLayoutConstraint.activate([
+            backupInfoBar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            backupInfoBar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            backupInfoBar.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            backupInfoBar.heightAnchor.constraint(equalToConstant: BackupInfoBar.height)
+        ])
+    }
+
+    private func updateBackupInfoBar() {
+        guard mode == .timeline else { return }
+        let status = env.backupStatus
+        // An expired session has its own notice in the nav bar, and nothing uploads until it
+        // is renewed, so progress here would only be stale.
+        let text = env.immichSession.state == .expired ? nil : status.infoBarText
+        if let text {
+            backupInfoBar.configure(text: text, symbol: status.infoBarSymbol, progress: status.progress)
+        }
+        setBackupInfoBarVisible(text != nil)
+    }
+
+    private func setBackupInfoBarVisible(_ visible: Bool) {
+        let inset = visible ? BackupInfoBar.height : 0
+        guard additionalSafeAreaInsets.top != inset else { return }
+
+        // Keep a grid that is scrolled to the top showing its first row; anywhere else, the
+        // content stays put and the bar simply covers or uncovers a strip of it.
+        let wasAtTop = collectionView.contentOffset.y <= -collectionView.adjustedContentInset.top + 1
+        additionalSafeAreaInsets.top = inset
+        backupInfoBar.isHidden = !visible
+        view.layoutIfNeeded()
+        if wasAtTop {
+            collectionView.setContentOffset(CGPoint(x: collectionView.contentOffset.x,
+                                                    y: -collectionView.adjustedContentInset.top),
+                                            animated: false)
+        }
     }
 
     /// The non-selecting right-hand items, outermost first.

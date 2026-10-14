@@ -34,6 +34,7 @@ final class SettingsViewModel: ObservableObject {
     @Published var showsScopePrompt = false
     @Published private(set) var syncEnabled = false
     @Published private(set) var syncScope: SyncScope = .all
+    @Published private(set) var syncAllowsCellular = false
     @Published private(set) var outOfScopeCount = 0
 
     // MARK: - Free up space (D18, M8)
@@ -61,6 +62,7 @@ final class SettingsViewModel: ObservableObject {
         self.localLibrary = localLibrary
         self.syncEnabled = settings.syncEnabled
         self.syncScope = settings.syncScope
+        self.syncAllowsCellular = settings.syncAllowsCellular
         self.serverURL = session.baseURL
         self.email = session.email ?? ""
         self.state = session.state
@@ -194,6 +196,11 @@ final class SettingsViewModel: ObservableObject {
         }
         syncEnabled = true
         Task { await syncEngine.setEnabled(true, scope: nil) }
+    }
+
+    func setSyncAllowsCellular(_ allowed: Bool) {
+        syncAllowsCellular = allowed
+        Task { await syncEngine.setAllowsCellular(allowed) }
     }
 
     func chooseScope(_ scope: SyncScope) {

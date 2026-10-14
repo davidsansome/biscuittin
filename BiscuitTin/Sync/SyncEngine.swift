@@ -42,6 +42,7 @@ actor SyncEngine {
     private let remoteLibrary: RemoteLibraryService
     private let settings: AppSettings
     private let status: BackupStatusStore
+    private let network = NetworkMonitor()
 
     private var isRunning = false
     private var uploadsInFlight = 0
@@ -70,6 +71,27 @@ actor SyncEngine {
 
     nonisolated var isEnabled: Bool { settings.syncEnabled }
     nonisolated var scope: SyncScope { settings.syncScope }
+    nonisolated var allowsCellular: Bool { settings.syncAllowsCellular }
+
+    /// Resumes the queue when connectivity returns or Wi-Fi appears, since nothing else would
+    /// until the next foreground or background task.
+    nonisolated func startMonitoringNetwork() {
+        network.start { [weak self] in
+            Task { await self?.kick() }
+        }
+    }
+
+    func setAllowsCellular(_ allowed: Bool) async {
+        settings.syncAllowsCellular = allowed
+        await kick()
+    }
+
+    /// Why uploads cannot use the network right now, or nil when they can.
+    private var networkWait: BackupStatusStore.Phase? {
+        if !network.isSatisfied { return .waitingForNetwork }
+        if network.isExpensive && !allowsCellular { return .waitingForWiFi }
+        return nil
+    }
 
     /// Turning sync on requires a scope choice; the settings screen asks for one (D17).
     func setEnabled(_ enabled: Bool, scope newScope: SyncScope?) async {
@@ -116,27 +138,40 @@ actor SyncEngine {
 
     /// Evaluates the queue and makes as much progress as it can. Safe to call often.
     func kick() async {
-        guard isEnabled, session.isConfigured, localLibrary.hasAnyAccess else {
+        guard isEnabled, session.isConfigured else {
+            await status.setPhase(.idle)
+            await publishStatus(uploading: false)
+            return
+        }
+        guard localLibrary.hasAnyAccess else {
+            await status.setPhase(.noPhotoAccess)
             await publishStatus(uploading: false)
             return
         }
         guard !isRunning else { return }
         isRunning = true
-        defer { isRunning = false }
+        await status.setError(nil)
+        await releaseOrphanedUploads()
 
         do {
+            await status.setPhase(.scanning)
             try await enumerateLibrary()
             await publishStatus(uploading: true)
 
             // Checksum, dedupe and upload in rounds until the queue stops shrinking, so one
             // kick drains the backlog instead of leaving most of it for the next trigger.
-            while true {
+            // Enumeration above is local and runs regardless of the network, so a wait still
+            // reports how much is owed.
+            while networkWait == nil {
                 try Task.checkCancellation()
                 let before = try await outstandingCount()
                 guard before > 0 else { break }
 
+                await status.setPhase(.preparing)
                 let checksummed = try await computeMissingChecksums()
+                await status.setPhase(.checkingServer)
                 let deduped = try await dedupeAgainstServer()
+                await status.setPhase(.uploading)
                 let uploaded = try await uploadPending()
                 // All three link facets in `facet_links` directly; the timeline hears of it only here.
                 if checksummed || deduped || uploaded { remoteLibrary.facetLinksDidChange() }
@@ -154,12 +189,29 @@ actor SyncEngine {
             }
         } catch is CancellationError {
             // Leave state as-is; the next kick resumes.
+        } catch where networkWait != nil || NetworkMonitor.isConnectivityError(error) {
+            Log.sync.info("Sync paused, network unavailable: \(error.localizedDescription, privacy: .public)")
         } catch {
             Log.sync.error("Sync failed: \(error.localizedDescription, privacy: .public)")
             await status.setError((error as? LocalizedError)?.errorDescription
                                   ?? error.localizedDescription)
         }
+        isRunning = false
+        await status.setPhase(networkWait ?? .idle)
         await publishStatus(uploading: false)
+    }
+
+    /// Returns rows left `uploading` by a run that never finished — the app was killed or
+    /// suspended mid-transfer — to the queue. Nothing selects `uploading` rows for upload, yet
+    /// they count as outstanding, so without this they would stay owed forever. Only one run
+    /// is ever active (`isRunning`), so at its start no row is genuinely in flight.
+    private func releaseOrphanedUploads() async {
+        guard let writer = try? database.writer() else { return }
+        try? await writer.write { db in
+            try db.execute(sql: "UPDATE backup_state SET state = ? WHERE state = ?",
+                           arguments: [BackupStateRecord.State.pending.rawValue,
+                                       BackupStateRecord.State.uploading.rawValue])
+        }
     }
 
     /// Items still owing an upload, used to detect progress between rounds.
@@ -309,27 +361,41 @@ actor SyncEngine {
 
         var linked = false
         let assets = resolver.resolve(pending)
+        let meter = TransferRateMeter()
+        let ticker = Task { [status] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(500))
+                await status.setUploadRate(meter.bytesPerSecond())
+            }
+        }
+        defer { ticker.cancel() }
+
         for identifier in pending {
             try Task.checkCancellation()
+            // Stop the round rather than fail the rest of it one by one; `kick` reports the wait.
+            guard networkWait == nil else { break }
             guard let asset = assets[identifier] else {
                 try await mark(identifier, state: .ineligible, error: "Asset no longer exists")
                 continue
             }
-            if await upload(asset: asset, identifier: identifier, client: client) { linked = true }
+            if await upload(asset: asset, identifier: identifier, client: client, meter: meter) {
+                linked = true
+            }
             await publishStatus(uploading: true)
         }
         return linked
     }
 
     /// Returns whether it linked the uploaded asset to its server copy.
-    private func upload(asset: PHAsset, identifier: String, client: ImmichClient) async -> Bool {
+    private func upload(asset: PHAsset, identifier: String, client: ImmichClient,
+                        meter: TransferRateMeter) async -> Bool {
         do {
             try await mark(identifier, state: .uploading, error: nil)
             let modifiedBeforeExport = asset.modificationDate
             let export = try await exporter.export(asset: asset)
             defer { try? FileManager.default.removeItem(at: export.fileURL) }
 
-            let (request, bodyURL) = try await client.makeUploadRequest(
+            let (unrestricted, bodyURL) = try await client.makeUploadRequest(
                 fileURL: export.fileURL,
                 deviceAssetId: identifier,
                 deviceId: session.deviceID,
@@ -338,8 +404,12 @@ actor SyncEngine {
                 filename: export.filename,
                 checksumHex: export.sha1Hex)
             defer { try? FileManager.default.removeItem(at: bodyURL) }
+            // Catches a switch from Wi-Fi to mobile data mid-transfer, which the check between
+            // items cannot: URLSession fails the request rather than moving it to cellular.
+            var request = unrestricted
+            request.allowsExpensiveNetworkAccess = allowsCellular
 
-            let response = try await UploadTask.perform(request: request, bodyURL: bodyURL)
+            let response = try await UploadTask.perform(request: request, bodyURL: bodyURL, meter: meter)
 
             // "duplicate" is success too: the server already had these bytes.
             try await mark(identifier, state: .uploaded, error: nil, checksum: export.sha1Hex)
@@ -360,6 +430,9 @@ actor SyncEngine {
             Log.sync.info("Uploaded \(export.filename, privacy: .public) (\(export.byteCount) bytes)")
             return response?.id != nil
         } catch is CancellationError {
+            try? await mark(identifier, state: .pending, error: nil)
+        } catch where networkWait != nil || NetworkMonitor.isConnectivityError(error) {
+            // Not this item's fault; spending a retry on it would eventually abandon it.
             try? await mark(identifier, state: .pending, error: nil)
         } catch {
             try? await bumpFailure(identifier, error: error.localizedDescription)
@@ -429,18 +502,30 @@ actor SyncEngine {
         }
     }
 
-    /// Recomputes the badge count (requirement 14).
+    /// Recomputes the badge count (requirement 14). Callers outside a run, such as Settings
+    /// refreshing its counts, cannot end one: `uploading` holds while a run is active.
     func publishStatus(uploading: Bool) async {
+        let uploading = uploading || isRunning
         let enabled = isEnabled
         var remaining = 0
+        var failed = 0
+        var retrying = 0
         if let writer = try? database.writer() {
-            remaining = (try? await writer.read { db in
-                try Int.fetchOne(db, sql: """
+            (remaining, failed, retrying) = (try? await writer.read { db in
+                let remaining = try Int.fetchOne(db, sql: """
                     SELECT COUNT(*) FROM backup_state WHERE state IN (?, ?, ?)
                     """, arguments: StatementArguments(BackupStateRecord.outstandingStates)) ?? 0
-            }) ?? 0
+                let failedTotal = try Int.fetchOne(db, sql: """
+                    SELECT COUNT(*) FROM backup_state WHERE state = ?
+                    """, arguments: [BackupStateRecord.State.failed.rawValue]) ?? 0
+                let failed = try Int.fetchOne(db, sql: """
+                    SELECT COUNT(*) FROM backup_state WHERE state = ? AND retry_count >= ?
+                    """, arguments: [BackupStateRecord.State.failed.rawValue, Self.maxRetries]) ?? 0
+                return (remaining, failed, failedTotal - failed)
+            }) ?? (0, 0, 0)
         }
-        await status.update(remaining: remaining, uploading: uploading, enabled: enabled)
+        await status.update(remaining: remaining, uploading: uploading, enabled: enabled,
+                            failed: failed, retrying: retrying)
     }
 
     // MARK: - Background scheduling (D12)
@@ -487,8 +572,11 @@ actor SyncEngine {
 /// Performs one upload. Kept separate so the transport can move to a true background
 /// `URLSession` without touching the engine's state machine.
 enum UploadTask {
-    static func perform(request: URLRequest, bodyURL: URL) async throws -> Immich.UploadResponse? {
-        let (data, response) = try await URLSession.shared.upload(for: request, fromFile: bodyURL)
+    static func perform(request: URLRequest, bodyURL: URL,
+                        meter: TransferRateMeter? = nil) async throws -> Immich.UploadResponse? {
+        let delegate = meter.map(ProgressDelegate.init)
+        let (data, response) = try await URLSession.shared.upload(for: request, fromFile: bodyURL,
+                                                                  delegate: delegate)
         guard let http = response as? HTTPURLResponse else { return nil }
         switch http.statusCode {
         case 200..<300:
@@ -498,5 +586,20 @@ enum UploadTask {
         default:
             throw ImmichError.http(status: http.statusCode)
         }
+    }
+}
+
+
+/// Feeds bytes sent to a `TransferRateMeter`, for the grid's info bar.
+private final class ProgressDelegate: NSObject, URLSessionTaskDelegate {
+    private let meter: TransferRateMeter
+
+    init(meter: TransferRateMeter) {
+        self.meter = meter
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64,
+                    totalBytesSent: Int64, totalBytesExpectedToSend: Int64) {
+        meter.record(bytes: bytesSent)
     }
 }
