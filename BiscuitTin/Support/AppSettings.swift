@@ -10,6 +10,7 @@ final class AppSettings: @unchecked Sendable {
         static let syncEnabled = "sync.enabled"
         static let syncScope = "sync.scope"
         static let syncScopeAnchor = "sync.scopeAnchor"
+        static let syncAllowsCellular = "sync.allowsCellular"
     }
 
     static let minColumns = 1
@@ -47,6 +48,14 @@ final class AppSettings: @unchecked Sendable {
     var syncEnabled: Bool {
         get { defaults.bool(forKey: Key.syncEnabled) }
         set { defaults.set(newValue, forKey: Key.syncEnabled) }
+    }
+
+    /// Off by default, as in iCloud Photos: a first backup can be the whole library, and
+    /// videos make it large. "Cellular" here means any expensive path, so a personal hotspot
+    /// counts too.
+    var syncAllowsCellular: Bool {
+        get { defaults.bool(forKey: Key.syncAllowsCellular) }
+        set { defaults.set(newValue, forKey: Key.syncAllowsCellular) }
     }
 
     /// Lives in UserDefaults rather than the `kv` table so the sync scope is readable without

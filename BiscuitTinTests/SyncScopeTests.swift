@@ -140,4 +140,92 @@ final class SyncScopeTests: XCTestCase {
         XCTAssertNil(store.indicatorText, "no count once everything is backed up")
         XCTAssertEqual(store.indicatorSymbol, "checkmark.icloud")
     }
+
+    @MainActor
+    func testInfoBarCountsProgressSinceQueueWasLastEmpty() {
+        let store = BackupStatusStore()
+        store.update(remaining: 40, uploading: false, enabled: true)
+        XCTAssertEqual(store.infoBarText, "0/40 · Queued")
+
+        store.setPhase(.uploading)
+        store.update(remaining: 37, uploading: true, enabled: true)
+        XCTAssertEqual(store.infoBarText, "3/40 · Uploading")
+
+        store.setUploadRate(47_000)
+        XCTAssertEqual(store.infoBarText, "3/40 · Uploading 376 kbps")
+
+        // New photos taken mid-run grow the total rather than resetting progress.
+        store.update(remaining: 39, uploading: true, enabled: true)
+        XCTAssertEqual(store.infoBarText, "3/42 · Uploading 376 kbps")
+
+        store.update(remaining: 0, uploading: false, enabled: true)
+        XCTAssertNil(store.infoBarText, "bar hides once everything is backed up")
+        XCTAssertEqual(store.stateText, "All backed up", "Settings still says so")
+
+        store.update(remaining: 90, uploading: false, enabled: true)
+        store.setPhase(.waitingForNetwork)
+        XCTAssertEqual(store.infoBarText, "0/90 · Waiting for network")
+        XCTAssertEqual(store.infoBarSymbol, "wifi.slash")
+
+        store.update(remaining: 90, uploading: false, enabled: false)
+        XCTAssertNil(store.infoBarText, "bar hides when sync is off")
+    }
+
+    @MainActor
+    func testInfoBarExplainsAStalledQueue() {
+        let store = BackupStatusStore()
+        store.update(remaining: 2, uploading: false, enabled: true, failed: 2)
+        XCTAssertEqual(store.infoBarText, "0/2 · 2 failed")
+        XCTAssertEqual(store.infoBarSymbol, "exclamationmark.icloud")
+
+        store.update(remaining: 3, uploading: false, enabled: true, retrying: 3)
+        XCTAssertEqual(store.infoBarText, "0/3 · 3 to retry")
+
+        // Rates only show while uploading: a stale one would read as current.
+        store.setUploadRate(1_000_000)
+        XCTAssertEqual(store.infoBarText, "0/3 · 3 to retry")
+    }
+
+    func testBitRateFormatting() {
+        XCTAssertEqual(BackupStatusStore.formatBitRate(bytesPerSecond: 47_000), "376 kbps")
+        XCTAssertEqual(BackupStatusStore.formatBitRate(bytesPerSecond: 10), "1 kbps")
+        XCTAssertEqual(BackupStatusStore.formatBitRate(bytesPerSecond: 300_000), "2.4 Mbps")
+        XCTAssertEqual(BackupStatusStore.formatBitRate(bytesPerSecond: 5_000_000), "40 Mbps")
+    }
+
+    func testTransferRateMeterAveragesOverObservedTime() {
+        let meter = TransferRateMeter()
+        XCTAssertNil(meter.bytesPerSecond(at: 0))
+        meter.record(bytes: 1_000, at: 100)
+        meter.record(bytes: 1_000, at: 101)
+        XCTAssertEqual(meter.bytesPerSecond(at: 102)!, 1_000, accuracy: 0.001)
+        // Once samples leave the window, a stalled upload reads as zero, not as its old rate.
+        XCTAssertEqual(meter.bytesPerSecond(at: 110)!, 0, accuracy: 0.001)
+    }
+
+    @MainActor
+    func testWaitReasonSurvivesTheStatusRefreshThatFollowsIt() {
+        let store = BackupStatusStore()
+        store.setPhase(.waitingForWiFi)
+        store.update(remaining: 5, uploading: false, enabled: true)
+        XCTAssertEqual(store.infoBarText, "0/5 · Waiting for Wi-Fi")
+
+        store.setPhase(.noPhotoAccess)
+        store.update(remaining: 5, uploading: false, enabled: true)
+        XCTAssertEqual(store.stateText, "No photo access")
+
+        // A run that starts and finishes clears the wait.
+        store.setPhase(.scanning)
+        store.update(remaining: 5, uploading: false, enabled: true)
+        XCTAssertEqual(store.phase, .idle)
+    }
+
+    func testCellularIsOffByDefault() {
+        let defaults = UserDefaults(suiteName: #function)!
+        defaults.removePersistentDomain(forName: #function)
+        let settings = AppSettings(defaults: defaults)
+        XCTAssertFalse(settings.syncAllowsCellular)
+        settings.syncAllowsCellular = true
+        XCTAssertTrue(AppSettings(defaults: defaults).syncAllowsCellular)
+    }
 }

@@ -160,16 +160,32 @@ struct SettingsScreen: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-                LabeledContent("Waiting to upload") {
-                    Text("\(backupStatus.remainingCount)")
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                }
+                Toggle("Use Mobile Data", isOn: Binding(
+                    get: { viewModel.syncAllowsCellular },
+                    set: { viewModel.setSyncAllowsCellular($0) }))
+                backupProgress
             }
         } header: {
             Text("Backup")
         } footer: {
-            Text("Uploads photos and videos from this \(DeviceName.current) to your Immich server.")
+            Text("Uploads photos and videos from this \(DeviceName.current) to your Immich server. "
+                 + "Without mobile data, backup waits for Wi-Fi.")
+        }
+    }
+
+    /// The same reading as the grid's info bar, so the two never disagree.
+    @ViewBuilder
+    private var backupProgress: some View {
+        LabeledContent("Status") {
+            Text(backupStatus.stateText).foregroundStyle(.secondary)
+        }
+        if let progress = backupStatus.progressText {
+            VStack(alignment: .leading, spacing: 6) {
+                LabeledContent("Progress") {
+                    Text(progress).foregroundStyle(.secondary).monospacedDigit()
+                }
+                ProgressView(value: backupStatus.progress)
+            }
         }
     }
 

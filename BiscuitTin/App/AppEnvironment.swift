@@ -109,6 +109,7 @@ final class AppEnvironment: ObservableObject {
         // Wiring that would otherwise be an initialisation cycle. Still zero I/O (D19).
         imageLoader.attachRemoteFetcher(remoteImages)
         syncEngine.connectBackgroundHandler()
+        syncEngine.startMonitoringNetwork()
         Task { await timelineStore.attach(remoteLibrary: remoteLibrary) }
     }
 
