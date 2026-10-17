@@ -4,41 +4,41 @@ import BackgroundTasks
 /// Owns BGTaskScheduler registration (DESIGN.md D12).
 ///
 /// Registration must happen before the app finishes launching, which is earlier than
-/// `AppEnvironment` exists — hence the split: the app delegate registers the identifier at
-/// launch, and the environment supplies the handler once it is built.
+/// `AppEnvironment` exists — hence the split: the app delegate registers the identifiers at
+/// launch, and the environment supplies the handlers once it is built.
 ///
 /// Submitting a request for an unregistered identifier raises an **Objective-C** exception
 /// that Swift's `try`/`catch` cannot intercept, so it aborts the process. `canSubmit` is the
 /// guard that makes that unreachable.
 enum BackgroundTaskRegistrar {
-    nonisolated(unsafe) private static var handler: ((BGProcessingTask) -> Void)?
-    nonisolated(unsafe) private static var registered = false
+    nonisolated(unsafe) private static var handlers: [String: (BGTask) -> Void] = [:]
+    nonisolated(unsafe) private static var registered: Set<String> = []
     private static let lock = NSLock()
 
-    static var canSubmit: Bool {
+    static func canSubmit(_ identifier: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        return registered
+        return registered.contains(identifier)
     }
 
-    /// Call from `application(_:didFinishLaunchingWithOptions:)`, once.
+    /// Call from `application(_:didFinishLaunchingWithOptions:)`, once per identifier.
     static func registerAtLaunch(identifier: String) {
         lock.lock()
-        guard !registered else { lock.unlock(); return }
+        guard !registered.contains(identifier) else { lock.unlock(); return }
         lock.unlock()
 
         let ok = BGTaskScheduler.shared.register(forTaskWithIdentifier: identifier, using: nil) { task in
-            guard let processing = task as? BGProcessingTask else {
+            lock.lock()
+            let handler = handlers[identifier]
+            lock.unlock()
+            guard let handler else {
+                // Nothing wired up yet; let the system reschedule rather than hang.
                 return task.setTaskCompleted(success: false)
             }
-            guard let handler = BackgroundTaskRegistrar.handler else {
-                // Nothing wired up yet; let the system reschedule rather than hang.
-                return processing.setTaskCompleted(success: false)
-            }
-            handler(processing)
+            handler(task)
         }
 
         lock.lock()
-        registered = ok
+        if ok { registered.insert(identifier) }
         lock.unlock()
 
         if !ok {
@@ -48,7 +48,8 @@ enum BackgroundTaskRegistrar {
         }
     }
 
-    static func setHandler(_ handler: @escaping (BGProcessingTask) -> Void) {
-        self.handler = handler
+    static func setHandler(for identifier: String, _ handler: @escaping (BGTask) -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        handlers[identifier] = handler
     }
 }
