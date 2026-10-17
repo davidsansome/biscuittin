@@ -34,7 +34,7 @@ final class RemoteRecordFallbackTests: XCTestCase {
                      tokenProvider: { "tok" })
     }
 
-    /// What `SyncEngine.upload` writes on success, and nothing more.
+    /// What `SyncEngine.record` writes on success, and nothing more.
     private func linkJustUploaded(localIdentifier: String, immichID: String) throws {
         try database.writer().write { db in
             try db.execute(sql: """

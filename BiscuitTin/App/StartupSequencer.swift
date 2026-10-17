@@ -1,5 +1,6 @@
 import Foundation
 import Photos
+import UIKit
 
 /// Orders the work that happens *after* the first frame is on screen (DESIGN.md D19).
 ///
@@ -150,5 +151,41 @@ final class StartupSequencer: ObservableObject {
     /// Scene moved to the background: make sure the freshest index survives to next launch.
     func sceneDidEnterBackground() {
         Task { await timelineStore.writeBootCache() }
+        finishBackupRunInBackground()
+    }
+
+    /// Asks for the short grace period iOS gives an app that has just left the screen, so the
+    /// original being exported and hashed is handed to the upload daemon instead of being
+    /// abandoned when the app is suspended. Anything already handed over needs no help.
+    private func finishBackupRunInBackground() {
+        let grant = BackgroundTimeGrant()
+        let work = Task { [syncEngine] in await syncEngine.waitForCurrentRun() }
+        grant.begin(name: "Finish backup step") { work.cancel() }
+        Task {
+            await work.value
+            grant.end()
+        }
+    }
+}
+
+/// One `beginBackgroundTask` grant, ended exactly once whichever of finishing or expiring
+/// comes first.
+@MainActor
+private final class BackgroundTimeGrant {
+    private var identifier = UIBackgroundTaskIdentifier.invalid
+
+    func begin(name: String, onExpiry: @escaping @Sendable () -> Void) {
+        identifier = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
+            MainActor.assumeIsolated {
+                onExpiry()
+                self?.end()
+            }
+        }
+    }
+
+    func end() {
+        guard identifier != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(identifier)
+        identifier = .invalid
     }
 }

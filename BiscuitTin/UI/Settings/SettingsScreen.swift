@@ -169,7 +169,8 @@ struct SettingsScreen: View {
             Text("Backup")
         } footer: {
             Text("Uploads photos and videos from this \(DeviceName.current) to your Immich server. "
-                 + "Without mobile data, backup waits for Wi-Fi.")
+                 + "Without mobile data, backup waits for Wi-Fi. Back Up Now keeps going if you "
+                 + "leave the app.")
         }
     }
 
@@ -186,6 +187,7 @@ struct SettingsScreen: View {
                 }
                 ProgressView(value: backupStatus.progress)
             }
+            Button("Back Up Now") { viewModel.backUpNow() }
         }
     }
 
