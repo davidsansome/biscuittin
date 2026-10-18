@@ -186,6 +186,31 @@ final class SyncScopeTests: XCTestCase {
         XCTAssertEqual(store.infoBarText, "0/3 · 3 to retry")
     }
 
+    @MainActor
+    func testInfoBarSeparatesRateFromState() {
+        let store = BackupStatusStore()
+        store.update(remaining: 10, uploading: true, enabled: true)
+        store.setPhase(.preparing)
+        XCTAssertEqual(store.stateTitle, "Preparing")
+        XCTAssertNil(store.rateText)
+
+        store.setPhase(.uploading)
+        store.setUploadRate(100_000)
+        XCTAssertEqual(store.stateTitle, "Uploading")
+        XCTAssertEqual(store.rateText, "800 kbps")
+
+        // One upload finishing makes the raw rate swing; the reading moves part of the way.
+        store.setUploadRate(200_000)
+        XCTAssertEqual(store.rateText, "1.1 Mbps")
+
+        // Leaving the uploading phase drops the rate, so the next one starts afresh.
+        store.setPhase(.preparing)
+        XCTAssertNil(store.rateText)
+        store.setPhase(.uploading)
+        store.setUploadRate(200_000)
+        XCTAssertEqual(store.rateText, "1.6 Mbps")
+    }
+
     func testBitRateFormatting() {
         XCTAssertEqual(BackupStatusStore.formatBitRate(bytesPerSecond: 47_000), "376 kbps")
         XCTAssertEqual(BackupStatusStore.formatBitRate(bytesPerSecond: 10), "1 kbps")

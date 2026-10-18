@@ -2,6 +2,7 @@ import Foundation
 import Photos
 import GRDB
 import BackgroundTasks
+import UIKit
 
 /// What gets backed up (DESIGN.md D17).
 enum SyncScope: Equatable {
@@ -61,6 +62,8 @@ actor SyncEngine {
     private var currentRun: Task<Void, Never>?
     /// A kick arrived during a run, which goes round again rather than dropping it.
     private var rerunRequested = false
+    /// A refill waiting to start; see `scheduleRefill`.
+    private var pendingRefill: Task<Void, Never>?
     /// Set by kicks from outside, which may follow a library change. An upload finishing
     /// leaves it alone: enumerating the whole library for that would be wasted work.
     private var needsEnumeration = true
@@ -197,13 +200,18 @@ actor SyncEngine {
         if rerunRequested && !Task.isCancelled { await requestRun() }
     }
 
-    /// Waits for the run in progress, if there is one. Cancelling the caller cancels the run.
+    /// Waits for the run in progress, and for a refill about to start one, if there are
+    /// any. Cancelling the caller cancels both.
     func waitForCurrentRun() async {
-        guard let run = currentRun else { return }
+        let refill = pendingRefill
+        let run = currentRun
+        guard refill != nil || run != nil else { return }
         await withTaskCancellationHandler {
-            await run.value
+            await refill?.value
+            await run?.value
         } onCancel: {
-            run.cancel()
+            refill?.cancel()
+            run?.cancel()
         }
     }
 
@@ -225,7 +233,7 @@ actor SyncEngine {
         do {
             if needsEnumeration {
                 needsEnumeration = false
-                await status.setPhase(.scanning)
+                await setWorkingPhase(.scanning)
                 try await enumerateLibrary()
             }
             await publishStatus(uploading: true)
@@ -239,9 +247,8 @@ actor SyncEngine {
                 let before = try await outstandingCount()
                 guard before > 0 else { break }
 
-                await status.setPhase(.preparing)
+                await setWorkingPhase(.preparing)
                 let checksummed = try await computeMissingChecksums()
-                await status.setPhase(.checkingServer)
                 let deduped = try await dedupeAgainstServer()
                 await status.setPhase(.uploading)
                 let queued = try await uploadPending()
@@ -569,13 +576,39 @@ actor SyncEngine {
 
         uploadsInFlight = max(0, uploadsInFlight - 1)
         updateRateTicker()
-        if uploadsInFlight == 0 && !isRunning { await status.setPhase(networkWait ?? .idle) }
-        await publishStatus(uploading: false)
         // Refill the queue, without waiting: on a background relaunch the uploader holds the
         // system's completion handler until this returns, and a run can take minutes. Not
         // after a failure, which would send a server that is refusing uploads straight
         // through every item's retries; the next completion or kick retries it.
-        if !spentRetry { Task { await requestRun() } }
+        if !spentRetry { scheduleRefill() }
+        if uploadsInFlight == 0 && !isRunning && pendingRefill == nil {
+            await status.setPhase(networkWait ?? .idle)
+        }
+        await publishStatus(uploading: false)
+    }
+
+    private static let refillDelay = Duration.seconds(1)
+
+    /// Starts a run to top the queue up after an upload finishes. In the foreground it waits a
+    /// moment first, so that uploads finishing close together share one run, and one dedupe
+    /// request to the server, rather than each starting its own. In the background it starts
+    /// at once: iOS may suspend the app as soon as the outcomes it woke it for are recorded.
+    private func scheduleRefill() {
+        guard pendingRefill == nil else { return }
+        pendingRefill = Task {
+            let active = await MainActor.run { UIApplication.shared.applicationState == .active }
+            if active { try? await Task.sleep(for: Self.refillDelay) }
+            pendingRefill = nil
+            guard !Task.isCancelled else { return }
+            await requestRun()
+        }
+    }
+
+    /// While the daemon holds uploads, that is what the status reports. Each refill run
+    /// passes through these steps briefly, and showing them would flash them between every
+    /// upload finishing and the next.
+    private func setWorkingPhase(_ phase: BackupStatusStore.Phase) async {
+        await status.setPhase(uploadsInFlight > 0 ? .uploading : phase)
     }
 
     /// Uploads finish one at a time, and each `facetLinksDidChange` makes the timeline merge
@@ -595,7 +628,7 @@ actor SyncEngine {
             guard rateTicker == nil else { return }
             rateTicker = Task { [status, meter = uploader.meter] in
                 while !Task.isCancelled {
-                    try? await Task.sleep(for: .milliseconds(500))
+                    try? await Task.sleep(for: .seconds(1))
                     await status.setUploadRate(meter.bytesPerSecond())
                 }
             }
@@ -669,10 +702,10 @@ actor SyncEngine {
     }
 
     /// Recomputes the badge count (requirement 14). Callers outside a run, such as Settings
-    /// refreshing its counts, cannot end one: `uploading` holds while a run is active or the
-    /// daemon holds uploads.
+    /// refreshing its counts, cannot end one: `uploading` holds while a run is active, the
+    /// daemon holds uploads, or a refill is about to start.
     func publishStatus(uploading: Bool) async {
-        let uploading = uploading || isRunning || uploadsInFlight > 0
+        let uploading = uploading || isRunning || uploadsInFlight > 0 || pendingRefill != nil
         let enabled = isEnabled
         var remaining = 0
         var failed = 0

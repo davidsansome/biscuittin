@@ -8,8 +8,8 @@ final class BackupStatusStore: ObservableObject {
     enum Phase: Equatable {
         case idle
         case scanning
+        /// Hashing originals and asking the server which it already has.
         case preparing
-        case checkingServer
         case uploading
         case waitingForNetwork
         /// Only metered networks are available and the user has not allowed mobile data.
@@ -69,10 +69,18 @@ final class BackupStatusStore: ObservableObject {
         if phase != .uploading { uploadBytesPerSecond = nil }
     }
 
+    /// Smoothed further than the meter's own window, because individual uploads starting and
+    /// finishing make the raw rate swing on every reading.
     func setUploadRate(_ bytesPerSecond: Double?) {
         guard phase == .uploading else { return }
-        uploadBytesPerSecond = bytesPerSecond
+        guard let bytesPerSecond, let previous = uploadBytesPerSecond else {
+            uploadBytesPerSecond = bytesPerSecond
+            return
+        }
+        uploadBytesPerSecond = previous + (bytesPerSecond - previous) * Self.rateSmoothing
     }
+
+    private static let rateSmoothing = 0.4
 
     /// What the grid's nav-bar pill should show, or nil when the indicator is hidden.
     var indicatorText: String? {
@@ -111,25 +119,36 @@ final class BackupStatusStore: ObservableObject {
         case .waitingForNetwork, .waitingForWiFi: return "wifi.slash"
         case .noPhotoAccess: return "exclamationmark.icloud"
         case .uploading: return "arrow.up.circle"
-        case .scanning, .preparing, .checkingServer: return "arrow.triangle.2.circlepath.icloud"
+        case .scanning, .preparing: return "arrow.triangle.2.circlepath.icloud"
         case .idle: return lastError != nil || failedCount > 0
             ? "exclamationmark.icloud" : "icloud.and.arrow.up"
         }
     }
 
-    /// What the engine is doing, or why it is not.
+    /// What the engine is doing, or why it is not, with the upload rate when there is one.
     var stateText: String {
+        guard let rateText else { return stateTitle }
+        return "\(stateTitle) \(rateText)"
+    }
+
+    /// The upload rate, e.g. "376 kbps", while one is being measured.
+    var rateText: String? {
+        guard remainingCount > 0, phase == .uploading,
+              let rate = uploadBytesPerSecond, rate > 0 else { return nil }
+        return Self.formatBitRate(bytesPerSecond: rate)
+    }
+
+    /// `stateText` without the rate. The info bar shows the two apart, so that the rate can
+    /// change every second without the rest of the line being redrawn.
+    var stateTitle: String {
         if remainingCount == 0 { return "All backed up" }
         switch phase {
         case .scanning: return "Scanning library"
         case .preparing: return "Preparing"
-        case .checkingServer: return "Checking server"
         case .waitingForNetwork: return "Waiting for network"
         case .waitingForWiFi: return "Waiting for Wi-Fi"
         case .noPhotoAccess: return "No photo access"
-        case .uploading:
-            guard let rate = uploadBytesPerSecond, rate > 0 else { return "Uploading" }
-            return "Uploading \(Self.formatBitRate(bytesPerSecond: rate))"
+        case .uploading: return "Uploading"
         case .idle:
             if let lastError { return lastError }
             if failedCount > 0 { return "\(failedCount) failed" }
