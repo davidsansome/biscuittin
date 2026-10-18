@@ -377,7 +377,7 @@ final class GridViewController: UIViewController {
         config.image = UIImage(systemName: status.indicatorSymbol,
                                withConfiguration: UIImage.SymbolConfiguration(pointSize: 15,
                                                                               weight: .medium))
-        config.title = status.indicatorText
+        // No count beside the icon: the info bar under the navigation bar shows it.
         config.baseForegroundColor = status.remainingCount > 0 ? .secondaryLabel : .systemGreen
         backupIndicatorButton.configuration = config
         backupIndicatorButton.accessibilityLabel = status.remainingCount > 0

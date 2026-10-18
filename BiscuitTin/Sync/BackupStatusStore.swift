@@ -82,12 +82,6 @@ final class BackupStatusStore: ObservableObject {
 
     private static let rateSmoothing = 0.4
 
-    /// What the grid's nav-bar pill should show, or nil when the indicator is hidden.
-    var indicatorText: String? {
-        guard isEnabled else { return nil }
-        return remainingCount > 0 ? "\(remainingCount)" : nil
-    }
-
     var indicatorSymbol: String {
         if !isEnabled { return "icloud.slash" }
         if remainingCount > 0 { return isActivelyUploading ? "arrow.up.circle" : "icloud.and.arrow.up" }

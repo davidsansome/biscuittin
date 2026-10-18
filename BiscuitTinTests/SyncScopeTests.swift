@@ -127,17 +127,15 @@ final class SyncScopeTests: XCTestCase {
         let store = BackupStatusStore()
 
         store.update(remaining: 0, uploading: false, enabled: false)
-        XCTAssertNil(store.indicatorText, "indicator is hidden when sync is off")
+        XCTAssertEqual(store.indicatorSymbol, "icloud.slash")
 
         store.update(remaining: 12, uploading: false, enabled: true)
-        XCTAssertEqual(store.indicatorText, "12")
         XCTAssertEqual(store.indicatorSymbol, "icloud.and.arrow.up")
 
         store.update(remaining: 12, uploading: true, enabled: true)
         XCTAssertEqual(store.indicatorSymbol, "arrow.up.circle")
 
         store.update(remaining: 0, uploading: false, enabled: true)
-        XCTAssertNil(store.indicatorText, "no count once everything is backed up")
         XCTAssertEqual(store.indicatorSymbol, "checkmark.icloud")
     }
 
