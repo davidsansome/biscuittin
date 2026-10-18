@@ -127,17 +127,15 @@ final class SyncScopeTests: XCTestCase {
         let store = BackupStatusStore()
 
         store.update(remaining: 0, uploading: false, enabled: false)
-        XCTAssertNil(store.indicatorText, "indicator is hidden when sync is off")
+        XCTAssertEqual(store.indicatorSymbol, "icloud.slash")
 
         store.update(remaining: 12, uploading: false, enabled: true)
-        XCTAssertEqual(store.indicatorText, "12")
         XCTAssertEqual(store.indicatorSymbol, "icloud.and.arrow.up")
 
         store.update(remaining: 12, uploading: true, enabled: true)
         XCTAssertEqual(store.indicatorSymbol, "arrow.up.circle")
 
         store.update(remaining: 0, uploading: false, enabled: true)
-        XCTAssertNil(store.indicatorText, "no count once everything is backed up")
         XCTAssertEqual(store.indicatorSymbol, "checkmark.icloud")
     }
 
@@ -184,6 +182,31 @@ final class SyncScopeTests: XCTestCase {
         // Rates only show while uploading: a stale one would read as current.
         store.setUploadRate(1_000_000)
         XCTAssertEqual(store.infoBarText, "0/3 · 3 to retry")
+    }
+
+    @MainActor
+    func testInfoBarSeparatesRateFromState() {
+        let store = BackupStatusStore()
+        store.update(remaining: 10, uploading: true, enabled: true)
+        store.setPhase(.preparing)
+        XCTAssertEqual(store.stateTitle, "Preparing")
+        XCTAssertNil(store.rateText)
+
+        store.setPhase(.uploading)
+        store.setUploadRate(100_000)
+        XCTAssertEqual(store.stateTitle, "Uploading")
+        XCTAssertEqual(store.rateText, "800 kbps")
+
+        // One upload finishing makes the raw rate swing; the reading moves part of the way.
+        store.setUploadRate(200_000)
+        XCTAssertEqual(store.rateText, "1.1 Mbps")
+
+        // Leaving the uploading phase drops the rate, so the next one starts afresh.
+        store.setPhase(.preparing)
+        XCTAssertNil(store.rateText)
+        store.setPhase(.uploading)
+        store.setUploadRate(200_000)
+        XCTAssertEqual(store.rateText, "1.6 Mbps")
     }
 
     func testBitRateFormatting() {

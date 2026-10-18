@@ -377,7 +377,7 @@ final class GridViewController: UIViewController {
         config.image = UIImage(systemName: status.indicatorSymbol,
                                withConfiguration: UIImage.SymbolConfiguration(pointSize: 15,
                                                                               weight: .medium))
-        config.title = status.indicatorText
+        // No count beside the icon: the info bar under the navigation bar shows it.
         config.baseForegroundColor = status.remainingCount > 0 ? .secondaryLabel : .systemGreen
         backupIndicatorButton.configuration = config
         backupIndicatorButton.accessibilityLabel = status.remainingCount > 0
@@ -407,8 +407,9 @@ final class GridViewController: UIViewController {
         // An expired session has its own notice in the nav bar, and nothing uploads until it
         // is renewed, so progress here would only be stale.
         let text = env.immichSession.state == .expired ? nil : status.infoBarText
-        if let text {
-            backupInfoBar.configure(text: text, symbol: status.infoBarSymbol, progress: status.progress)
+        if let text, let count = status.progressText {
+            backupInfoBar.configure(title: status.stateTitle, rate: status.rateText, count: count,
+                                    symbol: status.infoBarSymbol, progress: status.progress)
         }
         setBackupInfoBarVisible(text != nil)
     }

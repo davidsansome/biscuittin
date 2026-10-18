@@ -187,8 +187,9 @@ actor ImmichClient {
                        body: Immich.BulkUploadCheckRequest(assets: items))
     }
 
-    /// Builds the multipart upload request. `SyncEngine` hands this to a *background*
-    /// URLSession rather than executing it here, so uploads survive suspension (D12).
+    /// Builds the multipart upload request, writing its body into `bodyDirectory`. `SyncEngine`
+    /// hands this to a *background* URLSession rather than executing it here, so uploads
+    /// survive suspension (D12).
     func makeUploadRequest(fileURL: URL,
                            deviceAssetId: String,
                            deviceId: String,
@@ -196,7 +197,9 @@ actor ImmichClient {
                            fileModifiedAt: Date,
                            filename: String,
                            checksumHex: String,
-                           isFavorite: Bool = false) async throws -> (URLRequest, URL) {
+                           isFavorite: Bool = false,
+                           bodyDirectory: URL = FileManager.default.temporaryDirectory)
+    async throws -> (URLRequest, URL) {
         var request = try makeRequest(path: "/api/assets", method: "POST",
                                       timeout: Self.binaryTimeout)
         await applyCredential(to: &request)
@@ -218,7 +221,8 @@ actor ImmichClient {
             ],
             fileField: "assetData",
             fileURL: fileURL,
-            filename: filename)
+            filename: filename,
+            outputDirectory: bodyDirectory)
 
         return (request, bodyURL)
     }
@@ -491,8 +495,9 @@ enum MultipartBuilder {
                           fields: [String: String],
                           fileField: String,
                           fileURL: URL,
-                          filename: String) throws -> URL {
-        let outputURL = FileManager.default.temporaryDirectory
+                          filename: String,
+                          outputDirectory: URL = FileManager.default.temporaryDirectory) throws -> URL {
+        let outputURL = outputDirectory
             .appendingPathComponent("upload-\(UUID().uuidString).multipart")
         FileManager.default.createFile(atPath: outputURL.path, contents: nil)
 

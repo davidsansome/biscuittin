@@ -3,7 +3,7 @@
 **Status:** Draft v3 — adds the future-proofed rotation architecture (video/Live
 Photo rotation in M9) and the performance & responsiveness contract. No code
 written yet.
-**Target:** Native iOS app (iOS 17+, iPhone-first, iPad-compatible layout).
+**Target:** Native iOS app (iOS 26+, iPhone-first, iPad-compatible layout).
 **Name:** `Biscuit Tin`, shown with a space; one word (`BiscuitTin`) wherever a space is
 illegal — the Swift module, the target, the directories and the bundle-id stem.
 
@@ -74,7 +74,7 @@ downstream assumes them as written.
 
 | # | Decision | Choice | Rationale / Alternatives |
 |---|----------|--------|--------------------------|
-| **D1** | Minimum iOS version | **iOS 17.0** | Gives us modern Swift Concurrency and SwiftUI maturity, while covering the vast majority of devices. |
+| **D1** | Minimum iOS version | **iOS 26.0** (was 17.0; raised 2026-10-17) | `BGContinuedProcessingTask` for a user-started backup that survives leaving the app (§12) needs 26.0. Swift Concurrency and SwiftUI maturity came with 17.0 already. |
 | **D2** | UI framework | **SwiftUI app shell; UIKit (`UICollectionView`, custom pager) for the grid and viewer**, bridged via `UIViewControllerRepresentable` | LazyVGrid degrades with 100k items, custom pinch-relayout, and custom transitions. UIKit compositional layout + diffable data source is the proven path. Settings/Info/simple chrome stay SwiftUI. |
 | **D3** | Media types | **Images, videos, and Live Photos are distinct media kinds from day one** (`MediaKind` enum on every stub; Live Photo pairing tracked in the schema). All appear in the grid and sync in v1. Live Photos display/sync as stills in v1; videos play in the viewer. | Modeling the three kinds now (rather than a bool) is what lets M9 rotation and future Live Photo motion land without touching the domain model, DB schema, or timeline. |
 | **D4** | Local persistence | **GRDB (SQLite) via SPM** for the remote-asset cache and sync state | We need fast bulk upserts (10k+ rows/sync page), date-bucket GROUP BY queries, and background-thread writes. GRDB is deterministic and testable. Alternative: SwiftData — simpler but weaker for bulk sync workloads and background writing. This is the app's only third-party dependency. |
@@ -699,8 +699,15 @@ Pipeline when enabled:
 
 Scheduling: foreground kick on app-active (deferred behind first frame, D19) +
 library change; `BGProcessingTaskRequest` (id `dev.biscuittin.sync`,
-`requiresNetworkConnectivity = true`, external power not required) re-submitted
-after each run. Wi-Fi-only is **not** a v1 setting (uploads respect Low Data Mode
+`requiresNetworkConnectivity = true`, external power not required) and
+`BGAppRefreshTaskRequest` (id `dev.biscuittin.refresh`, for short wakes that queue new
+photos) re-submitted after each run; a completed upload refills the queue; Settings' "Back
+Up Now" submits a `BGContinuedProcessingTaskRequest`
+(id `com.davidsansome.biscuittin.backup-now`) that keeps running, with a system progress
+UI, if the user leaves the app; leaving the app mid-run asks `beginBackgroundTask` for time
+to finish handing the current item to the daemon. Uploads themselves run in a background
+`URLSession` (`dev.biscuittin.uploads`, `BackgroundUploader`), at most 8 or 1 GB queued at
+once. Wi-Fi-only is **not** a v1 setting (uploads respect Low Data Mode
 via `allowsConstrainedNetworkAccess = false`). All engine work runs at
 `.utility`/`.background` QoS — sync must never contend with scrolling.
 
@@ -2369,6 +2376,51 @@ told about), plus a failed replay. With the reset handling disabled, all but the
 `Tools/mock_immich.py --sync-reset` reproduces the server's state machine: every stream gets the
 reset line until a `reset: true` stream or a reset ack clears it. Not yet run against a real
 server, which needs a session left idle for 30 days or an admin-side reset.
+
+### Uploads moved to a background `URLSession` (2026-10-17)
+
+D12 always called for one, and `SyncEngine`'s doc comment said uploads used one, but the
+transport was `URLSession.shared.upload(for:fromFile:)`: an ordinary in-process request, cut
+off whenever the app was suspended. `BackgroundUploader` now owns the background session.
+
+* **Everything an outcome needs travels with the task.** iOS may report a completion to a
+  later process than the one that queued the upload, relaunched in the background for the
+  purpose. The `Ticket` (local identifier, checksum, body file, modification date at export)
+  is JSON in `taskDescription`, and `SyncEngine.record` does the bookkeeping that used to
+  follow the `await`.
+* **`AppEnvironment` is built by the app delegate**, in `didFinishLaunching`, not as the
+  app's `@StateObject`. A background launch connects no scene, and the session's events and
+  the BGTask handlers need the engine to exist then.
+* **Queued, not one at a time.** Up to 8 uploads or 1 GB of bodies are queued at once,
+  always at least one. iOS waits longer before each background relaunch it makes to report a
+  completion, so a one-at-a-time queue would crawl in the background. Each finished upload
+  starts a run to refill the queue, except after a failure, so a server refusing uploads does
+  not burn through every item's retries in seconds.
+* **Bodies live in Application Support/PendingUploads**, not the temporary directory, which
+  iOS may clear while the app is not running. Bodies with no live task are swept at the start
+  of each run. `uploading` rows are returned to the queue only when the daemon holds no
+  transfer for them; before, every run start reset them all.
+* **Turning off mobile data, turning off backup, or signing out cancels queued transfers.**
+  Each one carries the permission and credential it was queued with.
+* **Background wakes:** `BGAppRefreshTask` (`fetch` mode) for short wakes that queue new
+  photos; a continued-processing "Back Up Now" in Settings; and `beginBackgroundTask` when
+  the app leaves the screen mid-run. `BackgroundTaskRegistrar` now registers several
+  identifiers.
+
+**Not adopted: PhotoKit's background resource upload extension** (iOS 26.1;
+`PHBackgroundResourceUploadJobExtension` from iOS 27). The system uploads the resource's raw
+bytes as the request body, while Immich's `POST /api/assets` takes only multipart, and
+Immich's resumable-upload work (immich-app/immich#22385) is unmerged as of this date. YAIIU,
+an Immich client that ships the extension, requires its users to run a converting proxy
+in front of the server. The extension's Info.plist also needs a fixed
+`BackgroundUploadURLBase` "for network access validation". YAIIU sets it to
+`https://github.com` while uploading elsewhere, so how strictly it is checked is unknown.
+Revisit if Immich ships a raw or resumable upload endpoint.
+
+Not yet run on a simulator or device: written in an environment without Xcode. Before
+believing it, check against `Tools/mock_immich.py`: uploads finish after the app is
+backgrounded; killing the app mid-queue and relaunching neither loses nor duplicates rows;
+Back Up Now's Live Activity counts down; and a background relaunch records outcomes.
 
 ### Notes for later milestones
 

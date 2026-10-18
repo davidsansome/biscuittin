@@ -161,6 +161,8 @@ final class SettingsViewModel: ObservableObject {
         lastSyncDate = nil
         Task { [weak self] in
             guard let self else { return }
+            // Queued uploads carry the credential just signed out of, and would otherwise finish.
+            await self.syncEngine.cancelUploads()
             try? await self.remoteLibrary.wipeCache()
             self.imageCache.clearCache()
         }
@@ -196,6 +198,11 @@ final class SettingsViewModel: ObservableObject {
         }
         syncEnabled = true
         Task { await syncEngine.setEnabled(true, scope: nil) }
+    }
+
+    /// Keeps backing up with a system progress indicator if the user leaves the app.
+    func backUpNow() {
+        syncEngine.backUpNow(remaining: backupStatus.remainingCount)
     }
 
     func setSyncAllowsCellular(_ allowed: Bool) {
