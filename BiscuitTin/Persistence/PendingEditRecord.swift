@@ -39,6 +39,11 @@ struct PendingEditRecord: Codable, FetchableRecord, PersistableRecord, Equatable
     var retryCount: Int
     var lastError: String?
     var updatedAt: Double
+    var nextAttemptAt: Double
+    /// Set when a replacement was uploaded but the old asset was not yet retired; a retry
+    /// finishes that replacement rather than uploading another.
+    var uploadedID: String?
+    var uploadedChecksum: String?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -50,6 +55,9 @@ struct PendingEditRecord: Codable, FetchableRecord, PersistableRecord, Equatable
         case retryCount = "retry_count"
         case lastError = "last_error"
         case updatedAt = "updated_at"
+        case nextAttemptAt = "next_attempt_at"
+        case uploadedID = "uploaded_id"
+        case uploadedChecksum = "uploaded_checksum"
     }
 
     // `editType`/`mediaKind` are deliberately computed, not stored Codable properties: GRDB's
@@ -67,7 +75,10 @@ struct PendingEditRecord: Codable, FetchableRecord, PersistableRecord, Equatable
         payload: String?,
         retryCount: Int = 0,
         lastError: String? = nil,
-        updatedAt: Double) {
+        updatedAt: Double,
+        nextAttemptAt: Double = 0,
+        uploadedID: String? = nil,
+        uploadedChecksum: String? = nil) {
         self.id = nil
         self.localIdentifier = localIdentifier
         self.immichID = immichID
@@ -77,6 +88,9 @@ struct PendingEditRecord: Codable, FetchableRecord, PersistableRecord, Equatable
         self.retryCount = retryCount
         self.lastError = lastError
         self.updatedAt = updatedAt
+        self.nextAttemptAt = nextAttemptAt
+        self.uploadedID = uploadedID
+        self.uploadedChecksum = uploadedChecksum
     }
 
     mutating func didInsert(_ inserted: InsertionSuccess) {

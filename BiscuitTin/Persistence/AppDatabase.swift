@@ -211,6 +211,27 @@ final class AppDatabase: @unchecked Sendable {
             }
         }
 
+        migrator.registerMigration("v7-retry-backoff-and-edit-tracking") { db in
+            try db.alter(table: "backup_state") { t in
+                // PHAsset.modificationDate when the bytes the server holds were read.
+                t.add(column: "modified_at", .double)
+                // Earliest time a failed row may be tried again.
+                t.add(column: "next_attempt_at", .double).notNull().defaults(to: 0)
+            }
+            try db.alter(table: "pending_edits") { t in
+                t.add(column: "next_attempt_at", .double).notNull().defaults(to: 0)
+                // A replacement that was uploaded but whose old asset was not yet retired.
+                t.add(column: "uploaded_id", .text)
+                t.add(column: "uploaded_checksum", .text)
+            }
+            // Rows stranded by the old rules: one failed checksum, or five failures of any kind.
+            try db.execute(sql: """
+                UPDATE backup_state SET state = 'pending', retry_count = 0, last_error = NULL
+                WHERE state IN ('ineligible', 'failed')
+                """)
+            try db.execute(sql: "UPDATE pending_edits SET retry_count = 0")
+        }
+
         return migrator
     }
 }
