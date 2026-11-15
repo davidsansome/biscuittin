@@ -36,3 +36,23 @@ enum RetryPolicy {
         return .item
     }
 }
+
+/// How long uploads wait after the server answered but could not take one: 30 s, doubling
+/// up to 15 minutes, back to 30 s after any upload succeeds.
+struct ServerPause {
+    private static let first: TimeInterval = 30
+    private static let max: TimeInterval = 900
+
+    private(set) var next: TimeInterval = ServerPause.first
+
+    /// Returns the current pause, then doubles it.
+    mutating func take() -> TimeInterval {
+        let current = next
+        next = min(next * 2, Self.max)
+        return current
+    }
+
+    mutating func reset() {
+        next = Self.first
+    }
+}

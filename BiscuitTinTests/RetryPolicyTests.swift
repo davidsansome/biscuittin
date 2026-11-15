@@ -42,3 +42,13 @@ final class RetryPolicyTests: XCTestCase {
         XCTAssertEqual(RetryPolicy.kind(of: RotationError.renderFailed), .item)
     }
 }
+
+final class ServerPauseTests: XCTestCase {
+    func testPauseDoublesUpToFifteenMinutesAndResets() {
+        var pause = ServerPause()
+        let taken = (0..<8).map { _ in pause.take() }
+        XCTAssertEqual(taken, [30, 60, 120, 240, 480, 900, 900, 900])
+        pause.reset()
+        XCTAssertEqual(pause.take(), 30)
+    }
+}

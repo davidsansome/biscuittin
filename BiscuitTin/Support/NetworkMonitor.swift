@@ -3,8 +3,8 @@ import Network
 
 /// Whether the device currently has a usable network path, and whether it is metered.
 ///
-/// Uploads consult it so an outage pauses the queue instead of spending each item's retries
-/// (`SyncEngine.maxRetries`) on failures that say nothing about the item itself.
+/// Uploads consult it so an outage pauses the queue instead of counting failures that say
+/// nothing about the item itself against it (`RetryPolicy`).
 final class NetworkMonitor: @unchecked Sendable {
     private let monitor = NWPathMonitor()
     private let lock = NSLock()

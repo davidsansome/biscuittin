@@ -37,7 +37,6 @@ actor SyncEngine {
     /// Everything the app delegate registers at launch.
     static let backgroundTaskIdentifiers = [backgroundTaskIdentifier, refreshTaskIdentifier,
                                             backUpNowTaskIdentifier]
-    private static let maxRetries = 5
     private static let checksumBatchSize = 200
     /// Bounds on what is handed to the upload daemon at once. Queueing several at a time
     /// matters in the background: iOS waits longer before each relaunch it makes to report a
@@ -73,6 +72,12 @@ actor SyncEngine {
     private var linksNotice: Task<Void, Never>?
     /// Set when an upload landed bytes older than the asset it came from; see `upload`.
     private var queuedEditDuringUpload = false
+    /// Set when the server answered but could not take an upload. Uploads wait rather than
+    /// sending the whole queue at a server that is restarting.
+    private var serverPausedUntil: Date?
+    private var serverPause = ServerPause()
+    private var serverRetry: Task<Void, Never>?
+    private var isServerPaused: Bool { serverPausedUntil.map { $0 > Date() } ?? false }
 
     init(database: AppDatabase,
          session: ImmichAuthSession,
@@ -133,6 +138,7 @@ actor SyncEngine {
         if let newScope { settings.syncScope = newScope }
 
         if enabled {
+            await resetFailures()
             await kick()
         } else {
             await uploader.cancelAll()
@@ -175,7 +181,28 @@ actor SyncEngine {
     /// during a run makes that run go round again instead of starting a second one.
     func kick() async {
         needsEnumeration = true
+        // Called for a reason to try again now: foreground, a network change, Settings.
+        serverPausedUntil = nil
         await requestRun()
+    }
+
+    /// Puts every failed and ineligible row back in the queue, for an explicit request.
+    func resetFailures() async {
+        guard let writer = try? database.writer() else { return }
+        try? await writer.write { db in try BackupQueue.resetFailures(db) }
+    }
+
+    private func pauseForServer() {
+        serverPausedUntil = Date().addingTimeInterval(serverPause.take())
+        guard serverRetry == nil else { return }
+        serverRetry = Task {
+            // Loops because a further failure while waiting pushes the pause out.
+            while let until = serverPausedUntil, until > Date(), !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(until.timeIntervalSinceNow))
+            }
+            serverRetry = nil
+            await requestRun()
+        }
     }
 
     private func requestRun() async {
@@ -242,7 +269,7 @@ actor SyncEngine {
             // kick drains the backlog instead of leaving most of it for the next trigger.
             // Enumeration above is local and runs regardless of the network, so a wait still
             // reports how much is owed.
-            while networkWait == nil {
+            while networkWait == nil && !isServerPaused {
                 try Task.checkCancellation()
                 let before = try await outstandingCount()
                 guard before > 0 else { break }
@@ -310,14 +337,7 @@ actor SyncEngine {
     /// Items still owing an upload, used to detect progress between rounds.
     private func outstandingCount() async throws -> Int {
         let writer = try database.writer()
-        return try await writer.read { db in
-            try Int.fetchOne(db, sql:
-                "SELECT COUNT(*) FROM backup_state WHERE state IN (?, ?, ?) AND retry_count < ?",
-                arguments: [BackupStateRecord.State.pending.rawValue,
-                            BackupStateRecord.State.uploading.rawValue,
-                            BackupStateRecord.State.failed.rawValue,
-                            Self.maxRetries]) ?? 0
-        }
+        return try await writer.read { db in try BackupQueue.actionableCount(db, now: Date()) }
     }
 
     /// Step 1: make sure every local asset has a backup_state row, honouring the scope.
@@ -379,7 +399,14 @@ actor SyncEngine {
                 }
                 linked = true
             } catch {
-                try await mark(identifier, state: .ineligible, error: error.localizedDescription)
+                if Task.isCancelled { throw CancellationError() }
+                if case LocalAssetExporter.ExportError.noResource = error {
+                    // Genuinely nothing to upload.
+                    try await mark(identifier, state: .ineligible, error: error.localizedDescription)
+                } else if RetryPolicy.kind(of: error) == .item {
+                    try await bumpFailure(identifier, error: error.localizedDescription)
+                }
+                // Otherwise the row stays pending, and the next run tries again.
             }
         }
         return linked
@@ -448,15 +475,7 @@ actor SyncEngine {
 
         let writer = try database.writer()
         let pending = try await writer.read { db in
-            try String.fetchAll(db, sql: """
-                SELECT local_identifier FROM backup_state
-                WHERE state IN (?, ?) AND retry_count < ?
-                ORDER BY updated_at ASC
-                LIMIT ?
-                """, arguments: [BackupStateRecord.State.pending.rawValue,
-                                 BackupStateRecord.State.failed.rawValue,
-                                 Self.maxRetries,
-                                 room])
+            try BackupQueue.uploadCandidates(db, now: Date(), limit: room)
         }
         guard !pending.isEmpty else { return 0 }
 
@@ -465,7 +484,7 @@ actor SyncEngine {
         for identifier in pending where !live.contains(identifier) {
             try Task.checkCancellation()
             // Stop the round rather than fail the rest of it one by one; `kick` reports the wait.
-            guard networkWait == nil else { break }
+            guard networkWait == nil, !isServerPaused else { break }
             guard queuedBytes < Self.maxQueuedBytes || (queued == 0 && inFlight.isEmpty) else { break }
             guard let asset = assets[identifier] else {
                 try await mark(identifier, state: .ineligible, error: "Asset no longer exists")
@@ -519,13 +538,8 @@ actor SyncEngine {
             uploadsInFlight += 1
             updateRateTicker()
             return export.byteCount
-        } catch is CancellationError {
-            try? await mark(identifier, state: .pending, error: nil)
-        } catch where networkWait != nil || NetworkMonitor.isConnectivityError(error) {
-            // Not this item's fault; spending a retry on it would eventually abandon it.
-            try? await mark(identifier, state: .pending, error: nil)
         } catch {
-            try? await bumpFailure(identifier, error: error.localizedDescription)
+            await settleFailure(identifier, error: error)
         }
         return nil
     }
@@ -536,7 +550,7 @@ actor SyncEngine {
         let ticket = outcome.ticket
         let identifier = ticket.localIdentifier
 
-        var spentRetry = false
+        var refill = true
         switch outcome.result {
         case let .success(response):
             do {
@@ -557,6 +571,8 @@ actor SyncEngine {
                     await queueReconcileIfEdited(identifier: identifier, immichID: remoteID,
                                                  since: ticket.modifiedBeforeExport)
                 }
+                serverPause.reset()
+                serverPausedUntil = nil
                 Log.sync.info("Uploaded \(ticket.filename, privacy: .public) (\(ticket.byteCount) bytes)")
             } catch {
                 // Left `uploading`; the next run returns it to the queue and the server's
@@ -564,13 +580,16 @@ actor SyncEngine {
                 Log.sync.error("Couldn't record upload of \(ticket.filename, privacy: .public): \(error.localizedDescription, privacy: .public)")
             }
         case let .failure(error):
-            if (error as? URLError)?.code == .cancelled
-                || networkWait != nil || NetworkMonitor.isConnectivityError(error) {
-                // Not this item's fault; spending a retry on it would eventually abandon it.
-                try? await mark(identifier, state: .pending, error: nil)
-            } else {
-                try? await bumpFailure(identifier, error: error.localizedDescription)
-                spentRetry = true
+            let kind = await settleFailure(identifier, error: error)
+            let cancelled = (error as? URLError)?.code == .cancelled
+            if cancelled || NetworkMonitor.isConnectivityError(error) || networkWait != nil {
+                // Resumes as soon as the network allows.
+            } else if kind == .transient, case ImmichError.http = error {
+                // The server answered but could not take it; it is asked again after a pause.
+                pauseForServer()
+                refill = false
+            } else if kind != .transient {
+                refill = false
             }
         }
 
@@ -578,9 +597,9 @@ actor SyncEngine {
         updateRateTicker()
         // Refill the queue, without waiting: on a background relaunch the uploader holds the
         // system's completion handler until this returns, and a run can take minutes. Not
-        // after a failure, which would send a server that is refusing uploads straight
-        // through every item's retries; the next completion or kick retries it.
-        if !spentRetry { scheduleRefill() }
+        // after a failure the network does not explain, which would send a server that is
+        // refusing uploads straight through the queue; the next completion or kick retries it.
+        if refill { scheduleRefill() }
         if uploadsInFlight == 0 && !isRunning && pendingRefill == nil {
             await status.setPhase(networkWait ?? .idle)
         }
@@ -673,6 +692,16 @@ actor SyncEngine {
                       checksum: String? = nil) async throws {
         let writer = try database.writer()
         try await writer.write { db in
+            switch state {
+            case .uploaded:
+                try db.execute(sql: "UPDATE backup_state SET next_attempt_at = 0, retry_count = 0 WHERE local_identifier = ?",
+                               arguments: [identifier])
+            case .pending:
+                try db.execute(sql: "UPDATE backup_state SET next_attempt_at = 0 WHERE local_identifier = ?",
+                               arguments: [identifier])
+            default:
+                break
+            }
             if let checksum {
                 try db.execute(sql: """
                     UPDATE backup_state SET state = ?, last_error = ?, checksum_hex = ?, updated_at = ?
@@ -692,13 +721,27 @@ actor SyncEngine {
     private func bumpFailure(_ identifier: String, error: String) async throws {
         let writer = try database.writer()
         try await writer.write { db in
-            try db.execute(sql: """
-                UPDATE backup_state
-                SET state = ?, last_error = ?, retry_count = retry_count + 1, updated_at = ?
-                WHERE local_identifier = ?
-                """, arguments: [BackupStateRecord.State.failed.rawValue, error,
-                                 Date().timeIntervalSince1970, identifier])
+            try BackupQueue.recordFailure(db, identifier: identifier, error: error, now: Date())
         }
+    }
+
+    /// Returns a failed upload to the queue, counting it against the item only when it is the
+    /// item's fault. Returns how the failure was classified.
+    @discardableResult
+    private func settleFailure(_ identifier: String, error: Error) async -> RetryPolicy.FailureKind {
+        var kind = RetryPolicy.kind(of: error)
+        // Not this item's fault while the network is unavailable.
+        if networkWait != nil, kind == .item { kind = .transient }
+        switch kind {
+        case .transient:
+            try? await mark(identifier, state: .pending, error: nil)
+        case .authentication:
+            try? await mark(identifier, state: .pending, error: nil)
+            session.markExpired()
+        case .item:
+            try? await bumpFailure(identifier, error: error.localizedDescription)
+        }
+        return kind
     }
 
     /// Recomputes the badge count (requirement 14). Callers outside a run, such as Settings
@@ -712,16 +755,7 @@ actor SyncEngine {
         var retrying = 0
         if let writer = try? database.writer() {
             (remaining, failed, retrying) = (try? await writer.read { db in
-                let remaining = try Int.fetchOne(db, sql: """
-                    SELECT COUNT(*) FROM backup_state WHERE state IN (?, ?, ?)
-                    """, arguments: StatementArguments(BackupStateRecord.outstandingStates)) ?? 0
-                let failedTotal = try Int.fetchOne(db, sql: """
-                    SELECT COUNT(*) FROM backup_state WHERE state = ?
-                    """, arguments: [BackupStateRecord.State.failed.rawValue]) ?? 0
-                let failed = try Int.fetchOne(db, sql: """
-                    SELECT COUNT(*) FROM backup_state WHERE state = ? AND retry_count >= ?
-                    """, arguments: [BackupStateRecord.State.failed.rawValue, Self.maxRetries]) ?? 0
-                return (remaining, failed, failedTotal - failed)
+                try BackupQueue.counts(db)
             }) ?? (0, 0, 0)
         }
         await status.update(remaining: remaining, uploading: uploading, enabled: enabled,
@@ -809,7 +843,7 @@ actor SyncEngine {
     nonisolated func backUpNow(remaining: Int) {
         let identifier = Self.backUpNowTaskIdentifier
         guard BackgroundTaskRegistrar.canSubmit(identifier) else {
-            Task { await kick() }
+            Task { await resetFailures(); await kick() }
             return
         }
         let request = BGContinuedProcessingTaskRequest(identifier: identifier,
@@ -822,11 +856,12 @@ actor SyncEngine {
             try BGTaskScheduler.shared.submit(request)
         } catch {
             Log.sync.info("Back Up Now not accepted: \(error.localizedDescription, privacy: .public)")
-            Task { await kick() }
+            Task { await resetFailures(); await kick() }
         }
     }
 
     func handleBackUpNow(_ task: BGContinuedProcessingTask) async {
+        await resetFailures()
         let work = Task { await drain(reportingTo: task) }
         task.expirationHandler = { work.cancel() }
         let finished = await work.value
