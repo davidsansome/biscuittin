@@ -351,7 +351,7 @@ actor SyncEngine {
             rows.append(BackupQueue.LibraryRow(identifier: asset.localIdentifier,
                                                created: asset.creationDate ?? .distantPast,
                                                modified: asset.modificationDate,
-                                               kind: AssetStub(asset).kind))
+                                               kind: MediaKind(asset)))
         }
 
         let anchor = scope.anchor

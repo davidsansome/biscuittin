@@ -83,7 +83,7 @@ downstream assumes them as written.
 | **D7** | Immich auth | Three ways in, one stored credential: **email + password** (`POST /api/auth/login`), **OAuth** (`POST /api/oauth/authorize` → `ASWebAuthenticationSession` → `POST /api/oauth/callback`, with on-device state + PKCE S256), or a user-created **API key**. The token or key is **stored in Keychain**; the password never is. Requests carry `Authorization: Bearer <token>` or `x-api-key: <key>` via `ImmichCredential`. | Matches requirement 13. OAuth and API keys were added with the sign-in flow (Implementation Log, 2026-09-23): servers with `passwordLogin: false` were otherwise impossible to sign in to. |
 | **D8** | Immich API surface & versioning | Target **Immich v3.1.0** (current release, confirmed at review); require **server ≥ v3.0** via `GET /api/server/about` at login, failing settings validation with a clear message on older servers. | Implementers **must validate every endpoint path, field, and multipart shape against the v3.1.0 OpenAPI spec** — Immich serves it at `/api/docs` on the target server. The endpoint tables in §7 are the contract to verify, not a substitute for the spec. |
 | **D9** | Remote metadata sync strategy | Both full and incremental sync go through **`POST /api/sync/stream`** (`types: [AssetsV2, AssetExifsV1]`), whose cursor Immich tracks server-side per access token: `reset: true` replays the whole library (first sign-in), `reset: false` replays only what changed (foreground, pull-to-refresh, Settings "Refresh Now"). Hard deletes arrive as explicit `AssetDeleteV1` lines in that same stream, so there is **no separate reconciliation sweep** — a delete is visible on the very next sync, not gated behind a weekly cursor. A `reset: true` replay — asked for at sign-in, or by the server with a lone `SyncResetV1` line once the session's checkpoint outlives its 30-day audit retention — **replaces** the cached server rows rather than merging into them (Implementation Log, 2026-10-04). The stream is applied **as it downloads**, committed and acked in chunks about every 2 s, and a replay removes whatever it did not mention only at its end, so the grid never empties meanwhile (Implementation Log, 2026-10-05). Acks are a per-checkpoint watermark (`POST /api/sync/ack`), so each chunk sends only a handful regardless of library size. | Superseded the original paged-`search/metadata` design (below) once the dedicated sync endpoints were confirmed stable against a real v3.1.0 server — see Implementation Log, 2026-09-23. `RemoteLibraryService.syncStream` is still the sole point of contact, so nothing above it changed. Original v1 design, kept for context: full sync paged `search/metadata` (`updatedAfter` cursor for delta), with deletions caught only by a periodic full-ID sweep — weekly, or in principle on pull-to-refresh, though no such control was ever wired up, so in practice a hard delete could sit unsynced for up to 7 days. |
-| **D10** | Rotation architecture | Rotation is a **per-facet physical operation dispatched by `MediaKind` to a per-kind strategy** behind one `AssetRotator` protocol. **v1 ships the image strategy**; the video and Live Photo strategies ship in **M9**, but their approach is decided now: **videos rotate losslessly** by rewriting the track transform (remux via `AVMutableMovie`, no re-encode) — locally written as a PhotoKit content-editing output, remotely as download → remux → `PUT /api/assets/{id}/original`; **Live Photos rotate via `PHLivePhotoEditingContext`** (keeps still + paired video consistent) locally, with the remote still replaced like an image. Images: local → PhotoKit content edit (Core Image re-encode); remote → download, rotate pixels, replace-original. Both facets are always updated; remote failure → partial-success toast + queued retry (D22 — the queue is what actually catches the remote copy up once the server is reachable again, not just a phrase for the toast). Until M9, non-image rotations are skipped with a reported count. | Immich has no server-side rotate. Pixel rotation (images) keeps Immich thumbnails correct; transform-remux (video) avoids re-encoding multi-GB files and is lossless. The strategy protocol is the day-one commitment; per-kind implementations are additive. |
+| **D10** | Rotation architecture | Rotation is a **per-facet physical operation dispatched by `MediaKind` to a per-kind strategy** behind one `AssetRotator` protocol. **v1 ships the image strategy**; the video and Live Photo strategies ship in **M9**, but their approach is decided now: **videos rotate losslessly** by rewriting the track transform (remux via `AVMutableMovie`, no re-encode) — locally written as a PhotoKit content-editing output, remotely as download → remux → `PUT /api/assets/{id}/original`; **Live Photos rotate via `PHLivePhotoEditingContext`** (keeps still + paired video consistent) locally, with the remote still replaced like an image. Images: local → PhotoKit content edit (Core Image re-encode). When a local facet exists, the server copy is then **replaced with that local rendition** (upload it, trash the old asset), so both copies hold the same bytes and stay linked by checksum; only a remote-only asset is downloaded, rotated and re-uploaded (a deviation made on 2026-11-15, see the Implementation Log). Both facets are always updated; remote failure → partial-success toast + queued retry (D22 — the queue is what actually catches the remote copy up once the server is reachable again, not just a phrase for the toast). Until M9, non-image rotations are skipped with a reported count. | Immich has no server-side rotate. Pixel rotation (images) keeps Immich thumbnails correct; transform-remux (video) avoids re-encoding multi-GB files and is lossless. The strategy protocol is the day-one commitment; per-kind implementations are additive. |
 | **D11** | Delete semantics | The delete button (grid multi-select and viewer) **always deletes everywhere**: local facet via `PHAssetChangeRequest.deleteAssets` (iOS shows its own system confirmation) and remote facet via `DELETE /api/assets` (Immich moves to trash — recoverable server-side). Mixed-facet and remote-only deletes get **one app confirmation dialog** stating exactly what will happen. Local-only deletion is **never** offered through the delete button — it exists only as the separate "Free up space" feature (D18). | Confirmed at review: delete means delete, everywhere; freeing device space is a distinct, clearly-labeled operation. |
 | **D12** | Upload sync mechanics | `BGProcessingTask` + **background `URLSession`** upload tasks; dedup before upload via `POST /api/assets/bulk-upload-check` with SHA-1 checksums; checksums computed streaming and cached in SQLite. Sync also runs opportunistically while the app is foregrounded. Videos upload through the same pipeline. | Background URLSession survives suspension; bulk-upload-check avoids re-uploading assets that already exist server-side (critical for first-run against an existing library). |
 | **D13** | Thumbnail pipeline | One `ImageLoader` facade over two backends: `PHCachingImageManager` for local facets; URLSession + **two-tier cache (NSCache memory / disk LRU, ~500 MB cap)** for remote thumbnails (`size=thumbnail` for grid, `size=preview` for viewer, original only for rotation/zoom-in). Immich generates thumbnails for videos too, so the pipeline is media-kind-agnostic. No third-party image library. | Keeps dependencies to GRDB only; PhotoKit already is a cache for local. |
@@ -97,7 +97,7 @@ downstream assumes them as written.
 
 | **D21** | Search architecture | **Fully on-device semantic search**: a bundled CLIP-family model embeds every asset locally; queries are embedded and ranked on-device. The Immich server is not involved in any search. | The requirement is offline search, and the server can never index local-only photos. Rejected: (a) `POST /api/search/smart` — verified working on the live v3.1.0 server, but online-only and blind to assets not yet uploaded; (b) exporting the server's pgvector embeddings — no API exposes them (verified: search endpoints return assets, never vectors), it would couple us to the server's model choice, and still misses local-only photos. One code path that always works beats two that each sometimes do. |
 
-| **D22** | Pending-edit retry queue | A local edit whose remote leg fails (verified live: rotating with the server unreachable) is queued in `pending_edits` and retried once the network is back — on launch/foreground (`StartupSequencer`, after a successful `syncStream`) and from `SyncEngine`'s existing background task, not a new `BGTaskScheduler` registration. The table is generalised over `edit_type` (`rotation` today) so a future edit kind adds a case, not a schema change. Reconciliation takes one of two shapes, chosen by whether a local facet exists: **state-based** when it does — PhotoKit content edits are always baked into pixels (D10), so the local asset's *current* rendition already is the final state however many edits landed on it offline, in whatever order, and the processor re-reads it fresh rather than storing an operation to replay; **operation-replay** when it does not (a remote-only asset) — there is no local truth to fall back on, so the queued row carries a small JSON `payload` (`{"clockwise": true}`) and the retry redoes that operation against whatever the remote currently holds, the same model the online path already uses. Both shapes are last-writer-wins against a concurrent remote-side change — a deliberate, named trade-off, not conflict resolution. | Rejected: storing a rotation *delta* (net quarter-turns) queued against every failure. It compounds a wrong assumption — that the remote's state when the delta is later replayed still matches whatever it was when the delta was recorded — which a concurrent server-side edit (or just time passing) breaks silently. State-based reconciliation for the local-backed case removes the assumption entirely rather than trying to track it correctly. |
+| **D22** | Pending-edit retry queue | A local edit whose remote leg fails (verified live: rotating with the server unreachable) is queued in `pending_edits` and retried once the network is back — on launch/foreground (`StartupSequencer`, after a successful `syncStream`) and from `SyncEngine`'s existing background task, not a new `BGTaskScheduler` registration. The table is generalised over `edit_type` (`rotation` today) so a future edit kind adds a case, not a schema change. Reconciliation takes one of two shapes, chosen by whether a local facet exists: **state-based** when it does — PhotoKit content edits are always baked into pixels (D10), so the local asset's *current* rendition already is the final state however many edits landed on it offline, in whatever order, and the processor re-reads it fresh rather than storing an operation to replay; **operation-replay** when it does not (a remote-only asset) — there is no local truth to fall back on, so the queued row carries a small JSON `payload` (`{"clockwise": true}`) and the retry redoes that operation against whatever the remote currently holds, the same model the online path already uses. Both shapes are last-writer-wins against a concurrent remote-side change — a deliberate, named trade-off, not conflict resolution. Retries back off (1 minute doubling to 6 hours) and never stop; a failure that is not the edit's fault (no network, server 5xx/408/429, signed out) is not counted. A replacement that uploaded but did not retire the old asset is remembered (`uploaded_id`) and the retry finishes it rather than uploading again. Edits made outside the app after an upload are found by `backup_state.modified_at` and queued here (2026-11-15). | Rejected: storing a rotation *delta* (net quarter-turns) queued against every failure. It compounds a wrong assumption — that the remote's state when the delta is later replayed still matches whatever it was when the delta was recorded — which a concurrent server-side edit (or just time passing) breaks silently. State-based reconciliation for the local-backed case removes the assumption entirely rather than trying to track it correctly. |
 | **D22** | Search model & packaging | **MobileCLIP-S0** CoreML pair (image + text encoder, ~110 MB fp16, 512-dim) from Apple's official `apple/coreml-mobileclip` release, fetched at build time by a `Tools/fetch_models.sh` script (not committed to git) and bundled into the app; CLIP BPE tokenizer implemented in Swift with the vocab bundled. Every embedding row records `model_version`; a model upgrade triggers a staged re-embed. | S0's zero-shot quality ≈ OpenAI ViT-B/16 — *better* than the server's default ViT-B-32 — at a fraction of the latency. Matching the server's exact model buys nothing (embeddings never cross the wire, D21). MobileCLIP2 or S2 are drop-in upgrades behind `model_version` if quality disappoints; decided by measurement, not up front. |
 | **D23** | Embedding store & query path | Embeddings live in a GRDB table keyed by `AssetID.raw`: 512-dim **fp16 blobs** (1 KB/asset). Queries run as a **brute-force cosine scan** via Accelerate in chunks, returning the **top-K (200) ranked** — no similarity threshold, no ANN index. | At 100k assets a full scan is ~50M multiply-adds — milliseconds on any supported device — and fp16 keeps 100k assets ≈ 100 MB on disk, ~1 MB per 1k in the scan cache. CLIP thresholds are notoriously model- and query-dependent; ranking (as Immich itself does) sidesteps tuning. ANN adds build/update complexity that nothing below ~1M vectors needs. |
 | **D24** | Map data path | Capture coordinates live **on `AssetStub`** (two `Float`s, `.nan` for absent) rather than being fetched per asset: filtering by map region is then an in-memory scan over the timeline index. Remote coordinates are promoted from `exif_json` into `latitude`/`longitude` columns on `remote_assets`. Boot cache goes to format v2. | Filtering must keep up with a pan, which rules out a query per map move. Measured first (§20.1): reading `PHAsset.location` during enumeration costs nothing, and 88 % of a real library carries coordinates — the two facts that made carrying them in the stub viable. `Float` gives ~1 m resolution, far finer than a dot needs, and `.nan` encodes absence without a tag byte. Alternative rejected: a separate lazily-populated location table, which is the shape M10's embeddings need but is pure overhead when the source data is already free to read.
@@ -445,7 +445,17 @@ CREATE TABLE backup_state (
   checksum_hex TEXT,
   state TEXT NOT NULL,        -- pending | uploading | uploaded | failed | ineligible | out_of_scope
   last_error TEXT, retry_count INTEGER NOT NULL DEFAULT 0,
-  updated_at REAL NOT NULL
+  updated_at REAL NOT NULL,
+  modified_at REAL,           -- PHAsset.modificationDate when the server's bytes were read (v7)
+  next_attempt_at REAL NOT NULL DEFAULT 0   -- earliest retry of a failed row (v7)
+);
+
+CREATE TABLE pending_edits (  -- D22
+  id INTEGER PRIMARY KEY, local_identifier TEXT, immich_id TEXT NOT NULL,
+  edit_type TEXT NOT NULL, media_kind INTEGER NOT NULL, payload TEXT,
+  retry_count INTEGER NOT NULL DEFAULT 0, last_error TEXT, updated_at REAL NOT NULL,
+  next_attempt_at REAL NOT NULL DEFAULT 0,  -- (v7)
+  uploaded_id TEXT, uploaded_checksum TEXT  -- replacement uploaded, old asset not yet retired (v7)
 );
 
 CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
@@ -638,10 +648,11 @@ actor PhotoActionService {
 Per-asset rotate flow: dispatch to the `AssetRotator` for `stub.kind`; kinds
 without a rotator (video/Live Photo until M9) go straight to
 `skippedUnsupported` — the UI toast reads "N videos skipped" (copy updates in M9).
-Local facet → `LocalAssetEditor.applyRotation` (checksum changes ⇒ `ChecksumStore`
-invalidates; `backup_state` → `pending`; `facet_links` rewritten with the new
-checksum). Remote facet → download original → `rotateRemoteOriginal` →
-`replaceOriginal`. Batch operations run with limited concurrency (2–3) and report
+Local facet → `LocalAssetEditor.applyRotation`, then, if the asset is on the server,
+`RemoteLibraryService.pushLocalRendition`: upload the local rendition, set the capture date
+with its original UTC offset, trash the old asset, re-key the link and `backup_state` to the
+new checksum. Remote-only facet → download original → `rotateRemoteOriginal` → the same
+upload-and-retire replacement. Batch operations run with limited concurrency (2–3) and report
 per-asset outcomes. On completion: `applyChange(.update(...))` with swapped
 dimensions + thumbnail cache invalidation for affected IDs.
 
@@ -662,9 +673,26 @@ batched PhotoKit call; timeline stubs lose `hasLocal` via `applyChange(.update)`
 ## 12. SyncEngine (upload backup)
 
 States per local asset (in `backup_state`): `pending → uploading → uploaded`,
-with `failed` (retry with exponential backoff, max 5 then park), `ineligible`
-(e.g. iCloud-offloaded original unavailable and network-restricted), and
-`out_of_scope` (excluded by the "new items only" scope — D17).
+with `failed`, `ineligible` and `out_of_scope` (excluded by the "new items only" scope — D17).
+
+Retry rules (2026-11-15). Nothing is abandoned:
+- A failure that is the item's fault marks it `failed` and sets `next_attempt_at` 1 minute
+  ahead, doubling per failure up to 6 hours (`RetryPolicy`). After 5 failures it is shown as
+  "failed" in Settings, and it is still retried.
+- A failure that is not (no network, cancelled, server 5xx/408/429, expired sign-in) leaves
+  it `pending` and counts nothing.
+- A server that answers 5xx/408/429 to an upload pauses uploads for 30 seconds, doubling up
+  to 15 minutes. Any upload that succeeds ends the pause, and so does a kick from outside
+  (foreground, network change, Settings).
+- `ineligible` now means only that the asset has no resource to upload or no longer exists.
+- Back Up Now and turning backup on put `failed` and `ineligible` rows back to `pending`.
+- A server copy found only in the server's trash (dedupe, or a `duplicate` upload response)
+  is restored from the trash rather than counted as a backup; if that fails the row stays
+  `pending`.
+- Each enumeration compares an uploaded asset's `modificationDate` with `modified_at`. A
+  linked asset that moved gets a pending edit (D22), whose push compares checksums and sends
+  nothing when the bytes are unchanged; an uploaded asset with no known server copy goes back
+  to `pending`.
 
 ```swift
 enum SyncScope: Equatable { case all
@@ -1328,6 +1356,82 @@ assumptions (AGENTS.md).
 ---
 
 ## 21. Implementation Log
+
+### Sync and edit fixes: replacements, retries, trash, later edits (2026-11-15)
+
+Seven findings from a review of sync and editing, fixed in seven commits. What was observed
+for each:
+
+- **A replaced asset took its local photo's link back (finding 1).** After a rotation, the
+  next sync reports the old asset as trashed, still carrying the checksum the local photo
+  was linked under, and its checksum upsert pointed the link at the trashed copy. Reproduced
+  by `ReplacedAssetLinkTests.testTrashedOriginalDoesNotTakeTheLinkBackFromItsReplacement`,
+  which failed before the fix. A trashed asset now releases its link and claims none.
+  Against the mock: rotate a backed-up photo, refresh twice, one tile, one link naming the
+  newest id.
+- **Rotation re-keys the link (D10 deviation).** An online rotation used to download the
+  server file and rotate it separately, so the two copies never had the same bytes and no
+  checksum could link them again. A photo with a local copy now pushes its local rendition;
+  only remote-only assets still take the download path. The link and `backup_state` take
+  the new checksum, so the link survives a full replay (`ReplacementTests`).
+- **Capture time zone lost on replacement (finding 8).** Checked on the local v3.2.4 server:
+  `PUT /api/assets/{id}` with `dateTimeOriginal` `2026-08-18T10:00:00.000+11:00` left
+  `fileCreatedAt` `2026-08-17T23:00:00.000Z`, `localDateTime` `2026-08-18T10:00:00.000Z` and
+  EXIF zone `UTC+11` unchanged. The form the old code sent, the local time written as "Z",
+  moved `fileCreatedAt` to `2026-08-18T10:00:00.000Z` and the zone to `UTC+0`. The offset is
+  now recovered from `localDateTime - fileCreatedAt` and sent with the instant.
+- **A half-finished replacement left two live assets (finding 7).** The pending edit now
+  remembers the uploaded replacement. Against the mock, with `DELETE /api/assets` failing
+  once: one upload, the failed delete, then on foreground the retry finished it with no
+  second upload; one live asset, `pending_edits` empty.
+- **Failures stranded photos (findings 2, 3).** One failed checksum marked a photo
+  `ineligible` for good, and five failures of any kind abandoned it. Now everything backs
+  off and is retried (§12). Against the mock, 502 to five uploads: neither photo ended
+  `failed`, retries came about 60 s and then about 240 s apart, and uploads resumed without
+  a relaunch. The plan asked for 20 failures; 5 were run because the pause reaches its
+  15-minute cap after 6.
+- **A copy in the server's trash counted as a backup (finding 5).** Checked on v3.2.4:
+  `DELETE /api/assets` without `force` trashes; the next `sync/stream`, incremental or
+  reset, re-sends the asset with `deletedAt`; `bulk-upload-check` answers `reject`,
+  `duplicate`, the asset id and `isTrashed: true`; uploading the same bytes again answers
+  200 `{"status":"duplicate","id":<trashed id>}`; `POST /api/trash/restore/assets`
+  `{"ids":[id]}` answers 200 `{"count":1}`, after which `isTrashed` is false and the next
+  incremental stream re-sends the asset with `deletedAt: null`. Against the mock: trash an
+  uploaded asset, sign out, sign in; the dedupe restored it and nothing was uploaded.
+- **Edits made after an upload were never pushed (finding 6).** `backup_state.modified_at`
+  records `PHAsset.modificationDate` when the bytes the server holds were read; each
+  enumeration compares it (§12, D22). The scan is covered by `BackupQueueTests` only; no run
+  edited a photo outside the app. Against the mock, the older path for an edit made while
+  its upload is in flight still worked with the new replacement: the photo was pushed once
+  the upload finished, and the old asset was trashed.
+
+Known limits, not fixed:
+- Edits made before this version was installed are not found: the first scan can only take
+  a baseline.
+- PhotoKit moves `modificationDate` for changes that leave the bytes alone, such as
+  favouriting. Each costs one hash of the asset and pushes nothing.
+- The first upload of a photo already edited when it is uploaded is named "FullSizeRender"
+  (seen against the mock), as before.
+
+`Tools/mock_immich.py` now behaves as v3.2.4 did above: it trashes rather than forgets,
+re-sends changes through `sync/stream` by sequence number, restores, stores
+`dateTimeOriginal`, serves originals, and has `/mock/fail` and `/mock/upload-delay` control
+routes. It does not read EXIF, so its uploads report `localDateTime` equal to the multipart
+`fileCreatedAt`; the offset path is covered by the real-server check above and by
+`ReplacementTests`.
+
+Cost of the scan (plan 8.6), measured on an iPhone 13 with a 1,445-asset library: a warm-up
+pass, then each variant in both orders, over four launches (8 samples each). Enumerating
+identifier and creation date as before: best 33.6 ms, median 34.0. Adding
+`modificationDate` and the media kind read through a whole `AssetStub`: best 36.4, median
+37.0. Adding `modificationDate` and only the kind: best 34.0, median 35.1. Building the stub
+also faults in location, size and duration, which cost more than the date did, so the scan
+reads only the kind (`MediaKind(_:)`). Scaled linearly to 70,000 assets that is roughly 50 ms
+more per scan; no library that large was measured.
+
+Not verified on a phone, in the plan's words "unverified": cropping a photo in Photos after
+upload, rotating a HEIC and checking its time zone in Immich's web UI, favouriting in Photos
+causing no upload, and rotating a Live Photo and a video.
 
 ### Sync applied as it downloads (2026-10-05)
 

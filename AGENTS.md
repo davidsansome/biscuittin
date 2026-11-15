@@ -227,6 +227,11 @@ xcodebuild -project BiscuitTin.xcodeproj -scheme BiscuitTin -destination 'platfo
 xcrun devicectl device install app --device <DEVICE_UDID> build/DeviceDD/Build/Products/Debug-iphoneos/BiscuitTin.app
 ```
 
+To pass the app a launch argument, put `--` after the bundle id
+(`devicectl device process launch … com.davidsansome.biscuittin -- -someFlag`): without it
+devicectl parses `-someFlag` as one of its own options and fails. A launch also fails while
+the phone is locked ("device was not, or could not be, unlocked"); ask for it to be unlocked.
+
 `xcrun devicectl list devices` gives the identifier; `xcrun xctrace list devices` gives the UDID
 that `xcodebuild -destination` wants — they are different strings for the same phone.
 

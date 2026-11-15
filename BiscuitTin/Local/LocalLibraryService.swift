@@ -158,16 +158,23 @@ extension LocalLibraryService: PHPhotoLibraryChangeObserver {
 
 // MARK: - PHAsset bridging
 
+extension MediaKind {
+    /// Reads only what the kind needs: building a whole `AssetStub` also faults in location,
+    /// size and duration, which measurably slows a pass over the whole library.
+    init(_ asset: PHAsset) {
+        if asset.mediaType == .video {
+            self = .video
+        } else if asset.mediaSubtypes.contains(.photoLive) {
+            self = .livePhoto
+        } else {
+            self = .image
+        }
+    }
+}
+
 extension AssetStub {
     init(_ asset: PHAsset) {
-        let kind: MediaKind
-        if asset.mediaType == .video {
-            kind = .video
-        } else if asset.mediaSubtypes.contains(.photoLive) {
-            kind = .livePhoto
-        } else {
-            kind = .image
-        }
+        let kind = MediaKind(asset)
 
         let coordinate = asset.location?.coordinate
         self.init(id: .local(asset.localIdentifier),

@@ -30,7 +30,20 @@ exactly as the real server does. `--no-password-login` and `--oauth-auto-launch`
 mirror the matching admin settings.
 
 Uploads are remembered, so `GET /api/assets/{id}` describes them the way a real
-server does. `--upload-delay` holds each upload's response back, which keeps the
+server does, and they reach `sync/stream` like any other change. Trash behaves as
+v3.2.4's was observed to: `DELETE /api/assets` without `force` trashes, keeping the
+asset and its checksum, and the next stream re-sends it with `deletedAt` set;
+`bulk-upload-check` reports `isTrashed` for it; uploading its bytes again answers
+200 `duplicate` with the trashed asset's id; `POST /api/trash/restore/assets`
+answers 200 `{"count": n}` and the asset is re-sent live. `force: true` purges and
+sends `AssetDeleteV1`. `PUT /api/assets/{id}` with a `dateTimeOriginal` carrying an
+offset sets `fileCreatedAt` to that instant and `localDateTime` to its wall-clock
+time; a "Z" value sets the zone to UTC, as the real server does.
+
+`POST /mock/upload-delay?seconds=N` changes `--upload-delay` while running.
+`POST /mock/fail?method=DELETE&path=/api/assets&status=500&count=1` makes the next
+`count` matching requests fail with `status`; `POST /mock/fail-uploads?status=502&count=20`
+is the same for uploads. `--upload-delay` holds each upload's response back, which keeps the
 window between export and link open long enough to edit the photo by hand;
 `--save-uploads DIR` writes each uploaded file there, to inspect what arrived.
 
@@ -162,17 +175,21 @@ def sync_lines(types):
     """Every line not yet acked: the user's assets and their EXIF, then partner sharing."""
     lines = []
     if "AssetsV2" in types:
-        for asset in ASSETS:
-            lines.append({"type": "AssetV2", "ack": f"AssetV2|{asset['id']}", "data": {
+        for asset in sorted(all_assets(), key=lambda a: ASSET_SEQ.get(a["id"], 0)):
+            seq = ASSET_SEQ.get(asset["id"], 0)
+            lines.append({"type": "AssetV2", "ack": f"AssetV2|{seq:012d}", "data": {
                 "id": asset["id"], "ownerId": "user-1",
                 "originalFileName": asset["originalFileName"], "thumbhash": None,
                 "checksum": asset["checksum"], "fileCreatedAt": asset["fileCreatedAt"],
                 "fileModifiedAt": asset["fileModifiedAt"], "createdAt": asset["updatedAt"],
                 "localDateTime": asset["localDateTime"], "duration": asset["duration"],
-                "type": asset["type"], "deletedAt": None, "isFavorite": False,
+                "type": asset["type"], "deletedAt": TRASHED_AT.get(asset["id"]), "isFavorite": False,
                 "visibility": "timeline", "livePhotoVideoId": None, "stackId": None,
                 "libraryId": None, "width": asset["width"], "height": asset["height"],
                 "isEdited": False}})
+        for asset_id, seq in sorted(PURGED.items(), key=lambda item: item[1]):
+            lines.append({"type": "AssetDeleteV1", "ack": f"AssetDeleteV1|{seq:012d}",
+                          "data": {"assetId": asset_id}})
     if "AssetExifsV1" in types:
         for asset in ASSETS:
             exif = asset["exifInfo"]
@@ -181,7 +198,7 @@ def sync_lines(types):
                 "projectionType": None, "profileDescription": None, "rating": None, "fps": None,
                 **exif}})
     lines += partner_sync_lines(types)
-    unacked = [line for line in lines if line["ack"].split("|")[0] not in SYNC_CHECKPOINTS]
+    unacked = [line for line in lines if is_unacked(line)]
     unacked.append({"type": "SyncCompleteV1", "ack": "SyncCompleteV1|now", "data": {}})
     return unacked
 
@@ -287,11 +304,57 @@ def partner_sync_lines(types):
                                    "rating": None, "fps": None}})
     return lines
 REQUEST_LOG = []
+# Every asset change takes the next number, and an AssetV2/AssetDeleteV1 checkpoint is the
+# last number acked: what the real server's time-ordered ack ids amount to.
+CHANGE_SEQ = [0]
+ASSET_SEQ = {}          # asset id -> number of its latest change
+PURGED = {}             # asset id -> number of its hard delete
+TRASHED_AT = {}         # asset id -> deletedAt
+SEQ_TYPES = ("AssetV2", "AssetDeleteV1")
+FAILURES = []           # [method, path, status, remaining]
+
+
+def touch(asset_id):
+    CHANGE_SEQ[0] += 1
+    ASSET_SEQ[asset_id] = CHANGE_SEQ[0]
+
+
+def iso_z(moment):
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") \
+        + f"{moment.microsecond // 1000:03d}Z"
+
+
+def all_assets():
+    return list(ASSETS) + list(UPLOADED_ASSETS.values())
+
+
+def find_asset(asset_id):
+    return UPLOADED_ASSETS.get(asset_id) or next((a for a in ASSETS if a["id"] == asset_id), None)
+
+
+def checksum_hex(asset):
+    return base64.b64decode(asset["checksum"]).hex() if asset.get("checksum") else None
+
+
+def is_unacked(line):
+    kind, _, position = line["ack"].partition("|")
+    if kind not in SYNC_CHECKPOINTS:
+        return True
+    if kind in SEQ_TYPES:
+        return int(position) > int(SYNC_CHECKPOINTS[kind].split("|")[1])
+    return False
+
+
+for _asset in ASSETS:
+    touch(_asset["id"])
+
 # checksum -> server asset id, so bulk-upload-check can report duplicates
 UPLOADED_CHECKSUMS = {}
 UPLOAD_COUNT = []
 # server asset id -> AssetResponseDto, for GET /api/assets/{id}
 UPLOADED_ASSETS = {}
+# server asset id -> the uploaded file's bytes, for GET /api/assets/{id}/original
+UPLOADED_DATA = {}
 UPLOAD_DELAY = 0.0
 SAVE_UPLOADS = None
 
@@ -353,6 +416,16 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(chunk)))
         self.end_headers()
         self.wfile.write(chunk)
+
+    def _injected_failure(self, method, path):
+        """True when a /mock/fail rule answered this request."""
+        for rule in FAILURES:
+            if rule[0] == method and rule[1] == path and rule[3] > 0:
+                rule[3] -= 1
+                print(f"  injected failure: {rule[2]} ({rule[3]} left)", flush=True)
+                self._send(rule[2], {"message": "injected failure"})
+                return True
+        return False
 
     def _authorized(self):
         if EXPIRE_SESSIONS:
@@ -419,11 +492,18 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/assets/") and path.count("/") == 3:
             if not self._authorized():
                 return self._send(401, {"message": "unauthorized"})
-            asset = UPLOADED_ASSETS.get(path.split("/")[3]) \
-                or next((a for a in ASSETS if a["id"] == path.split("/")[3]), None)
+            asset = find_asset(path.split("/")[3])
             if asset is None:
                 return self._send(404, {"message": "Asset not found"})
             return self._send(200, asset)
+
+        if path.startswith("/api/assets/") and path.endswith("/original"):
+            if not self._authorized():
+                return self._send(401, {"message": "unauthorized"})
+            data = UPLOADED_DATA.get(path.split("/")[3])
+            if data is None:
+                return self._send(404, {"message": "Asset not found"})
+            return self._send(200, data, content_type="application/octet-stream")
 
         if path.startswith("/api/assets/") and path.endswith("/video/playback"):
             if not self._authorized():
@@ -450,6 +530,22 @@ class Handler(BaseHTTPRequestHandler):
             pass  # raw holds the multipart body; only its size matters here
         REQUEST_LOG.append(("POST", path))
         print(f"POST {path}  body={raw[:120]!r}", flush=True)
+
+        if path in ("/mock/fail", "/mock/fail-uploads"):
+            query = parse_qs(urlparse(self.path).query)
+            method = query.get("method", ["POST"])[0]
+            target = "/api/assets" if path == "/mock/fail-uploads" else query["path"][0]
+            FAILURES.append([method, target, int(query.get("status", ["500"])[0]),
+                             int(query.get("count", ["1"])[0])])
+            print(f"  will fail {FAILURES[-1]}", flush=True)
+            return self._send(204, b"", content_type="application/json")
+        if path == "/mock/upload-delay":
+            global UPLOAD_DELAY
+            UPLOAD_DELAY = float(parse_qs(urlparse(self.path).query).get("seconds", ["0"])[0])
+            print(f"  upload delay now {UPLOAD_DELAY:g}s", flush=True)
+            return self._send(204, b"", content_type="application/json")
+        if self._injected_failure("POST", path):
+            return
 
         if path == "/api/auth/login":
             if not FEATURES["passwordLogin"]:
@@ -496,6 +592,9 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(raw or b"{}")
             if body.get("reset"):
                 SYNC_CHECKPOINTS.clear()
+                # A replay describes what exists; deletes are only reported to a session
+                # that saw the asset.
+                PURGED.clear()
                 PENDING_SYNC_RESET = False
             if PENDING_SYNC_RESET:
                 line = json.dumps({"type": "SyncResetV1", "data": {}, "ack": "SyncResetV1|reset"})
@@ -531,12 +630,15 @@ class Handler(BaseHTTPRequestHandler):
             results = []
             for item in body.get("assets", []):
                 known = item["checksum"] in UPLOADED_CHECKSUMS
-                results.append({
+                result = {
                     "id": item["id"],
                     "action": "reject" if known else "accept",
                     "reason": "duplicate" if known else None,
                     "assetId": UPLOADED_CHECKSUMS.get(item["checksum"]),
-                })
+                }
+                if known:
+                    result["isTrashed"] = UPLOADED_CHECKSUMS[item["checksum"]] in TRASHED_AT
+                results.append(result)
             print(f"  bulk-upload-check: {len(results)} items, "
                   f"{sum(1 for r in results if r['action'] == 'reject')} duplicates", flush=True)
             return self._send(200, {"results": results})
@@ -575,6 +677,8 @@ class Handler(BaseHTTPRequestHandler):
                 "livePhotoVideoId": None,
                 "exifInfo": None,
             }
+            touch(new_id)
+            UPLOADED_DATA[new_id] = data
             if SAVE_UPLOADS and filename:
                 with open(os.path.join(SAVE_UPLOADS, f"{new_id}-{filename}"), "wb") as f:
                     f.write(data)
@@ -584,6 +688,20 @@ class Handler(BaseHTTPRequestHandler):
                 print(f"  holding the response for {UPLOAD_DELAY:g}s", flush=True)
                 time.sleep(UPLOAD_DELAY)
             return self._send(201, {"id": new_id, "status": "created"})
+
+        if path == "/api/trash/restore/assets":
+            if not self._authorized():
+                return self._send(401, {"message": "Authentication required"})
+            ids = json.loads(raw or b"{}").get("ids", [])
+            count = 0
+            for asset_id in ids:
+                asset = find_asset(asset_id)
+                if asset is not None and TRASHED_AT.pop(asset_id, None) is not None:
+                    asset["isTrashed"] = False
+                    touch(asset_id)
+                    count += 1
+            print(f"  restored {count} of {ids}", flush=True)
+            return self._send(200, {"count": count})
 
         if path == "/api/search/metadata":
             if not self._authorized():
@@ -609,11 +727,21 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b"{}"
         REQUEST_LOG.append(("PUT", path))
         print(f"PUT  {path}  body={raw[:120]!r}", flush=True)
+        if self._injected_failure("PUT", path):
+            return
         if not self._authorized():
             return self._send(401, {"message": "Authentication required"})
-        asset = UPLOADED_ASSETS.get(path.split("/")[-1])
+        asset = find_asset(path.split("/")[-1])
         if asset is None:
             return self._send(404, {"message": "Asset not found"})
+        original = json.loads(raw or b"{}").get("dateTimeOriginal")
+        if original:
+            moment = datetime.fromisoformat(original.replace("Z", "+00:00"))
+            asset["fileCreatedAt"] = iso_z(moment)
+            # Wall-clock time in the given offset, written as if it were UTC.
+            asset["localDateTime"] = moment.replace(tzinfo=timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
+            touch(asset["id"])
         return self._send(200, asset)
 
     def do_DELETE(self):
@@ -621,8 +749,29 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b""
         REQUEST_LOG.append(("DELETE", self.path))
         print(f"DELETE {self.path}  body={raw[:120]!r}", flush=True)
+        if self._injected_failure("DELETE", self.path.split("?")[0]):
+            return
         if not self._authorized():
             return self._send(401, {"message": "Authentication required"})
+        body = json.loads(raw or b"{}")
+        now = iso_z(datetime.now(timezone.utc))
+        for asset_id in body.get("ids", []):
+            asset = find_asset(asset_id)
+            if asset is None:
+                continue
+            if body.get("force"):
+                UPLOADED_ASSETS.pop(asset_id, None)
+                ASSETS[:] = [a for a in ASSETS if a["id"] != asset_id]
+                UPLOADED_CHECKSUMS.pop(checksum_hex(asset), None)
+                TRASHED_AT.pop(asset_id, None)
+                ASSET_SEQ.pop(asset_id, None)
+                CHANGE_SEQ[0] += 1
+                PURGED[asset_id] = CHANGE_SEQ[0]
+            else:
+                asset["isTrashed"] = True
+                TRASHED_AT[asset_id] = now
+                touch(asset_id)
+            print(f"  {'purged' if body.get('force') else 'trashed'} {asset_id}", flush=True)
         return self._send(204, b"", content_type="application/json")
 
 
