@@ -108,4 +108,104 @@ final class BackupQueueTests: XCTestCase {
         XCTAssertEqual(counts.failed, 2)
         XCTAssertEqual(counts.retrying, 1)
     }
+
+    // MARK: - Library scan
+
+    private func scan(_ rows: [BackupQueue.LibraryRow], anchor: Date? = nil) throws -> BackupQueue.ScanResult {
+        try database.writer().write { db in
+            try BackupQueue.applyLibraryScan(db, rows: rows, anchor: anchor, now: self.now)
+        }
+    }
+
+    private func libraryRow(_ id: String, created: Double = 0, modified: Double?) -> BackupQueue.LibraryRow {
+        BackupQueue.LibraryRow(identifier: id, created: Date(timeIntervalSince1970: created),
+                               modified: modified.map(Date.init(timeIntervalSince1970:)), kind: .image)
+    }
+
+    private func insertUploaded(_ id: String, modifiedAt: Double?, linkedTo immichID: String?) throws {
+        try database.writer().write { db in
+            try BackupStateRecord(localIdentifier: id, checksumHex: "c-\(id)", state: .uploaded,
+                                  modifiedAt: modifiedAt).insert(db)
+            try db.execute(sql: "INSERT INTO facet_links (checksum_hex, local_identifier, immich_id) VALUES (?, ?, ?)",
+                           arguments: ["c-\(id)", id, immichID])
+        }
+    }
+
+    private func pendingEdits() throws -> [PendingEditRecord] {
+        try database.writer().read { db in try PendingEditRecord.fetchAll(db) }
+    }
+
+    func testScanAddsNewAssetsHonouringTheAnchor() throws {
+        _ = try scan([libraryRow("old", created: 10, modified: nil), libraryRow("new", created: 30, modified: nil)],
+                     anchor: Date(timeIntervalSince1970: 20))
+        XCTAssertEqual(try row("old")?.backupState, .outOfScope)
+        XCTAssertEqual(try row("new")?.backupState, .pending)
+    }
+
+    func testFirstScanOfAnUploadedAssetOnlyTakesABaseline() throws {
+        try insertUploaded("A", modifiedAt: nil, linkedTo: "R1")
+        let result = try scan([libraryRow("A", modified: 500)])
+        XCTAssertEqual(result, BackupQueue.ScanResult())
+        XCTAssertEqual(try row("A")?.modifiedAt, 500)
+        XCTAssertEqual(try pendingEdits().count, 0)
+    }
+
+    func testEditedLinkedAssetQueuesOneCheck() throws {
+        try insertUploaded("A", modifiedAt: 500, linkedTo: "R1")
+        let result = try scan([libraryRow("A", modified: 510)])
+        XCTAssertEqual(result.edited, ["A"])
+        let edits = try pendingEdits()
+        XCTAssertEqual(edits.count, 1)
+        XCTAssertEqual(edits.first?.localIdentifier, "A")
+        XCTAssertEqual(edits.first?.immichID, "R1")
+        XCTAssertEqual(try row("A")?.modifiedAt, 510)
+
+        let again = try scan([libraryRow("A", modified: 510)])
+        XCTAssertEqual(again, BackupQueue.ScanResult())
+        XCTAssertEqual(try pendingEdits().count, 1)
+    }
+
+    func testEditedUnlinkedAssetIsUploadedAfresh() throws {
+        try insertUploaded("A", modifiedAt: 500, linkedTo: nil)
+        let result = try scan([libraryRow("A", modified: 510)])
+        XCTAssertEqual(result.requeued, ["A"])
+        let record = try XCTUnwrap(try row("A"))
+        XCTAssertEqual(record.backupState, .pending)
+        XCTAssertNil(record.checksumHex)
+        XCTAssertNil(record.modifiedAt)
+        let halfLinks = try database.writer().read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM facet_links WHERE local_identifier = 'A'")
+        }
+        XCTAssertEqual(halfLinks, 0)
+        XCTAssertEqual(try pendingEdits().count, 0)
+    }
+
+    func testSmallDateDriftIsIgnored() throws {
+        try insertUploaded("A", modifiedAt: 500, linkedTo: "R1")
+        let result = try scan([libraryRow("A", modified: 500.2)])
+        XCTAssertEqual(result, BackupQueue.ScanResult())
+        XCTAssertEqual(try pendingEdits().count, 0)
+    }
+
+    func testPendingRowIsNotTreatedAsEdited() throws {
+        try database.writer().write { db in
+            try BackupStateRecord(localIdentifier: "A", state: .pending, modifiedAt: 500).insert(db)
+        }
+        let result = try scan([libraryRow("A", modified: 900)])
+        XCTAssertEqual(result, BackupQueue.ScanResult())
+        XCTAssertEqual(try row("A")?.modifiedAt, 500)
+    }
+
+    func testExistingPendingEditIsUpdatedNotDuplicated() throws {
+        try insertUploaded("A", modifiedAt: 500, linkedTo: "R1")
+        try database.writer().write { db in
+            try PendingEditRecord(localIdentifier: "A", immichID: "R1", editType: .rotation, mediaKind: .image,
+                                  payload: nil, retryCount: 3, updatedAt: 1, nextAttemptAt: 99_999_999).insert(db)
+        }
+        _ = try scan([libraryRow("A", modified: 510)])
+        let edits = try pendingEdits()
+        XCTAssertEqual(edits.count, 1)
+        XCTAssertEqual(edits.first?.retryCount, 0)
+        XCTAssertEqual(edits.first?.nextAttemptAt, 0)
+    }
 }

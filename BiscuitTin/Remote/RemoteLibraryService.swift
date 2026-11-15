@@ -915,38 +915,10 @@ actor RemoteLibraryService {
         let writer = try database.writer()
         let now = Date().timeIntervalSince1970
         try await writer.write { db in
-            let existing: PendingEditRecord?
-            if let localIdentifier {
-                existing = try PendingEditRecord
-                    .filter(sql: "local_identifier = ?", arguments: [localIdentifier])
-                    .fetchOne(db)
-            } else {
-                existing = try PendingEditRecord
-                    .filter(sql: "immich_id = ? AND local_identifier IS NULL", arguments: [immichID])
-                    .fetchOne(db)
-            }
-
-            if var row = existing {
-                row.immichID = immichID
-                row.mediaKindRaw = Int(mediaKind.rawValue)
-                row.payload = payload
-                row.retryCount = 0
-                row.lastError = nil
-                row.updatedAt = now
-                row.nextAttemptAt = 0
-                // An unfinished replacement already on record must not be forgotten because a
-                // later attempt failed before uploading anything.
-                if let uploadedID {
-                    row.uploadedID = uploadedID
-                    row.uploadedChecksum = uploadedChecksum
-                }
-                try row.update(db)
-            } else {
-                try PendingEditRecord(localIdentifier: localIdentifier, immichID: immichID,
-                                      editType: editType, mediaKind: mediaKind, payload: payload,
-                                      updatedAt: now, uploadedID: uploadedID,
-                                      uploadedChecksum: uploadedChecksum).insert(db)
-            }
+            try PendingEditRecord.upsert(db, localIdentifier: localIdentifier, immichID: immichID,
+                                         editType: editType, mediaKind: mediaKind, payload: payload,
+                                         uploadedID: uploadedID, uploadedChecksum: uploadedChecksum,
+                                         now: now)
         }
     }
 

@@ -96,6 +96,53 @@ struct PendingEditRecord: Codable, FetchableRecord, PersistableRecord, Equatable
     mutating func didInsert(_ inserted: InsertionSuccess) {
         id = inserted.rowID
     }
+
+    /// Queues an edit, or resets the retry clock of the one already queued for the same asset.
+    ///
+    /// `uploadedID`/`uploadedChecksum` name a replacement that reached the server but whose
+    /// old asset was not retired.
+    static func upsert(_ db: Database,
+                       localIdentifier: String?,
+                       immichID: String,
+                       editType: EditType,
+                       mediaKind: MediaKind,
+                       payload: String?,
+                       uploadedID: String? = nil,
+                       uploadedChecksum: String? = nil,
+                       now: Double) throws {
+        let existing: PendingEditRecord?
+        if let localIdentifier {
+            existing = try PendingEditRecord
+                .filter(sql: "local_identifier = ?", arguments: [localIdentifier])
+                .fetchOne(db)
+        } else {
+            existing = try PendingEditRecord
+                .filter(sql: "immich_id = ? AND local_identifier IS NULL", arguments: [immichID])
+                .fetchOne(db)
+        }
+
+        if var row = existing {
+            row.immichID = immichID
+            row.mediaKindRaw = Int(mediaKind.rawValue)
+            row.payload = payload
+            row.retryCount = 0
+            row.lastError = nil
+            row.updatedAt = now
+            row.nextAttemptAt = 0
+            // An unfinished replacement already on record must not be forgotten because a
+            // later attempt failed before uploading anything.
+            if let uploadedID {
+                row.uploadedID = uploadedID
+                row.uploadedChecksum = uploadedChecksum
+            }
+            try row.update(db)
+        } else {
+            try PendingEditRecord(localIdentifier: localIdentifier, immichID: immichID,
+                                  editType: editType, mediaKind: mediaKind, payload: payload,
+                                  updatedAt: now, uploadedID: uploadedID,
+                                  uploadedChecksum: uploadedChecksum).insert(db)
+        }
+    }
 }
 
 /// The remote-only fallback payload for `EditType.rotation` — see `PendingEditRecord`'s doc

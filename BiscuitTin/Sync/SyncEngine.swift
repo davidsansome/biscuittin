@@ -70,8 +70,9 @@ actor SyncEngine {
     private var uploadsInFlight = 0
     private var rateTicker: Task<Void, Never>?
     private var linksNotice: Task<Void, Never>?
-    /// Set when an upload landed bytes older than the asset it came from; see `upload`.
-    private var queuedEditDuringUpload = false
+    /// Set when an edit was queued for the server: by an upload that landed bytes older than
+    /// the asset it came from (`queueReconcileIfEdited`), or by the library scan.
+    private var hasQueuedEdits = false
     /// Set when the server answered but could not take an upload. Uploads wait rather than
     /// sending the whole queue at a server that is restarting.
     private var serverPausedUntil: Date?
@@ -292,8 +293,8 @@ actor SyncEngine {
 
             // Straight away rather than on the next foreground: the server was reachable a
             // moment ago, and until this runs it shows the photo as it was before the edit.
-            if queuedEditDuringUpload {
-                queuedEditDuringUpload = false
+            if hasQueuedEdits {
+                hasQueuedEdits = false
                 await remoteLibrary.retryPendingEdits()
             }
         } catch is CancellationError {
@@ -340,27 +341,38 @@ actor SyncEngine {
         return try await writer.read { db in try BackupQueue.actionableCount(db, now: Date()) }
     }
 
-    /// Step 1: make sure every local asset has a backup_state row, honouring the scope.
+    /// Step 1: make sure every local asset has a backup_state row, honouring the scope, and
+    /// notice uploaded assets edited since their bytes were read.
     private func enumerateLibrary() async throws {
         let fetch = localLibrary.fetchAllAssets()
-        var rows: [(String, Date)] = []
+        var rows: [BackupQueue.LibraryRow] = []
         rows.reserveCapacity(fetch.count)
         fetch.enumerateObjects { asset, _, _ in
-            rows.append((asset.localIdentifier, asset.creationDate ?? .distantPast))
+            rows.append(BackupQueue.LibraryRow(identifier: asset.localIdentifier,
+                                               created: asset.creationDate ?? .distantPast,
+                                               modified: asset.modificationDate,
+                                               kind: AssetStub(asset).kind))
         }
 
         let anchor = scope.anchor
         let writer = try database.writer()
-        try await writer.write { db in
-            let known = try String.fetchSet(db, sql: "SELECT local_identifier FROM backup_state")
-            for (identifier, created) in rows where !known.contains(identifier) {
-                // Out of scope assets are recorded, not skipped, so upgrading later is a
-                // state flip rather than a re-enumeration of the whole library.
-                let state: BackupStateRecord.State =
-                    (anchor.map { created < $0 } ?? false) ? .outOfScope : .pending
-                try BackupStateRecord(localIdentifier: identifier, state: state).insert(db)
-            }
+        let result = try await writer.write { db in
+            try BackupQueue.applyLibraryScan(db, rows: rows, anchor: anchor, now: Date())
         }
+        if !result.edited.isEmpty || !result.requeued.isEmpty {
+            resolver.invalidate(result.edited + result.requeued)
+        }
+        if !result.edited.isEmpty {
+            Log.sync.info("\(result.edited.count) uploaded assets changed since upload; queueing server updates")
+            hasQueuedEdits = true
+        }
+    }
+
+    /// Current `PHAsset`s by identifier. Not the resolver: it caches for the image pipeline
+    /// and can hold an object from before an edit.
+    private func freshAssets(_ identifiers: [String]) -> [String: PHAsset] {
+        Dictionary(localLibrary.assets(for: identifiers).map { ($0.localIdentifier, $0) },
+                   uniquingKeysWith: { first, _ in first })
     }
 
     /// Step 2: checksum assets we have not hashed yet. Returns whether it linked any facets.
@@ -376,7 +388,7 @@ actor SyncEngine {
         guard !identifiers.isEmpty else { return false }
 
         var linked = false
-        let assets = resolver.resolve(identifiers)
+        let assets = freshAssets(identifiers)
         for identifier in identifiers {
             try Task.checkCancellation()
             guard let asset = assets[identifier] else {
@@ -384,12 +396,15 @@ actor SyncEngine {
                 continue
             }
             do {
+                // Read before the bytes, so an edit landing during the read is newer than this.
+                let modifiedAt = asset.modificationDate
                 let checksum = try await exporter.checksum(asset: asset)
                 try await writer.write { db in
                     try db.execute(sql: """
-                        UPDATE backup_state SET checksum_hex = ?, updated_at = ?
+                        UPDATE backup_state SET checksum_hex = ?, modified_at = ?, updated_at = ?
                         WHERE local_identifier = ?
-                        """, arguments: [checksum, Date().timeIntervalSince1970, identifier])
+                        """, arguments: [checksum, modifiedAt?.timeIntervalSince1970,
+                                         Date().timeIntervalSince1970, identifier])
                     // Link the facets: a server asset with this checksum is the same photo (D5).
                     try db.execute(sql: """
                         INSERT INTO facet_links (checksum_hex, local_identifier, immich_id)
@@ -485,7 +500,7 @@ actor SyncEngine {
         guard !pending.isEmpty else { return 0 }
 
         var queued = 0
-        let assets = resolver.resolve(pending)
+        let assets = freshAssets(pending)
         for identifier in pending where !live.contains(identifier) {
             try Task.checkCancellation()
             // Stop the round rather than fail the rest of it one by one; `kick` reports the wait.
@@ -571,7 +586,8 @@ actor SyncEngine {
                         return
                     }
                 }
-                try await mark(identifier, state: .uploaded, error: nil, checksum: ticket.checksumHex)
+                try await mark(identifier, state: .uploaded, error: nil, checksum: ticket.checksumHex,
+                               modifiedAt: ticket.modifiedBeforeExport)
                 let writer = try database.writer()
                 if let remoteID = response?.id {
                     try await writer.write { db in
@@ -717,7 +733,13 @@ actor SyncEngine {
         do {
             try await remoteLibrary.enqueueLocalReconcile(localIdentifier: identifier, immichID: immichID,
                                                           mediaKind: AssetStub(current).kind)
-            queuedEditDuringUpload = true
+            hasQueuedEdits = true
+            // So the library scan does not queue the same edit again.
+            let writer = try database.writer()
+            try await writer.write { db in
+                try db.execute(sql: "UPDATE backup_state SET modified_at = ? WHERE local_identifier = ?",
+                               arguments: [modified.timeIntervalSince1970, identifier])
+            }
         } catch {
             Log.sync.error("Couldn't queue a server update: \(error.localizedDescription, privacy: .public)")
         }
@@ -728,13 +750,19 @@ actor SyncEngine {
     private func mark(_ identifier: String,
                       state: BackupStateRecord.State,
                       error: String?,
-                      checksum: String? = nil) async throws {
+                      checksum: String? = nil,
+                      modifiedAt: Date? = nil) async throws {
         let writer = try database.writer()
         try await writer.write { db in
             switch state {
             case .uploaded:
                 try db.execute(sql: "UPDATE backup_state SET next_attempt_at = 0, retry_count = 0 WHERE local_identifier = ?",
                                arguments: [identifier])
+                // When the bytes the server now holds were read.
+                if let modifiedAt {
+                    try db.execute(sql: "UPDATE backup_state SET modified_at = ? WHERE local_identifier = ?",
+                                   arguments: [modifiedAt.timeIntervalSince1970, identifier])
+                }
             case .pending:
                 try db.execute(sql: "UPDATE backup_state SET next_attempt_at = 0 WHERE local_identifier = ?",
                                arguments: [identifier])
