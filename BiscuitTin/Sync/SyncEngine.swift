@@ -437,13 +437,18 @@ actor SyncEngine {
         for result in response.results where result.action == "reject" {
             guard result.reason == "duplicate" else { continue }
 
-            // Immich reports assets in its trash as duplicates too. Treating one as backed up
-            // would mark the local copy safe while its only server copy waits to be purged —
-            // and would then make it a candidate for Free Up Space (D18). Leave it pending so
-            // it uploads again.
+            // Immich reports assets in its trash as duplicates too, and a copy waiting to be
+            // purged is not a backup (it would also make the local copy a Free Up Space
+            // candidate, D18). This device still has the photo and backup is on, so the server
+            // copy is taken out of the trash. If that fails the photo stays pending.
             if result.isTrashed == true {
-                Log.sync.info("Duplicate \(result.id, privacy: .public) is trashed on the server; re-uploading")
-                continue
+                guard let assetID = result.assetId else { continue }   // the upload settles it
+                do {
+                    try await remoteLibrary.restoreFromTrash(ids: [assetID], client: client)
+                } catch {
+                    Log.sync.info("Couldn't restore trashed duplicate \(result.id, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                    continue
+                }
             }
 
             try await mark(result.id, state: .uploaded, error: nil)
@@ -554,10 +559,21 @@ actor SyncEngine {
         switch outcome.result {
         case let .success(response):
             do {
-                // "duplicate" is success too: the server already had these bytes.
+                // "duplicate" is success too: the server already had these bytes, but possibly
+                // in its trash, which is no backup.
+                if let response, Self.needsTrashCheck(response) {
+                    do {
+                        try await remoteLibrary.ensureLive(immichID: response.id, client: try makeClient())
+                    } catch {
+                        Log.sync.info("Couldn't check \(ticket.filename, privacy: .public)'s server copy: \(error.localizedDescription, privacy: .public)")
+                        try? await mark(identifier, state: .pending, error: nil)
+                        await finishRecording(refill: false)
+                        return
+                    }
+                }
                 try await mark(identifier, state: .uploaded, error: nil, checksum: ticket.checksumHex)
+                let writer = try database.writer()
                 if let remoteID = response?.id {
-                    let writer = try database.writer()
                     try await writer.write { db in
                         try db.execute(sql: """
                             INSERT INTO facet_links (checksum_hex, local_identifier, immich_id)
@@ -570,6 +586,14 @@ actor SyncEngine {
                     noteLinksChanged()
                     await queueReconcileIfEdited(identifier: identifier, immichID: remoteID,
                                                  since: ticket.modifiedBeforeExport)
+                } else {
+                    // No body to name the server asset; a later sync completes the link by checksum.
+                    try await writer.write { db in
+                        try db.execute(sql: """
+                            INSERT INTO facet_links (checksum_hex, local_identifier, immich_id) VALUES (?, ?, NULL)
+                            ON CONFLICT(checksum_hex) DO UPDATE SET local_identifier = excluded.local_identifier
+                            """, arguments: [ticket.checksumHex, identifier])
+                    }
                 }
                 serverPause.reset()
                 serverPausedUntil = nil
@@ -593,6 +617,11 @@ actor SyncEngine {
             }
         }
 
+        await finishRecording(refill: refill)
+    }
+
+    /// The common end of `record`, however the upload ended.
+    private func finishRecording(refill: Bool) async {
         uploadsInFlight = max(0, uploadsInFlight - 1)
         updateRateTicker()
         // Refill the queue, without waiting: on a background relaunch the uploader holds the
@@ -604,6 +633,16 @@ actor SyncEngine {
             await status.setPhase(networkWait ?? .idle)
         }
         await publishStatus(uploading: false)
+    }
+
+    /// Whether an upload the server accepted needs its asset checked for being in the trash.
+    static func needsTrashCheck(_ response: Immich.UploadResponse?) -> Bool {
+        response?.status == "duplicate"
+    }
+
+    private func makeClient() throws -> ImmichClient {
+        guard let baseURL = session.baseURL else { throw ImmichError.notConfigured }
+        return ImmichClient(baseURL: baseURL, credentialProvider: { [session] in session.credential })
     }
 
     private static let refillDelay = Duration.seconds(1)
