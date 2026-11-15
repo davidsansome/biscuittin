@@ -369,6 +369,7 @@ actor RemoteLibraryService {
                                arguments: [Cursor.unfinishedReplay])
             }
             try PartnerStore.apply(batch.partners, in: db)
+            var releasedLink = false
             for (id, asset) in batch.upserts {
                 guard asset.visibility == .timeline else {
                     // Matches the old `isVisible: true` search filter (D9): archived, hidden and
@@ -384,6 +385,15 @@ actor RemoteLibraryService {
                 if let exif = batch.exifs[id] { record.apply(exif) }
                 try record.save(db)
 
+                if record.isTrashed {
+                    // A trashed asset still reports the checksum it was uploaded under. Letting it
+                    // claim the link would take a local photo back from the asset that replaced it.
+                    try db.execute(sql: "UPDATE facet_links SET immich_id = NULL WHERE immich_id = ?",
+                                   arguments: [id])
+                    releasedLink = true
+                    continue
+                }
+
                 guard !record.checksumHex.isEmpty else { continue }
                 // Checksum-only link; M6 fills in the local identifier once computed. (v3.1.0
                 // never reports `deviceAssetId`/`deviceId` on this DTO, so the immediate-link
@@ -394,6 +404,9 @@ actor RemoteLibraryService {
                     VALUES (?, NULL, ?)
                     ON CONFLICT(checksum_hex) DO UPDATE SET immich_id = excluded.immich_id
                     """, arguments: [record.checksumHex, id])
+            }
+            if releasedLink {
+                try db.execute(sql: "DELETE FROM facet_links WHERE local_identifier IS NULL AND immich_id IS NULL")
             }
 
             // EXIF lines for assets not touched by an upsert this chunk: merge onto whatever is
