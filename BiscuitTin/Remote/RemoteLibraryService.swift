@@ -33,6 +33,14 @@ struct SyncProgress: Sendable, Equatable {
     }
 }
 
+/// The replacement is stored on the server but the old asset has not been retired. A retry
+/// must finish this replacement, not upload another.
+struct ReplacementIncomplete: Error {
+    let newID: String
+    let newChecksumHex: String
+    let underlying: Error
+}
+
 struct RemoteMergeData {
     /// Every non-trashed remote asset, newest first.
     var stubs: [AssetStub] = []
@@ -81,9 +89,12 @@ actor RemoteLibraryService {
     private let exporter: LocalAssetExporter
     private let registry: RotatorRegistry
 
-    private var isSyncing = false
+    private let clientProvider: (@Sendable () throws -> ImmichClient)?
 
-    private static let maxEditRetries = 5
+    private var isSyncing = false
+    /// The actor is re-entrant across `await`, and launch, foreground and the background task
+    /// each start a drain.
+    private var isRetryingEdits = false
 
     private enum Cursor {
         /// Wall-clock time of the last successful sync, for display only (§13.4) — the sync
@@ -101,8 +112,10 @@ actor RemoteLibraryService {
          exporter: LocalAssetExporter,
          registry: RotatorRegistry = .v1,
          maxLinesPerCommit: Int = 20_000,
-         clientFactory: (@Sendable (URL) -> ImmichClient)? = nil) {
+         clientFactory: (@Sendable (URL) -> ImmichClient)? = nil,
+         clientProvider: (@Sendable () throws -> ImmichClient)? = nil) {
         self.database = database
+        self.clientProvider = clientProvider
         self.maxLinesPerCommit = maxLinesPerCommit
         self.session = session
         self.resolver = resolver
@@ -123,6 +136,8 @@ actor RemoteLibraryService {
     nonisolated var isConfigured: Bool { session.isConfigured }
 
     private func makeClient() throws -> ImmichClient {
+        // Tests cannot produce a Keychain token.
+        if let clientProvider { return try clientProvider() }
         guard let baseURL = session.baseURL, session.credential != nil else {
             throw ImmichError.notConfigured
         }
@@ -591,17 +606,15 @@ actor RemoteLibraryService {
 
     // MARK: - Remote mutations
 
-    /// Rotates the server's copy (M7, D10).
+    /// Rotates the server's copy of an asset that has no local copy (M7, D10), by downloading,
+    /// rotating and re-uploading it. An asset with a local copy is rotated locally and that
+    /// rendition pushed instead (`pushLocalRendition`), so both copies hold the same bytes.
     ///
     /// Immich v3.1.0 has **no endpoint that replaces an existing asset's file** — verified
     /// against a real server: `PUT/POST /api/assets/{id}/original`, `/file` and `/replace` all
     /// return the route-missing response, and there is no server-side edit or rotate route
     /// either. So "rotate the server copy" has to be expressed as upload-the-rotated-file then
     /// trash the old asset.
-    ///
-    /// The replacement is uploaded with the original's `fileCreatedAt`/`fileModifiedAt`, which
-    /// v3.1.0 honours (it echoes them back, including in `localDateTime`). Without that the new
-    /// asset would take "now" as its capture date and jump to the top of the timeline.
     ///
     /// Caveat worth knowing: the rotated copy is a *new* asset id, so server-side album
     /// membership, favourites and ratings for that photo do not carry over.
@@ -619,7 +632,9 @@ actor RemoteLibraryService {
         let rotated = try await rotator.rotateRemoteOriginal(fileURL: downloaded, clockwise: clockwise)
         defer { try? FileManager.default.removeItem(at: rotated) }
 
-        try await replaceRemoteFile(oldID: immichID, fileURL: rotated, filename: filename, record: record)
+        try await replaceRemoteFile(oldID: immichID, fileURL: rotated, exportedFilename: filename,
+                                    record: record, localIdentifier: nil, localModifiedAt: nil,
+                                    width: nil, height: nil)
     }
 
     /// The cached row for `immichID`, or the server's own description of the asset when there
@@ -636,66 +651,140 @@ actor RemoteLibraryService {
 
     /// Uploads `fileURL` as `oldID`'s replacement, retires the original, and repoints local
     /// state to the new id. Shared by `rotateRemote` (rotate the remote's own download) and
-    /// `reconcileFromLocalFacet` (push a local edit's current rendition) — both end the same
-    /// way: a new asset id replacing an old one, verified safe to retire only once the
-    /// replacement is stored.
-    private func replaceRemoteFile(oldID: String, fileURL: URL, filename: String,
-                                   record: RemoteAssetRecord,
-                                   width: Int? = nil, height: Int? = nil,
-                                   checksumHex: String? = nil) async throws {
+    /// `pushLocalRendition` (push a local photo's current rendition).
+    ///
+    /// The replacement is uploaded with the original's true capture instant, which v3.1.0
+    /// honours. Without that the new asset would take "now" as its capture date and jump to
+    /// the top of the timeline.
+    ///
+    /// `localIdentifier` is set when `fileURL` is that local photo's current rendition.
+    func replaceRemoteFile(oldID: String, fileURL: URL, exportedFilename: String,
+                           record: RemoteAssetRecord, localIdentifier: String?,
+                           localModifiedAt: Date?, width: Int?, height: Int?) async throws {
         let client = try makeClient()
-        let captured = Date(timeIntervalSince1970: record.captureAt)
-        let newID = try await client.uploadReplacement(fileURL: fileURL,
-                                                       filename: filename,
-                                                       deviceID: session.deviceID,
-                                                       fileCreatedAt: captured,
-                                                       fileModifiedAt: captured)
-
-        // The multipart timestamps only stick when the file carries no date of its own, which
-        // is true of a rotated JPEG but not a remuxed video. Set it explicitly so a rotated
-        // video keeps its place in the timeline instead of resurfacing as if shot just now.
-        try await client.updateCaptureDate(id: newID, to: captured)
-
-        // Only trash the original once the replacement is safely stored.
-        try await client.deleteAssets(ids: [oldID])
-
-        try await repointAfterRotation(oldID: oldID, newID: newID, record: record,
-                                       width: width, height: height, checksumHex: checksumHex)
+        let old = try await client.assetInfo(id: oldID)
+        let capture = ReplacementPlan.captureTime(fileCreatedAt: old.fileCreatedAt,
+                                                  localDateTime: old.localDateTime,
+                                                  fallback: Date(timeIntervalSince1970: record.captureAt))
+        let name = ReplacementPlan.filename(serverName: old.originalFileName ?? record.fileName,
+                                            exportedName: exportedFilename)
+        let upload = try await client.uploadReplacement(fileURL: fileURL,
+                                                        filename: name,
+                                                        deviceID: session.deviceID,
+                                                        fileCreatedAt: capture.instant,
+                                                        fileModifiedAt: capture.instant)
+        do {
+            try await finishReplacement(oldID: oldID, newID: upload.id,
+                                        newChecksumHex: upload.checksumHex,
+                                        isDuplicate: upload.isDuplicate, capture: capture,
+                                        record: record, localIdentifier: localIdentifier,
+                                        localModifiedAt: localModifiedAt, width: width, height: height)
+        } catch {
+            // Cancellation included: the upload did happen.
+            throw ReplacementIncomplete(newID: upload.id, newChecksumHex: upload.checksumHex,
+                                        underlying: error)
+        }
     }
 
-    /// Swaps the rotated asset in for the old one locally, so the grid updates without waiting
+    /// Everything after the upload. Also what a retry calls when a pending edit remembers an
+    /// upload whose replacement never finished.
+    func finishReplacement(oldID: String, newID: String, newChecksumHex: String,
+                           isDuplicate: Bool, capture: (instant: Date, offsetSeconds: Int),
+                           record: RemoteAssetRecord, localIdentifier: String?,
+                           localModifiedAt: Date?, width: Int?, height: Int?) async throws {
+        // `newID == oldID`: the server already holds these bytes as this very asset.
+        if newID != oldID {
+            let client = try makeClient()
+            if isDuplicate {
+                // The server may hold these bytes in its trash, which is no home for the photo.
+                try await ensureLive(immichID: newID, client: client)
+            }
+            // The multipart timestamps only stick when the file carries no date of its own,
+            // which is true of a rotated JPEG but not a remuxed video, and a duplicate keeps
+            // whatever date it already had.
+            try await client.updateCaptureDate(id: newID, to: capture.instant,
+                                               offsetSeconds: capture.offsetSeconds)
+            // Only trash the original once the replacement is safely stored.
+            try await client.deleteAssets(ids: [oldID])
+        }
+        try await repointAfterReplacement(oldID: oldID, newID: newID, newChecksumHex: newChecksumHex,
+                                          record: record, localIdentifier: localIdentifier,
+                                          localModifiedAt: localModifiedAt, width: width, height: height)
+    }
+
+    /// Swaps the replacement in for the old asset locally, so the grid updates without waiting
     /// for the next metadata sync.
     ///
-    /// `width`/`height` let a caller supply the *authoritative* new dimensions — needed by D22's
-    /// state-based reconciliation, where the local rendition may reflect any number of composed
-    /// edits, not necessarily one quarter turn. Omitting them keeps `rotateRemote`'s existing
-    /// swap-on-a-quarter-turn behaviour, which is exactly right for that single-turn call site.
-    private func repointAfterRotation(oldID: String,
-                                      newID: String,
-                                      record: RemoteAssetRecord,
-                                      width: Int? = nil,
-                                      height: Int? = nil,
-                                      checksumHex: String? = nil) async throws {
+    /// The link is re-keyed to the new bytes' checksum: a full sync replay drops any link whose
+    /// checksum does not match its server row. `width`/`height` are the authoritative new
+    /// dimensions when known; omitting them swaps the old ones, right for one quarter turn.
+    private func repointAfterReplacement(oldID: String, newID: String, newChecksumHex: String,
+                                         record: RemoteAssetRecord, localIdentifier: String?,
+                                         localModifiedAt: Date?, width: Int?, height: Int?) async throws {
         let writer = try database.writer()
         try await writer.write { db in
-            var rotated = record
-            rotated.immichID = newID
-            // Known when the uploaded bytes were hashed here, and lets a repeated reconcile of
-            // the same rendition see that there is nothing left to push.
-            if let checksumHex { rotated.checksumHex = checksumHex }
-            // The checksum changed and the next sync will replace this row with the server's
-            // authoritative copy anyway — this is an optimistic bridge until then.
-            rotated.width = width ?? record.height
-            rotated.height = height ?? record.width
-            rotated.updatedAt = Date().timeIntervalSince1970
-            try rotated.save(db)
+            let linkedLocal = try localIdentifier ?? String.fetchOne(db, sql: """
+                SELECT local_identifier FROM facet_links
+                WHERE immich_id = ? AND local_identifier IS NOT NULL LIMIT 1
+                """, arguments: [oldID])
 
-            try db.execute(sql: "DELETE FROM remote_assets WHERE immich_id = ?", arguments: [oldID])
-            try db.execute(sql: "UPDATE facet_links SET immich_id = ? WHERE immich_id = ?",
-                           arguments: [newID, oldID])
+            var replaced = record
+            replaced.immichID = newID
+            replaced.checksumHex = newChecksumHex
+            // The next sync replaces this row with the server's own; this bridges until then.
+            replaced.width = width ?? record.height
+            replaced.height = height ?? record.width
+            replaced.isTrashed = false
+            replaced.updatedAt = Date().timeIntervalSince1970
+            try replaced.save(db)
+            if newID != oldID {
+                try db.execute(sql: "DELETE FROM remote_assets WHERE immich_id = ?", arguments: [oldID])
+            }
+
+            try db.execute(sql: "UPDATE facet_links SET immich_id = NULL WHERE immich_id IN (?, ?)",
+                           arguments: [oldID, newID])
+            if let linkedLocal {
+                try db.execute(sql: "DELETE FROM facet_links WHERE local_identifier = ?",
+                               arguments: [linkedLocal])
+            }
+            try db.execute(sql: """
+                INSERT INTO facet_links (checksum_hex, local_identifier, immich_id) VALUES (?, ?, ?)
+                ON CONFLICT(checksum_hex) DO UPDATE SET
+                    local_identifier = excluded.local_identifier, immich_id = excluded.immich_id
+                """, arguments: [newChecksumHex, linkedLocal, newID])
+            try db.execute(sql: "DELETE FROM facet_links WHERE local_identifier IS NULL AND immich_id IS NULL")
+
+            // Only when the bytes pushed are the local photo's own: otherwise backup_state
+            // would claim a checksum the local photo does not have.
+            if let localIdentifier {
+                try db.execute(sql: """
+                    UPDATE backup_state
+                    SET checksum_hex = ?, state = 'uploaded', modified_at = ?,
+                        retry_count = 0, next_attempt_at = 0, last_error = NULL
+                    WHERE local_identifier = ?
+                    """, arguments: [newChecksumHex, localModifiedAt?.timeIntervalSince1970, localIdentifier])
+            }
         }
         // Every rotation and pending-edit retry ends here.
         changesContinuation.yield(.assets([oldID, newID]))
+    }
+
+    /// Takes the asset out of the server's trash if it is in it.
+    func ensureLive(immichID: String, client: ImmichClient) async throws {
+        guard try await client.assetInfo(id: immichID).isTrashed == true else { return }
+        try await restoreFromTrash(ids: [immichID], client: client)
+    }
+
+    func restoreFromTrash(ids: [String], client: ImmichClient) async throws {
+        guard !ids.isEmpty else { return }
+        try await client.restoreAssets(ids: ids)
+        let writer = try database.writer()
+        try await writer.write { db in
+            let placeholders = databaseQuestionMarks(count: ids.count)
+            try db.execute(sql: "UPDATE remote_assets SET is_trashed = 0 WHERE immich_id IN (\(placeholders))",
+                           arguments: StatementArguments(ids))
+        }
+        changesContinuation.yield(.assets(Set(ids)))
     }
 
     private func writeSwappedDimensions(immichID: String) async throws {
@@ -788,19 +877,25 @@ actor RemoteLibraryService {
     // hold a reference here, so nothing new needed registering with the OS to get a retry
     // window (BGTaskScheduler identifiers are a scarce, crash-prone resource — see AGENTS.md).
 
-    /// Queues a rotation to retry, called after `rotateRemote` fails regardless of whether the
+    /// Queues a rotation to retry, called after the server leg fails regardless of whether the
     /// local facet's own rotation succeeded. Re-enqueuing an asset that already has a pending
     /// edit just resets its retry clock — the partial unique indexes on `pending_edits` make
     /// that an update, not a duplicate row.
+    ///
+    /// `uploadedID`/`uploadedChecksum` name a replacement that reached the server but whose
+    /// old asset was not retired; the retry finishes it before anything else.
     func enqueuePendingRotation(localIdentifier: String?,
                                 immichID: String,
                                 mediaKind: MediaKind,
-                                clockwise: Bool) async throws {
+                                clockwise: Bool,
+                                uploadedID: String? = nil,
+                                uploadedChecksum: String? = nil) async throws {
         // Only a remote-only edit needs to remember the operation — a local-backed one is
         // state-based and re-reads PhotoKit fresh at retry time (see PendingEditRecord).
         let payload = localIdentifier == nil ? RotationPayload(clockwise: clockwise).jsonString : nil
         try await upsertPendingEdit(localIdentifier: localIdentifier, immichID: immichID,
-                                    editType: .rotation, mediaKind: mediaKind, payload: payload)
+                                    editType: .rotation, mediaKind: mediaKind, payload: payload,
+                                    uploadedID: uploadedID, uploadedChecksum: uploadedChecksum)
     }
 
     /// Queues a push of the local rendition for an asset whose upload finished after it was
@@ -814,7 +909,9 @@ actor RemoteLibraryService {
                                    immichID: String,
                                    editType: PendingEditRecord.EditType,
                                    mediaKind: MediaKind,
-                                   payload: String?) async throws {
+                                   payload: String?,
+                                   uploadedID: String? = nil,
+                                   uploadedChecksum: String? = nil) async throws {
         let writer = try database.writer()
         let now = Date().timeIntervalSince1970
         try await writer.write { db in
@@ -836,23 +933,36 @@ actor RemoteLibraryService {
                 row.retryCount = 0
                 row.lastError = nil
                 row.updatedAt = now
+                row.nextAttemptAt = 0
+                // An unfinished replacement already on record must not be forgotten because a
+                // later attempt failed before uploading anything.
+                if let uploadedID {
+                    row.uploadedID = uploadedID
+                    row.uploadedChecksum = uploadedChecksum
+                }
                 try row.update(db)
             } else {
                 try PendingEditRecord(localIdentifier: localIdentifier, immichID: immichID,
                                       editType: editType, mediaKind: mediaKind, payload: payload,
-                                      updatedAt: now).insert(db)
+                                      updatedAt: now, uploadedID: uploadedID,
+                                      uploadedChecksum: uploadedChecksum).insert(db)
             }
         }
     }
 
     /// Drains the queue, one edit at a time. Safe to call often — each edit either reconciles
-    /// and clears, or fails and is left for the next call; there is no partial state to corrupt
-    /// (D22, matching `SyncEngine`'s bounded-retry pattern for uploads).
+    /// and clears, or fails and waits (D22). A failure that is not the edit's fault (no
+    /// network, server down, signed out) stops the drain without counting against anything.
     func retryPendingEdits() async {
+        guard !isRetryingEdits else { return }
+        isRetryingEdits = true
+        defer { isRetryingEdits = false }
+
         guard let writer = try? database.writer() else { return }
+        let now = Date().timeIntervalSince1970
         let edits = (try? await writer.read { db in
             try PendingEditRecord
-                .filter(sql: "retry_count < ?", arguments: [Self.maxEditRetries])
+                .filter(sql: "next_attempt_at <= ?", arguments: [now])
                 .fetchAll(db)
         }) ?? []
         guard !edits.isEmpty else { return }
@@ -862,11 +972,20 @@ actor RemoteLibraryService {
                 try Task.checkCancellation()
                 try await reconcile(edit)
                 try await clearPendingEdit(id: edit.id)
-            } catch is CancellationError {
-                return
             } catch {
-                Log.immich.error("Pending edit retry failed: \(error.localizedDescription, privacy: .public)")
-                try? await bumpPendingEditFailure(id: edit.id, error: error.localizedDescription)
+                var underlying = error
+                if let incomplete = error as? ReplacementIncomplete {
+                    try? await recordUploadedReplacement(id: edit.id, newID: incomplete.newID,
+                                                         checksumHex: incomplete.newChecksumHex)
+                    underlying = incomplete.underlying
+                }
+                switch RetryPolicy.kind(of: underlying) {
+                case .transient, .authentication:
+                    return
+                case .item:
+                    Log.immich.error("Pending edit retry failed: \(underlying.localizedDescription, privacy: .public)")
+                    try? await bumpPendingEditFailure(id: edit.id, error: underlying.localizedDescription)
+                }
             }
         }
     }
@@ -879,8 +998,25 @@ actor RemoteLibraryService {
     }
 
     private func reconcileRotation(_ edit: PendingEditRecord) async throws {
+        if let newID = edit.uploadedID, let checksum = edit.uploadedChecksum {
+            let client = try makeClient()
+            let record = try await remoteRecord(for: edit.immichID, client: client)
+            let old = try await client.assetInfo(id: edit.immichID)
+            let capture = ReplacementPlan.captureTime(fileCreatedAt: old.fileCreatedAt,
+                                                      localDateTime: old.localDateTime,
+                                                      fallback: Date(timeIntervalSince1970: record.captureAt))
+            // No local identifier: these bytes may no longer be the local photo's, so
+            // backup_state is left for the push below to settle.
+            try await finishReplacement(oldID: edit.immichID, newID: newID, newChecksumHex: checksum,
+                                        isDuplicate: true, capture: capture, record: record,
+                                        localIdentifier: nil, localModifiedAt: nil,
+                                        width: nil, height: nil)
+            try await clearUploadedReplacement(id: edit.id)
+            guard edit.localIdentifier != nil else { return }   // the remote-only rotation is complete
+        }
+
         if let localIdentifier = edit.localIdentifier {
-            try await reconcileFromLocalFacet(localIdentifier: localIdentifier)
+            try await pushLocalRendition(localIdentifier: localIdentifier)
         } else {
             guard let payloadString = edit.payload, let payload = RotationPayload(jsonString: payloadString) else {
                 throw RotationError.assetUnavailable
@@ -892,17 +1028,18 @@ actor RemoteLibraryService {
         }
     }
 
-    /// State-based reconciliation: pushes whatever PhotoKit currently has, rather than replaying
-    /// whichever rotation(s) were attempted while offline. However many edits landed locally,
-    /// in whatever order, the current rendition already *is* the answer — there is no baseline
-    /// to drift from, because nothing is remembered; it is re-read fresh every time this runs.
+    /// State-based reconciliation: replaces the server copy with whatever PhotoKit currently
+    /// has, rather than replaying whichever rotation(s) were attempted. However many edits
+    /// landed locally, in whatever order, the current rendition already *is* the answer.
     ///
     /// This always overwrites a concurrent remote-side change — a deliberate, last-writer-wins
-    /// choice, not an attempt at conflict resolution. It matches D10's existing posture: an
-    /// online rotation already produces a new asset id and drops server-side album membership
-    /// in favour of staying simple.
-    private func reconcileFromLocalFacet(localIdentifier: String) async throws {
-        guard let phAsset = resolver.resolve(localIdentifier) else {
+    /// choice, not an attempt at conflict resolution. It matches D10's existing posture: a
+    /// rotation already produces a new asset id and drops server-side album membership in
+    /// favour of staying simple.
+    func pushLocalRendition(localIdentifier: String) async throws {
+        // Fetched fresh: the resolver's cached object can predate the edit.
+        resolver.invalidate([localIdentifier])
+        guard let phAsset = PHAsset.fetchAssets(withLocalIdentifiers: [localIdentifier], options: nil).firstObject else {
             return   // Local asset is gone; nothing left to push. Not an error — just moot.
         }
         guard let immichID = try immichID(forLocalIdentifier: localIdentifier) else {
@@ -910,17 +1047,29 @@ actor RemoteLibraryService {
         }
         let record = try await remoteRecord(for: immichID, client: try makeClient())
 
+        // Read before the bytes, so an edit landing during the read is newer than what is stored.
+        let modifiedAt = phAsset.modificationDate
+        let sha = try await exporter.checksum(asset: phAsset)
+        guard sha != record.checksumHex else {
+            // Already in step. PhotoKit moves the modification date for changes that leave the
+            // bytes alone; replacing anyway would cost a new asset id for nothing.
+            let writer = try database.writer()
+            try await writer.write { db in
+                try db.execute(sql: "UPDATE backup_state SET checksum_hex = ?, modified_at = ? WHERE local_identifier = ?",
+                               arguments: [sha, modifiedAt?.timeIntervalSince1970, localIdentifier])
+            }
+            return
+        }
+
         let export = try await exporter.export(asset: phAsset)
         defer { try? FileManager.default.removeItem(at: export.fileURL) }
+        // The photo changed between the two reads; the retry will see the settled state.
+        guard export.sha1Hex == sha else { throw RotationError.assetUnavailable }
 
-        // Already in step. An edit queued by `SyncEngine` after an upload is a guess from a
-        // moved modification date, which PhotoKit also moves for changes that leave the bytes
-        // alone; replacing anyway would cost a new asset id for nothing.
-        guard export.sha1Hex != record.checksumHex else { return }
-
-        try await replaceRemoteFile(oldID: immichID, fileURL: export.fileURL, filename: export.filename,
-                                    record: record, width: phAsset.pixelWidth, height: phAsset.pixelHeight,
-                                    checksumHex: export.sha1Hex)
+        try await replaceRemoteFile(oldID: immichID, fileURL: export.fileURL,
+                                    exportedFilename: export.filename, record: record,
+                                    localIdentifier: localIdentifier, localModifiedAt: modifiedAt,
+                                    width: phAsset.pixelWidth, height: phAsset.pixelHeight)
     }
 
     private func clearPendingEdit(id: Int64?) async throws {
@@ -931,14 +1080,35 @@ actor RemoteLibraryService {
         }
     }
 
-    private func bumpPendingEditFailure(id: Int64?, error: String) async throws {
+    private func recordUploadedReplacement(id: Int64?, newID: String, checksumHex: String) async throws {
         guard let id else { return }
         let writer = try database.writer()
         try await writer.write { db in
+            try db.execute(sql: "UPDATE pending_edits SET uploaded_id = ?, uploaded_checksum = ? WHERE id = ?",
+                           arguments: [newID, checksumHex, id])
+        }
+    }
+
+    private func clearUploadedReplacement(id: Int64?) async throws {
+        guard let id else { return }
+        let writer = try database.writer()
+        try await writer.write { db in
+            try db.execute(sql: "UPDATE pending_edits SET uploaded_id = NULL, uploaded_checksum = NULL WHERE id = ?",
+                           arguments: [id])
+        }
+    }
+
+    private func bumpPendingEditFailure(id: Int64?, error: String) async throws {
+        guard let id else { return }
+        let writer = try database.writer()
+        let now = Date().timeIntervalSince1970
+        try await writer.write { db in
+            let failures = (try Int.fetchOne(db, sql: "SELECT retry_count FROM pending_edits WHERE id = ?",
+                                             arguments: [id]) ?? 0) + 1
             try db.execute(sql: """
-                UPDATE pending_edits SET retry_count = retry_count + 1, last_error = ?, updated_at = ?
+                UPDATE pending_edits SET retry_count = ?, last_error = ?, updated_at = ?, next_attempt_at = ?
                 WHERE id = ?
-                """, arguments: [error, Date().timeIntervalSince1970, id])
+                """, arguments: [failures, error, now, now + RetryPolicy.delay(afterFailures: failures), id])
         }
     }
 

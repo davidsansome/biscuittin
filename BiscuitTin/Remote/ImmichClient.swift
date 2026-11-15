@@ -1,6 +1,13 @@
 import Foundation
 import CryptoKit
 
+struct ReplacementUpload: Sendable, Equatable {
+    let id: String
+    /// The server already held these bytes, under `id`.
+    let isDuplicate: Bool
+    let checksumHex: String
+}
+
 /// Typed HTTP client for the Immich API (DESIGN.md §7.1).
 ///
 /// Deliberately storage-free: it holds no cache, no database and no credentials of its own —
@@ -227,7 +234,7 @@ actor ImmichClient {
         return (request, bodyURL)
     }
 
-    /// Uploads a rotated replacement for an existing asset and returns its new id.
+    /// Uploads a replacement for an existing asset.
     ///
     /// There is no replace-in-place endpoint in v3.1.0 (see `RemoteLibraryService.rotateRemote`),
     /// so this is an ordinary upload that deliberately carries the *original's* timestamps —
@@ -237,7 +244,7 @@ actor ImmichClient {
                            filename: String,
                            deviceID: String,
                            fileCreatedAt: Date,
-                           fileModifiedAt: Date) async throws -> String {
+                           fileModifiedAt: Date) async throws -> ReplacementUpload {
         let checksum = try Self.sha1Hex(ofFileAt: fileURL)
 
         var request = try makeRequest(path: "/api/assets", method: "POST",
@@ -269,7 +276,8 @@ actor ImmichClient {
         switch http.statusCode {
         case 200..<300:
             let decoded = try JSONDecoder().decode(Immich.UploadResponse.self, from: data)
-            return decoded.id
+            return ReplacementUpload(id: decoded.id, isDuplicate: decoded.status == "duplicate",
+                                     checksumHex: checksum)
         case 401, 403:
             throw ImmichError.unauthorized
         default:
@@ -283,11 +291,26 @@ actor ImmichClient {
     /// the file carries no date of its own. A rotated JPEG keeps its EXIF and so survives, but a
     /// remuxed video does not, and Immich re-derives the date — landing the replacement at
     /// "now" and jumping it to the top of the timeline. Setting it explicitly covers every kind.
-    func updateCaptureDate(id: String, to date: Date) async throws {
+    ///
+    /// `offsetSeconds` is the asset's offset from UTC: Immich derives the local time and zone
+    /// from the offset in `dateTimeOriginal`.
+    func updateCaptureDate(id: String, to date: Date, offsetSeconds: Int) async throws {
         struct Update: Encodable { let dateTimeOriginal: String }
+        let value = Immich.iso8601String(from: date, offsetSeconds: offsetSeconds)
         var request = try makeRequest(path: "/api/assets/\(id)",
                                       method: "PUT",
-                                      body: Update(dateTimeOriginal: Immich.iso8601String(from: date)),
+                                      body: Update(dateTimeOriginal: value),
+                                      timeout: Self.metadataTimeout)
+        await applyCredential(to: &request)
+        _ = try await dataForRequest(request)
+    }
+
+    /// Takes assets back out of the server's trash.
+    func restoreAssets(ids: [String]) async throws {
+        guard !ids.isEmpty else { return }
+        var request = try makeRequest(path: "/api/trash/restore/assets",
+                                      method: "POST",
+                                      body: Immich.RestoreRequest(ids: ids),
                                       timeout: Self.metadataTimeout)
         await applyCredential(to: &request)
         _ = try await dataForRequest(request)

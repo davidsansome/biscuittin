@@ -442,6 +442,10 @@ enum Immich {
         let force: Bool
     }
 
+    struct RestoreRequest: Encodable {
+        let ids: [String]
+    }
+
     struct BulkUploadCheckItem: Encodable {
         let id: String
         let checksum: String
@@ -532,6 +536,15 @@ enum Immich {
 
     static func iso8601String(from date: Date) -> String {
         iso8601WithFraction.string(from: date)
+    }
+
+    /// ISO 8601 with a numeric offset, e.g. "2026-08-18T10:00:00.000+11:00". Immich derives
+    /// an asset's local time and zone from the offset, so sending "Z" would discard them.
+    static func iso8601String(from date: Date, offsetSeconds: Int) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        formatter.timeZone = TimeZone(secondsFromGMT: offsetSeconds) ?? TimeZone(secondsFromGMT: 0)!
+        return formatter.string(from: date)
     }
 }
 

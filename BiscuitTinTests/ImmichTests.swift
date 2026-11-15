@@ -636,31 +636,44 @@ actor RequestRecorder {
     private(set) var lastBody: Data?
     /// Every request body in order, keyed by path.
     private(set) var bodies: [(path: String, body: Data?)] = []
+    /// Every request in order, with its method.
+    private(set) var requests: [(method: String, path: String, body: Data?)] = []
     private var stubs: [String: (Int, Data)] = [:]
     private var queued: [String: [(Int, Data)]] = [:]
 
-    func stub(path: String, json: String, status: Int = 200) {
-        stubs[path] = (status, Data(json.utf8))
+    /// With `method`, answers only that method on `path`, ahead of a stub without one.
+    func stub(method: String? = nil, path: String, json: String, status: Int = 200) {
+        stubs[Self.key(method, path)] = (status, Data(json.utf8))
     }
 
     /// Served once each, in order, before falling back to `stub(path:)`.
-    func enqueue(path: String, json: String, status: Int = 200) {
-        queued[path, default: []].append((status, Data(json.utf8)))
+    func enqueue(method: String? = nil, path: String, json: String, status: Int = 200) {
+        queued[Self.key(method, path), default: []].append((status, Data(json.utf8)))
     }
 
     func record(_ request: URLRequest, body: Data?) {
         lastRequest = request
         lastBody = body
         bodies.append((request.url?.path ?? "", body))
+        requests.append((request.httpMethod ?? "GET", request.url?.path ?? "", body))
     }
 
-    func response(for path: String) -> (Int, Data) {
-        if var pending = queued[path], !pending.isEmpty {
-            let next = pending.removeFirst()
-            queued[path] = pending
-            return next
+    /// "METHOD path" for each request, in order.
+    var log: [String] { requests.map { "\($0.method) \($0.path)" } }
+
+    func response(method: String? = nil, for path: String) -> (Int, Data) {
+        for key in [Self.key(method, path), path] {
+            if var pending = queued[key], !pending.isEmpty {
+                let next = pending.removeFirst()
+                queued[key] = pending
+                return next
+            }
         }
-        return stubs[path] ?? (404, Data("{}".utf8))
+        return stubs[Self.key(method, path)] ?? stubs[path] ?? (404, Data("{}".utf8))
+    }
+
+    private static func key(_ method: String?, _ path: String) -> String {
+        method.map { "\($0) \(path)" } ?? path
     }
 }
 
@@ -700,7 +713,7 @@ final class StubURLProtocol: URLProtocol {
 
         Task {
             await recorder?.record(self.request, body: body)
-            let (status, data) = await recorder?.response(for: path) ?? (404, Data())
+            let (status, data) = await recorder?.response(method: self.request.httpMethod, for: path) ?? (404, Data())
             let response = HTTPURLResponse(url: self.request.url!,
                                            statusCode: status,
                                            httpVersion: "HTTP/1.1",

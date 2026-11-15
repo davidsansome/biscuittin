@@ -33,7 +33,7 @@ final class ReplacedAssetLinkTests: XCTestCase {
     }
 
     func testTrashedOriginalDoesNotTakeTheLinkBackFromItsReplacement() async throws {
-        // As `repointAfterRotation` leaves things: the local photo's link, still keyed by the
+        // As the old repoint after a rotation left things: the local photo's link, still keyed by the
         // checksum it was uploaded under, now names the replacement.
         try await database.writer().write { db in
             var record = RemoteAssetRecord(placeholderID: "new")

@@ -1,0 +1,38 @@
+import Foundation
+
+/// How failed uploads and pending edits are retried (DESIGN.md §12, D22). Nothing is abandoned:
+/// a failure that is the item's fault waits longer each time, and one that is not (no network,
+/// a server that is down, an expired sign-in) does not count against the item at all.
+enum RetryPolicy {
+    enum FailureKind { case transient, authentication, item }
+
+    private static let firstDelay: TimeInterval = 60
+    private static let maxDelay: TimeInterval = 6 * 60 * 60
+
+    /// 1 failure: 60 s, doubling per failure, capped at 6 hours. 0 failures: 0.
+    static func delay(afterFailures failures: Int) -> TimeInterval {
+        guard failures > 0 else { return 0 }
+        // 2^9 minutes already exceeds the cap; stopping there keeps the shift from overflowing.
+        let doublings = min(failures - 1, 9)
+        return min(firstDelay * Double(1 << doublings), maxDelay)
+    }
+
+    static func kind(of error: Error) -> FailureKind {
+        if error is CancellationError { return .transient }
+        if let urlError = error as? URLError, urlError.code == .cancelled { return .transient }
+        if NetworkMonitor.isConnectivityError(error) { return .transient }
+        if let immich = error as? ImmichError {
+            switch immich {
+            case .unreachable:
+                return .transient
+            case .unauthorized, .notConfigured:
+                return .authentication
+            case .http(let status) where status == 408 || status == 429 || status >= 500:
+                return .transient
+            default:
+                return .item
+            }
+        }
+        return .item
+    }
+}

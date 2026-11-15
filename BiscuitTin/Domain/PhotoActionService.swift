@@ -177,18 +177,22 @@ actor PhotoActionService {
 
     /// Rotates every facet the asset has (D10).
     ///
-    /// The local edit runs first because it is the one the user sees immediately. If the server
-    /// copy then fails, the local rotation still stands and the failure is reported — reporting
+    /// The local edit runs first because it is the one the user sees immediately. When it
+    /// succeeds, the server copy is replaced with the local rendition, so both hold the same
+    /// bytes and stay linked by checksum; only an asset with no local copy has its server
+    /// original downloaded and rotated (`rotateRemote`). If the server copy then fails, the local rotation still stands and the failure is reported — reporting
     /// a partial success is more honest than rolling back a correct local edit. The remote leg
     /// is also queued for a background retry (D22), so the failure is not the end of the story —
     /// just because it always throws to report the toast.
     private func rotateOne(asset: Asset, rotator: any AssetRotator, clockwise: Bool) async throws {
         var rotatedSomething = false
+        var rotatedLocally = false
 
         if let localIdentifier = asset.localIdentifier,
            let phAsset = resolver.resolve(localIdentifier) {
             try await editor.applyRotation(asset: phAsset, clockwise: clockwise, rotator: rotator)
             rotatedSomething = true
+            rotatedLocally = true
         }
 
         // Looked up again *after* the local edit: a photo whose upload has just finished is
@@ -202,19 +206,28 @@ actor PhotoActionService {
 
         if let immichID, let remoteLibrary {
             do {
-                try await remoteLibrary.rotateRemote(immichID: immichID,
-                                                     clockwise: clockwise,
-                                                     rotator: rotator)
+                if rotatedLocally, let localIdentifier = asset.localIdentifier {
+                    try await remoteLibrary.pushLocalRendition(localIdentifier: localIdentifier)
+                } else {
+                    try await remoteLibrary.rotateRemote(immichID: immichID,
+                                                         clockwise: clockwise,
+                                                         rotator: rotator)
+                }
                 rotatedSomething = true
             } catch {
-                try? await remoteLibrary.enqueuePendingRotation(localIdentifier: asset.localIdentifier,
-                                                                immichID: immichID,
-                                                                mediaKind: asset.stub.kind,
-                                                                clockwise: clockwise)
-                if rotatedSomething {
-                    throw PartialRotationError.serverCopyNotRotated(underlying: error)
+                let incomplete = error as? ReplacementIncomplete
+                try? await remoteLibrary.enqueuePendingRotation(
+                    localIdentifier: rotatedLocally ? asset.localIdentifier : nil,
+                    immichID: immichID,
+                    mediaKind: asset.stub.kind,
+                    clockwise: clockwise,
+                    uploadedID: incomplete?.newID,
+                    uploadedChecksum: incomplete?.newChecksumHex)
+                let underlying = incomplete?.underlying ?? error
+                if rotatedLocally {
+                    throw PartialRotationError.serverCopyNotRotated(underlying: underlying)
                 }
-                throw error
+                throw underlying
             }
         }
 
