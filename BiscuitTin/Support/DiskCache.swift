@@ -54,11 +54,6 @@ final class DiskCache: @unchecked Sendable {
         }
     }
 
-    /// Total bytes on disk, for the settings screen's cache row.
-    func currentSize() -> Int {
-        contents().reduce(0) { $0 + $1.size }
-    }
-
     // MARK: - Internals
 
     /// Runs on `io`. Defers filesystem I/O out of `init` (D19).
