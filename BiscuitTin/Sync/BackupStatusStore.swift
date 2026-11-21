@@ -33,7 +33,8 @@ final class BackupStatusStore: ObservableObject {
     @Published private(set) var lastError: String?
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var uploadBytesPerSecond: Double?
-    /// Outstanding items that have used up their retries; the engine no longer tries them.
+    /// Outstanding items that have failed repeatedly (see `BackupQueue.persistentFailureThreshold`);
+    /// they are still retried with backoff.
     @Published private(set) var failedCount: Int = 0
     /// Items whose last attempt failed but which have retries left, for the next sync run.
     @Published private(set) var retryingCount: Int = 0

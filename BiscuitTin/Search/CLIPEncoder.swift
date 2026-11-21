@@ -38,7 +38,8 @@ final class CLIPEncoder: @unchecked Sendable {
     }
 
     private let bundle: Bundle
-    private let lock = NSLock()
+    private let imageLock = NSLock()
+    private let textLock = NSLock()
     private var imageModel: MLModel?
     private var textModel: MLModel?
 
@@ -59,9 +60,12 @@ final class CLIPEncoder: @unchecked Sendable {
 
     // MARK: - Model lifetime
 
-    private func model(named name: String, cached: inout MLModel?) throws -> MLModel {
+    private func loadModel(named name: String,
+                           lock: NSLock,
+                           read: () -> MLModel?,
+                           write: (MLModel) -> Void) throws -> MLModel {
         lock.lock(); defer { lock.unlock() }
-        if let cached { return cached }
+        if let cached = read() { return cached }
         guard let url = bundle.url(forResource: name, withExtension: "mlmodelc") else {
             throw EncoderError.modelMissing(name)
         }
@@ -70,42 +74,52 @@ final class CLIPEncoder: @unchecked Sendable {
         // none and would otherwise fail rather than fall back.
         configuration.computeUnits = .all
         let loaded = try MLModel(contentsOf: url, configuration: configuration)
-        cached = loaded
+        write(loaded)
         Log.search.info("Loaded \(name, privacy: .public)")
         return loaded
     }
 
     private func imageEncoder() throws -> MLModel {
-        try model(named: "mobileclip_s0_image", cached: &imageModel)
+        try loadModel(named: "mobileclip_s0_image", lock: imageLock,
+                      read: { self.imageModel }, write: { self.imageModel = $0 })
     }
 
     private func textEncoder() throws -> MLModel {
-        try model(named: "mobileclip_s0_text", cached: &textModel)
+        try loadModel(named: "mobileclip_s0_text", lock: textLock,
+                      read: { self.textModel }, write: { self.textModel = $0 })
     }
 
     /// Releases the image encoder's weights. Called when an indexing batch finishes (P8).
     func releaseImageEncoder() {
-        lock.lock(); defer { lock.unlock() }
+        imageLock.lock(); defer { imageLock.unlock() }
         imageModel = nil
     }
 
     /// Releases the text encoder's weights. Called when the search UI closes (P8).
     func releaseTextEncoder() {
-        lock.lock(); defer { lock.unlock() }
+        textLock.lock(); defer { textLock.unlock() }
         textModel = nil
     }
 
     // MARK: - Encoding
 
     func encode(text tokens: [Int32]) throws -> [Float] {
-        let array = try MLMultiArray(shape: [1, NSNumber(value: CLIPTokenizer.contextLength)],
-                                     dataType: .int32)
-        let pointer = array.dataPointer.bindMemory(to: Int32.self, capacity: tokens.count)
-        for (index, token) in tokens.enumerated() { pointer[index] = token }
-
+        let array = try Self.makeTokenArray(from: tokens)
         let input = try MLDictionaryFeatureProvider(
             dictionary: [Contract.textInput: MLFeatureValue(multiArray: array)])
         return try vector(from: try textEncoder().prediction(from: input))
+    }
+
+    static func makeTokenArray(from tokens: [Int32]) throws -> MLMultiArray {
+        let length = CLIPTokenizer.contextLength
+        let array = try MLMultiArray(shape: [1, NSNumber(value: length)], dataType: .int32)
+        let pointer = array.dataPointer.bindMemory(to: Int32.self, capacity: length)
+        let count = min(tokens.count, length)
+        for index in 0..<count { pointer[index] = tokens[index] }
+        if count < length {
+            pointer.advanced(by: count).initialize(repeating: 0, count: length - count)
+        }
+        return array
     }
 
     /// Encodes several images in one `MLBatchProvider` call. The models are fixed batch-1
@@ -124,12 +138,27 @@ final class CLIPEncoder: @unchecked Sendable {
     }
 
     private func vector(from provider: MLFeatureProvider) throws -> [Float] {
-        guard let array = provider.featureValue(for: Contract.output)?.multiArrayValue,
-              array.count == EmbeddingStore.dimensions else {
+        guard let array = provider.featureValue(for: Contract.output)?.multiArrayValue else {
             throw EncoderError.badOutput
         }
-        let pointer = array.dataPointer.bindMemory(to: Float.self, capacity: array.count)
-        return Array(UnsafeBufferPointer(start: pointer, count: array.count))
+        return try Self.extractVector(from: array)
+    }
+
+    static func extractVector(from array: MLMultiArray) throws -> [Float] {
+        guard array.count == EmbeddingStore.dimensions else {
+            throw EncoderError.badOutput
+        }
+        switch array.dataType {
+        case .float32:
+            let pointer = array.dataPointer.bindMemory(to: Float.self, capacity: array.count)
+            return Array(UnsafeBufferPointer(start: pointer, count: array.count))
+        case .float16:
+            let pointer = array.dataPointer.bindMemory(to: UInt16.self, capacity: array.count)
+            let halves = Array(UnsafeBufferPointer(start: pointer, count: array.count))
+            return EmbeddingStore.decodeHalves(halves)
+        default:
+            throw EncoderError.badOutput
+        }
     }
 
     // MARK: - Preprocessing

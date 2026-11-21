@@ -10,7 +10,12 @@ final class NetworkMonitor: @unchecked Sendable {
     private let lock = NSLock()
     private var satisfied = true
     private var expensive = false
+    private var isStarted = false
     private var onChange: (@Sendable () -> Void)?
+
+    deinit {
+        monitor.cancel()
+    }
 
     /// Optimistic until the first path update: being wrong costs one failed request, while
     /// starting pessimistic would hold uploads back on every launch.
@@ -30,7 +35,10 @@ final class NetworkMonitor: @unchecked Sendable {
     func start(onChange: @escaping @Sendable () -> Void) {
         lock.lock()
         self.onChange = onChange
+        let shouldStart = !isStarted
+        isStarted = true
         lock.unlock()
+        guard shouldStart else { return }
 
         monitor.pathUpdateHandler = { [weak self] path in
             guard let self else { return }
@@ -77,6 +85,10 @@ final class TransferRateMeter: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard let startedAt else { return nil }
         samples.removeAll { now - $0.time > Self.window }
+        if samples.isEmpty {
+            self.startedAt = nil
+            return 0
+        }
         let total = samples.reduce(Int64(0)) { $0 + $1.bytes }
         // Divide by the time actually observed while the window is still filling, or the first
         // seconds of every run would read as a fraction of the true rate.

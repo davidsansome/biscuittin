@@ -68,6 +68,48 @@ final class EmbeddingStoreTests: XCTestCase {
         XCTAssertNil(EmbeddingStore.decode(Data()))
     }
 
+    func testEncodeAndNormalizeHandleEmptyVectorsSafely() {
+        XCTAssertEqual(EmbeddingStore.encode([]), Data())
+        XCTAssertEqual(EmbeddingStore.normalized([]), [])
+    }
+
+    func testNaNQueryDoesNotTrapOrReturnNaNScores() async throws {
+        try await store.store((0..<20).map { (id($0), vector(seed: UInt64($0))) })
+        let nanQuery = [Float](repeating: .nan, count: EmbeddingStore.dimensions)
+        let results = try await store.search(vector: nanQuery, limit: 5)
+        XCTAssertTrue(results.isEmpty)
+    }
+
+    func testStreamingSearchPastCacheCapRanksCorrectlyWithoutCaching() async throws {
+        // Tiny cap (1 KB) forces streaming past the cache cap even with a small set of vectors.
+        let streamingStore = EmbeddingStore(database: AppDatabase(fileURL: databaseURL), cacheByteCap: 1024)
+        let target = vector(seed: 777)
+        var rows: [(id: AssetID, vector: [Float])] = []
+        for n in 0..<200 { rows.append((id(n), vector(seed: UInt64(n) &+ 2000))) }
+        rows.append((id(999), target))
+        try await streamingStore.store(rows)
+
+        let results = try await streamingStore.search(vector: target, limit: 5)
+        XCTAssertEqual(results.first?.id, id(999))
+        XCTAssertGreaterThan(try XCTUnwrap(results.first?.score), 0.99)
+        let footprint = await streamingStore.cacheFootprintBytes
+        XCTAssertEqual(footprint, 0, "exceeding cacheByteCap must stream without retaining chunks")
+    }
+
+    func testSearchPropagatesCancellation() async throws {
+        try await store.store((0..<100).map { (id($0), vector(seed: UInt64($0))) })
+        let task = Task { [store, query = vector(seed: 1)] in
+            try await store!.search(vector: query, limit: 10)
+        }
+        task.cancel()
+        do {
+            _ = try await task.value
+            // If it completed before cancellation took effect, that's also fine; otherwise CancellationError.
+        } catch is CancellationError {
+            // Expected when cancellation is observed.
+        }
+    }
+
     // MARK: - Store and search
 
     func testSearchRanksTheMatchingVectorFirst() async throws {

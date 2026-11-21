@@ -73,8 +73,8 @@ final class AppSettings: @unchecked Sendable {
                 defaults.set("all", forKey: Key.syncScope)
                 defaults.removeObject(forKey: Key.syncScopeAnchor)
             case let .newOnly(anchor):
-                defaults.set("new_only", forKey: Key.syncScope)
                 defaults.set(anchor.timeIntervalSince1970, forKey: Key.syncScopeAnchor)
+                defaults.set("new_only", forKey: Key.syncScope)
             }
         }
     }

@@ -9,43 +9,48 @@ final class DiskCache: @unchecked Sendable {
     private let directory: URL
     private let byteLimit: Int
     private let io = DispatchQueue(label: "dev.biscuittin.diskcache", qos: .utility)
+    private var hasCreatedDirectory = false
     private var isTrimScheduled = false
     private let lock = NSLock()
 
     init(name: String, byteLimit: Int = 500 * 1024 * 1024) {
-        let base = (try? FileManager.default.url(for: .cachesDirectory, in: .userDomainMask,
-                                                 appropriateFor: nil, create: true))
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory())
         directory = base.appendingPathComponent("BiscuitTin", isDirectory: true)
             .appendingPathComponent(name, isDirectory: true)
         self.byteLimit = byteLimit
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     }
 
     func data(for key: String) -> Data? {
         let url = fileURL(for: key)
         guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
-        // Touch for LRU ordering; failure here only degrades eviction quality.
-        try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
+        // Touch for LRU ordering off the caller's thread; failure only degrades eviction quality.
+        io.async {
+            try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
+        }
         return data
     }
 
     func store(_ data: Data, for key: String) {
         let url = fileURL(for: key)
         io.async { [weak self] in
+            guard let self else { return }
+            self.ensureDirectoryExists()
             do {
                 try data.write(to: url, options: .atomic)
             } catch {
                 Log.immich.debug("Disk cache write failed: \(error.localizedDescription, privacy: .public)")
             }
-            self?.scheduleTrim()
+            self.scheduleTrim()
         }
     }
 
     func removeAll() {
-        io.async { [directory] in
-            try? FileManager.default.removeItem(at: directory)
-            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        io.async { [weak self] in
+            guard let self else { return }
+            try? FileManager.default.removeItem(at: self.directory)
+            self.hasCreatedDirectory = false
+            self.ensureDirectoryExists()
         }
     }
 
@@ -55,6 +60,13 @@ final class DiskCache: @unchecked Sendable {
     }
 
     // MARK: - Internals
+
+    /// Runs on `io`. Defers filesystem I/O out of `init` (D19).
+    private func ensureDirectoryExists() {
+        guard !hasCreatedDirectory else { return }
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        hasCreatedDirectory = true
+    }
 
     private func fileURL(for key: String) -> URL {
         // Keys contain '/' (asset id + variant), so hash rather than sanitise.
@@ -97,11 +109,12 @@ final class DiskCache: @unchecked Sendable {
 
     private func contents() -> [Entry] {
         let keys: [URLResourceKey] = [.fileSizeKey, .contentModificationDateKey]
+        let keySet = Set(keys)
         guard let urls = try? FileManager.default.contentsOfDirectory(
             at: directory, includingPropertiesForKeys: keys) else { return [] }
 
         return urls.compactMap { url in
-            guard let values = try? url.resourceValues(forKeys: Set(keys)) else { return nil }
+            guard let values = try? url.resourceValues(forKeys: keySet) else { return nil }
             return Entry(url: url,
                          size: values.fileSize ?? 0,
                          accessed: values.contentModificationDate ?? .distantPast)

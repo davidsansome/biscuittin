@@ -18,6 +18,7 @@ final class SearchSessionController {
 
     private let engine: SearchEngine
     private var queryTask: Task<Void, Never>?
+    private var lifecycleTask: Task<Void, Never>?
     private var currentQuery = ""
 
     /// §14 P8. Long enough that ordinary typing does not queue a query per character, short
@@ -32,7 +33,11 @@ final class SearchSessionController {
 
     /// Loads the tokenizer and warms the text encoder so the first keystroke doesn't pay for it.
     func begin() {
-        Task { await engine.prepare() }
+        let previous = lifecycleTask
+        lifecycleTask = Task { [engine] in
+            await previous?.value
+            await engine.prepare()
+        }
     }
 
     /// Releases the tokenizer tables and the text encoder's ~85 MB of weights (P8).
@@ -41,7 +46,11 @@ final class SearchSessionController {
         queryTask = nil
         currentQuery = ""
         onResults?(nil)
-        Task { await engine.teardown() }
+        let previous = lifecycleTask
+        lifecycleTask = Task { [engine] in
+            await previous?.value
+            await engine.teardown()
+        }
     }
 
     func update(query raw: String) {
@@ -73,6 +82,8 @@ final class SearchSessionController {
                 return
             } catch {
                 Log.search.error("Search failed: \(error.localizedDescription, privacy: .public)")
+                guard self.currentQuery == query else { return }
+                self.onResults?(TimelineSnapshot.empty(grouping: .day))
             }
         }
     }
@@ -81,17 +92,9 @@ final class SearchSessionController {
     /// cell, prefetch, selection and viewer paths without a parallel implementation.
     private func snapshot(for results: SearchEngine.Results) -> TimelineSnapshot {
         let stubs = results.ranked.compactMap { stubProvider?($0.id) }
-        guard !stubs.isEmpty else {
-            return TimelineSnapshot(grouping: .day, buckets: [], totalCount: 0, provenance: .live)
-        }
         // A fixed bucket id: a new query replaces the section wholesale rather than diffing
         // against the previous query's ranking, which is meaningless as an animation.
-        let bucket = TimelineSnapshot.Bucket(id: "search-results",
-                                             title: "\(stubs.count) result\(stubs.count == 1 ? "" : "s")",
-                                             items: stubs)
-        return TimelineSnapshot(grouping: .day,
-                                buckets: [bucket],
-                                totalCount: stubs.count,
-                                provenance: .live)
+        let title = "\(stubs.count) result\(stubs.count == 1 ? "" : "s")"
+        return TimelineSnapshot.singleBucket(id: "search-results", title: title, stubs: stubs)
     }
 }

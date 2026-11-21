@@ -3,6 +3,7 @@ import Photos
 import GRDB
 import BackgroundTasks
 import UIKit
+import os
 
 /// What gets backed up (DESIGN.md D17).
 enum SyncScope: Equatable {
@@ -183,7 +184,7 @@ actor SyncEngine {
     func kick() async {
         needsEnumeration = true
         // Called for a reason to try again now: foreground, a network change, Settings.
-        serverPausedUntil = nil
+        clearServerPause()
         await requestRun()
     }
 
@@ -191,6 +192,12 @@ actor SyncEngine {
     func resetFailures() async {
         guard let writer = try? database.writer() else { return }
         try? await writer.write { db in try BackupQueue.resetFailures(db) }
+    }
+
+    private func clearServerPause() {
+        serverPausedUntil = nil
+        serverRetry?.cancel()
+        serverRetry = nil
     }
 
     private func pauseForServer() {
@@ -202,6 +209,7 @@ actor SyncEngine {
                 try? await Task.sleep(for: .seconds(until.timeIntervalSinceNow))
             }
             serverRetry = nil
+            guard !Task.isCancelled else { return }
             await requestRun()
         }
     }
@@ -303,8 +311,7 @@ actor SyncEngine {
             Log.sync.info("Sync paused, network unavailable: \(error.localizedDescription, privacy: .public)")
         } catch {
             Log.sync.error("Sync failed: \(error.localizedDescription, privacy: .public)")
-            await status.setError((error as? LocalizedError)?.errorDescription
-                                  ?? error.localizedDescription)
+            await status.setError(error.userMessage)
         }
         isRunning = false
         await status.setPhase(networkWait ?? (uploadsInFlight > 0 ? .uploading : .idle))
@@ -378,12 +385,18 @@ actor SyncEngine {
     /// Step 2: checksum assets we have not hashed yet. Returns whether it linked any facets.
     private func computeMissingChecksums() async throws -> Bool {
         let writer = try database.writer()
+        let now = Date().timeIntervalSince1970
         let identifiers = try await writer.read { db in
             try String.fetchAll(db, sql: """
                 SELECT local_identifier FROM backup_state
-                WHERE checksum_hex IS NULL AND state = ?
+                WHERE checksum_hex IS NULL
+                  AND (state = ? OR (state = ? AND next_attempt_at <= ?))
+                ORDER BY updated_at ASC
                 LIMIT ?
-                """, arguments: [BackupStateRecord.State.pending.rawValue, Self.checksumBatchSize])
+                """, arguments: [BackupStateRecord.State.pending.rawValue,
+                                 BackupStateRecord.State.failed.rawValue,
+                                 now,
+                                 Self.checksumBatchSize])
         }
         guard !identifiers.isEmpty else { return false }
 
@@ -401,26 +414,24 @@ actor SyncEngine {
                 let checksum = try await exporter.checksum(asset: asset)
                 try await writer.write { db in
                     try db.execute(sql: """
-                        UPDATE backup_state SET checksum_hex = ?, modified_at = ?, updated_at = ?
+                        UPDATE backup_state
+                        SET state = ?, checksum_hex = ?, modified_at = ?, next_attempt_at = 0, updated_at = ?
                         WHERE local_identifier = ?
-                        """, arguments: [checksum, modifiedAt?.timeIntervalSince1970,
+                        """, arguments: [BackupStateRecord.State.pending.rawValue,
+                                         checksum, modifiedAt?.timeIntervalSince1970,
                                          Date().timeIntervalSince1970, identifier])
                     // Link the facets: a server asset with this checksum is the same photo (D5).
-                    try db.execute(sql: """
-                        INSERT INTO facet_links (checksum_hex, local_identifier, immich_id)
-                        VALUES (?, ?, NULL)
-                        ON CONFLICT(checksum_hex) DO UPDATE SET local_identifier = excluded.local_identifier
-                        """, arguments: [checksum, identifier])
+                    try Self.upsertLocalFacetLink(db, checksumHex: checksum, localIdentifier: identifier)
                 }
                 linked = true
             } catch {
                 if Task.isCancelled { throw CancellationError() }
                 if case LocalAssetExporter.ExportError.noResource = error {
                     // Genuinely nothing to upload.
-                    try await mark(identifier, state: .ineligible, error: error.localizedDescription)
+                    try await mark(identifier, state: .ineligible, error: error.userMessage)
                 } else if networkWait == nil, RetryPolicy.kind(of: error) == .item {
                     let cap = RetryPolicy.isPhotoKitError(error) ? BackupQueue.persistentFailureThreshold : nil
-                    try await bumpFailure(identifier, error: error.localizedDescription, ineligibleAfter: cap)
+                    try await bumpFailure(identifier, error: error.userMessage, ineligibleAfter: cap)
                 }
                 // Otherwise the row stays pending, and the next run tries again.
             }
@@ -429,16 +440,17 @@ actor SyncEngine {
     }
 
     /// Step 3: ask the server which checksums it already has. Duplicates are marked uploaded
-    /// without transferring anything. Returns whether it linked any facets.
+    /// without transferring anything; accepted non-duplicates move to `deduped` so `uploadPending`
+    /// never uploads an un-deduped asset. Returns whether it linked any facets.
     private func dedupeAgainstServer() async throws -> Bool {
-        guard let baseURL = session.baseURL else { throw ImmichError.notConfigured }
-        let client = ImmichClient(baseURL: baseURL, credentialProvider: { [session] in session.credential })
+        let client = try makeClient()
 
         let writer = try database.writer()
         let candidates = try await writer.read { db in
             try Row.fetchAll(db, sql: """
                 SELECT local_identifier, checksum_hex FROM backup_state
                 WHERE state = ? AND checksum_hex IS NOT NULL
+                ORDER BY updated_at ASC
                 LIMIT ?
                 """, arguments: [BackupStateRecord.State.pending.rawValue, Self.checksumBatchSize])
         }
@@ -448,35 +460,72 @@ actor SyncEngine {
             Immich.BulkUploadCheckItem(id: $0["local_identifier"], checksum: $0["checksum_hex"])
         }
         let response = try await client.bulkUploadCheck(items)
-        var linked = false
 
-        for result in response.results where result.action == "reject" {
-            guard result.reason == "duplicate" else { continue }
+        var duplicates: [(id: String, assetID: String?)] = []
+        var accepted: [String] = []
+        var rejectedOther: [(id: String, reason: String?)] = []
 
-            // Immich reports assets in its trash as duplicates too, and a copy waiting to be
-            // purged is not a backup (it would also make the local copy a Free Up Space
-            // candidate, D18). This device still has the photo and backup is on, so the server
-            // copy is taken out of the trash. If that fails the photo stays pending.
-            if result.isTrashed == true {
-                guard let assetID = result.assetId else { continue }   // the upload settles it
-                do {
-                    try await remoteLibrary.restoreFromTrash(ids: [assetID], client: client)
-                } catch {
-                    Log.sync.info("Couldn't restore trashed duplicate \(result.id, privacy: .public): \(error.localizedDescription, privacy: .public)")
+        for result in response.results {
+            if result.action == "reject" {
+                guard result.reason == "duplicate" else {
+                    rejectedOther.append((result.id, result.reason))
                     continue
                 }
-            }
 
-            try await mark(result.id, state: .uploaded, error: nil)
-            if let assetID = result.assetId {
-                try await writer.write { db in
+                // Immich reports assets in its trash as duplicates too, and a copy waiting to be
+                // purged is not a backup (it would also make the local copy a Free Up Space
+                // candidate, D18). This device still has the photo and backup is on, so the server
+                // copy is taken out of the trash. If that fails the photo stays pending.
+                if result.isTrashed == true {
+                    guard let assetID = result.assetId else { continue }   // the upload settles it
+                    do {
+                        try await remoteLibrary.restoreFromTrash(ids: [assetID], client: client)
+                    } catch {
+                        Log.sync.info("Couldn't restore trashed duplicate \(result.id, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                        continue
+                    }
+                }
+                duplicates.append((result.id, result.assetId))
+            } else if result.action == "accept" {
+                accepted.append(result.id)
+            }
+        }
+
+        guard !duplicates.isEmpty || !accepted.isEmpty || !rejectedOther.isEmpty else { return false }
+
+        let now = Date().timeIntervalSince1970
+        let linked = try await writer.write { db -> Bool in
+            var didLink = false
+            for entry in duplicates {
+                try db.execute(sql: """
+                    UPDATE backup_state
+                    SET state = ?, last_error = NULL, next_attempt_at = 0, retry_count = 0, updated_at = ?
+                    WHERE local_identifier = ?
+                    """, arguments: [BackupStateRecord.State.uploaded.rawValue, now, entry.id])
+                if let assetID = entry.assetID {
                     try db.execute(sql: """
                         UPDATE facet_links SET immich_id = ?
                         WHERE local_identifier = ?
-                        """, arguments: [assetID, result.id])
+                        """, arguments: [assetID, entry.id])
+                    didLink = true
                 }
-                linked = true
             }
+            for id in accepted {
+                try db.execute(sql: """
+                    UPDATE backup_state
+                    SET state = ?, last_error = NULL, updated_at = ?
+                    WHERE local_identifier = ?
+                    """, arguments: [BackupStateRecord.State.deduped.rawValue, now, id])
+            }
+            for entry in rejectedOther {
+                try db.execute(sql: """
+                    UPDATE backup_state
+                    SET state = ?, last_error = ?, updated_at = ?
+                    WHERE local_identifier = ?
+                    """, arguments: [BackupStateRecord.State.ineligible.rawValue,
+                                     entry.reason ?? "Rejected by server", now, entry.id])
+            }
+            return didLink
         }
         return linked
     }
@@ -484,8 +533,7 @@ actor SyncEngine {
     /// Step 4: hand what is left to the upload daemon, within the queue's bounds. Returns how
     /// many it queued.
     private func uploadPending() async throws -> Int {
-        guard let baseURL = session.baseURL else { throw ImmichError.notConfigured }
-        let client = ImmichClient(baseURL: baseURL, credentialProvider: { [session] in session.credential })
+        let client = try makeClient()
 
         let inFlight = await uploader.inFlightTickets()
         uploadsInFlight = inFlight.count
@@ -560,7 +608,11 @@ actor SyncEngine {
             updateRateTicker()
             return export.byteCount
         } catch {
-            await settleFailure(identifier, error: error)
+            if case LocalAssetExporter.ExportError.noResource = error {
+                try? await mark(identifier, state: .ineligible, error: error.userMessage)
+            } else {
+                await settleFailure(identifier, error: error)
+            }
         }
         return nil
     }
@@ -606,14 +658,12 @@ actor SyncEngine {
                 } else {
                     // No body to name the server asset; a later sync completes the link by checksum.
                     try await writer.write { db in
-                        try db.execute(sql: """
-                            INSERT INTO facet_links (checksum_hex, local_identifier, immich_id) VALUES (?, ?, NULL)
-                            ON CONFLICT(checksum_hex) DO UPDATE SET local_identifier = excluded.local_identifier
-                            """, arguments: [ticket.checksumHex, identifier])
+                        try Self.upsertLocalFacetLink(db, checksumHex: ticket.checksumHex,
+                                                      localIdentifier: identifier)
                     }
                 }
                 serverPause.reset()
-                serverPausedUntil = nil
+                clearServerPause()
                 Log.sync.info("Uploaded \(ticket.filename, privacy: .public) (\(ticket.byteCount) bytes)")
             } catch {
                 // Left `uploading`; the next run returns it to the queue and the server's
@@ -748,41 +798,45 @@ actor SyncEngine {
 
     // MARK: - State helpers
 
+    private static func upsertLocalFacetLink(_ db: Database, checksumHex: String,
+                                             localIdentifier: String) throws {
+        try db.execute(sql: """
+            INSERT INTO facet_links (checksum_hex, local_identifier, immich_id)
+            VALUES (?, ?, NULL)
+            ON CONFLICT(checksum_hex) DO UPDATE SET local_identifier = excluded.local_identifier
+            """, arguments: [checksumHex, localIdentifier])
+    }
+
     private func mark(_ identifier: String,
                       state: BackupStateRecord.State,
                       error: String?,
                       checksum: String? = nil,
                       modifiedAt: Date? = nil) async throws {
         let writer = try database.writer()
+        let now = Date().timeIntervalSince1970
         try await writer.write { db in
+            var clauses = ["state = ?", "last_error = ?", "updated_at = ?"]
+            var arguments: [DatabaseValueConvertible?] = [state.rawValue, error, now]
+            if let checksum {
+                clauses.append("checksum_hex = ?")
+                arguments.append(checksum)
+            }
             switch state {
             case .uploaded:
-                try db.execute(sql: "UPDATE backup_state SET next_attempt_at = 0, retry_count = 0 WHERE local_identifier = ?",
-                               arguments: [identifier])
-                // When the bytes the server now holds were read.
+                clauses.append("next_attempt_at = 0")
+                clauses.append("retry_count = 0")
                 if let modifiedAt {
-                    try db.execute(sql: "UPDATE backup_state SET modified_at = ? WHERE local_identifier = ?",
-                                   arguments: [modifiedAt.timeIntervalSince1970, identifier])
+                    clauses.append("modified_at = ?")
+                    arguments.append(modifiedAt.timeIntervalSince1970)
                 }
             case .pending:
-                try db.execute(sql: "UPDATE backup_state SET next_attempt_at = 0 WHERE local_identifier = ?",
-                               arguments: [identifier])
+                clauses.append("next_attempt_at = 0")
             default:
                 break
             }
-            if let checksum {
-                try db.execute(sql: """
-                    UPDATE backup_state SET state = ?, last_error = ?, checksum_hex = ?, updated_at = ?
-                    WHERE local_identifier = ?
-                    """, arguments: [state.rawValue, error, checksum,
-                                     Date().timeIntervalSince1970, identifier])
-            } else {
-                try db.execute(sql: """
-                    UPDATE backup_state SET state = ?, last_error = ?, updated_at = ?
-                    WHERE local_identifier = ?
-                    """, arguments: [state.rawValue, error,
-                                     Date().timeIntervalSince1970, identifier])
-            }
+            arguments.append(identifier)
+            try db.execute(sql: "UPDATE backup_state SET \(clauses.joined(separator: ", ")) WHERE local_identifier = ?",
+                           arguments: StatementArguments(arguments))
         }
     }
 
@@ -886,23 +940,43 @@ actor SyncEngine {
         // Reuses this same background window for D22's pending-edit retries rather than
         // registering a second BGTaskScheduler identifier for what is, in practice, a much
         // smaller and rarer queue than the upload backlog this task already exists for.
+        let expired = OSAllocatedUnfairLock(initialState: false)
         let work = Task {
             await kick()
-            await remoteLibrary.retryPendingEdits()
+            while currentRun != nil && !Task.isCancelled {
+                await waitForCurrentRun()
+            }
+            if !Task.isCancelled {
+                await remoteLibrary.retryPendingEdits()
+            }
         }
-        task.expirationHandler = { work.cancel() }
+        task.expirationHandler = {
+            expired.withLock { $0 = true }
+            work.cancel()
+        }
         await work.value
-        task.setTaskCompleted(success: true)
+        let didExpire = expired.withLock { $0 }
+        task.setTaskCompleted(success: !didExpire)
     }
 
     /// About 30 seconds: enough to find new photos and queue the first few, which the daemon
     /// then uploads after the app is suspended again.
     func handleRefreshTask(_ task: BGAppRefreshTask) async {
         scheduleBackgroundTask()
-        let work = Task { await kick() }
-        task.expirationHandler = { work.cancel() }
+        let expired = OSAllocatedUnfairLock(initialState: false)
+        let work = Task {
+            await kick()
+            while currentRun != nil && !Task.isCancelled {
+                await waitForCurrentRun()
+            }
+        }
+        task.expirationHandler = {
+            expired.withLock { $0 = true }
+            work.cancel()
+        }
         await work.value
-        task.setTaskCompleted(success: true)
+        let didExpire = expired.withLock { $0 }
+        task.setTaskCompleted(success: !didExpire)
     }
 
     // MARK: - Back Up Now
@@ -944,22 +1018,45 @@ actor SyncEngine {
     /// because the system's progress UI offers to cancel a task whose progress stalls, and one
     /// run can spend minutes hashing before the count moves.
     private func drain(reportingTo task: BGContinuedProcessingTask) async -> Bool {
-        let total = max((try? await outstandingCount()) ?? 0, 1)
+        if localLibrary.hasAnyAccess {
+            do {
+                try await enumerateLibrary()
+                needsEnumeration = false
+            } catch {
+                needsEnumeration = true
+            }
+        } else {
+            needsEnumeration = true
+        }
+
+        var total = max((try? await outstandingCount()) ?? 0, 1)
         task.progress.totalUnitCount = Int64(total)
         var lastRemaining = Int.max
-        needsEnumeration = true
+        var spawnedRun: Task<Void, Never>?
+        defer {
+            spawnedRun?.cancel()
+            if Task.isCancelled { currentRun?.cancel() }
+        }
 
         while !Task.isCancelled {
             if currentRun == nil {
-                Task { await requestRun() }
+                spawnedRun = Task { await requestRun() }
             }
             try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { break }
 
             let remaining = (try? await outstandingCount()) ?? 0
+            if remaining > total {
+                total = remaining
+                task.progress.totalUnitCount = Int64(total)
+            }
             task.progress.completedUnitCount = Int64(min(max(total - remaining, 0), total))
             task.updateTitle(task.title, subtitle: Self.remainingText(remaining))
             if remaining == 0 { return true }
-            if currentRun == nil && uploadsInFlight == 0 && remaining >= lastRemaining { return false }
+            if currentRun == nil && uploadsInFlight == 0 && pendingRefill == nil && !isServerPaused
+                && remaining >= lastRemaining {
+                return false
+            }
             lastRemaining = remaining
         }
         // The user cancelled from the Live Activity. Uploads already in the daemon carry on.

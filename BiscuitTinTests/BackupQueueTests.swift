@@ -19,10 +19,11 @@ final class BackupQueueTests: XCTestCase {
         try super.tearDownWithError()
     }
 
-    private func insert(_ id: String, _ state: BackupStateRecord.State, updatedAt: Double = 0,
-                        retries: Int = 0, nextAttemptAt: Double = 0) throws {
+    private func insert(_ id: String, _ state: BackupStateRecord.State, checksumHex: String? = nil,
+                        updatedAt: Double = 0, retries: Int = 0, nextAttemptAt: Double = 0) throws {
         try database.writer().write { db in
-            try BackupStateRecord(localIdentifier: id, state: state, retryCount: retries,
+            try BackupStateRecord(localIdentifier: id, checksumHex: checksumHex, state: state,
+                                  retryCount: retries,
                                   updatedAt: Date(timeIntervalSince1970: updatedAt),
                                   nextAttemptAt: nextAttemptAt).insert(db)
         }
@@ -37,20 +38,23 @@ final class BackupQueueTests: XCTestCase {
     func testUploadCandidatesAreDueRowsOldestFirst() throws {
         let past = now.timeIntervalSince1970 - 1
         let future = now.timeIntervalSince1970 + 60
-        try insert("P2", .pending, updatedAt: 20)
-        try insert("P1", .pending, updatedAt: 10)
-        try insert("Fdue", .failed, updatedAt: 15, retries: 1, nextAttemptAt: past)
-        try insert("Flater", .failed, updatedAt: 5, retries: 1, nextAttemptAt: future)
-        try insert("U", .uploaded, updatedAt: 1)
+        try insert("PendingUnchecksummed", .pending, updatedAt: 1)
+        try insert("PendingUndeduped", .pending, checksumHex: "h0", updatedAt: 2)
+        try insert("FailedUnchecksummed", .failed, updatedAt: 3, retries: 1, nextAttemptAt: past)
+        try insert("D2", .deduped, checksumHex: "h2", updatedAt: 20)
+        try insert("D1", .deduped, checksumHex: "h1", updatedAt: 10)
+        try insert("Fdue", .failed, checksumHex: "hf1", updatedAt: 15, retries: 1, nextAttemptAt: past)
+        try insert("Flater", .failed, checksumHex: "hf2", updatedAt: 5, retries: 1, nextAttemptAt: future)
+        try insert("U", .uploaded, checksumHex: "hu", updatedAt: 1)
 
         let all = try database.writer().read { db in try BackupQueue.uploadCandidates(db, now: self.now, limit: 10) }
-        XCTAssertEqual(all, ["P1", "Fdue", "P2"])
+        XCTAssertEqual(all, ["D1", "Fdue", "D2"])
         let two = try database.writer().read { db in try BackupQueue.uploadCandidates(db, now: self.now, limit: 2) }
-        XCTAssertEqual(two, ["P1", "Fdue"])
+        XCTAssertEqual(two, ["D1", "Fdue"])
     }
 
     func testNothingIsAbandoned() throws {
-        try insert("F", .failed, retries: 9, nextAttemptAt: now.timeIntervalSince1970 - 1)
+        try insert("F", .failed, checksumHex: "hf", retries: 9, nextAttemptAt: now.timeIntervalSince1970 - 1)
         let candidates = try database.writer().read { db in try BackupQueue.uploadCandidates(db, now: self.now, limit: 10) }
         XCTAssertEqual(candidates, ["F"])
     }
@@ -134,22 +138,24 @@ final class BackupQueueTests: XCTestCase {
 
     func testActionableCountSkipsFailuresNotYetDue() throws {
         try insert("P", .pending)
+        try insert("D", .deduped, checksumHex: "hd")
         try insert("Up", .uploading)
         try insert("Fdue", .failed, nextAttemptAt: now.timeIntervalSince1970)
         try insert("Flater", .failed, nextAttemptAt: now.timeIntervalSince1970 + 60)
         try insert("U", .uploaded)
         let count = try database.writer().read { db in try BackupQueue.actionableCount(db, now: self.now) }
-        XCTAssertEqual(count, 3)
+        XCTAssertEqual(count, 4)
     }
 
     func testCountsSplitPersistentFailuresFromRetrying() throws {
         try insert("P", .pending)
+        try insert("D", .deduped, checksumHex: "hd")
         try insert("F5", .failed, retries: 5)
         try insert("F9", .failed, retries: 9)
         try insert("F1", .failed, retries: 1)
         try insert("U", .uploaded)
         let counts = try database.writer().read { db in try BackupQueue.counts(db) }
-        XCTAssertEqual(counts.remaining, 4)
+        XCTAssertEqual(counts.remaining, 5)
         XCTAssertEqual(counts.failed, 2)
         XCTAssertEqual(counts.retrying, 1)
     }

@@ -51,7 +51,7 @@ final class BackgroundUploader: NSObject, @unchecked Sendable {
     private var responseBodies: [Int: Data] = [:]
     private var handler: (@Sendable (Outcome) async -> Void)?
     private var undelivered: [Outcome] = []
-    private var recording: [UUID: Task<Void, Never>] = [:]
+    private var recording: [UUID: (ticket: Ticket, task: Task<Void, Never>)] = [:]
     private var finishEvents: (() -> Void)?
 
     /// Created on first use rather than at launch: recreating it with the same identifier is
@@ -87,11 +87,30 @@ final class BackgroundUploader: NSObject, @unchecked Sendable {
         task.resume()
     }
 
-    /// Uploads the daemon still owes an outcome for.
+    /// Uploads the daemon still owes an outcome for, plus outcomes whose recording is still in flight.
     func inFlightTickets() async -> [Ticket] {
-        await session.allTasks
+        let sessionTickets = await session.allTasks
             .filter { $0.state != .completed }
             .compactMap(Self.ticket(of:))
+        return Self.mergeTickets(sessionTickets, pendingRecordingTickets())
+    }
+
+    func pendingRecordingTickets() -> [Ticket] {
+        lock.withLock {
+            undelivered.map(\.ticket) + recording.values.map(\.ticket)
+        }
+    }
+
+    private static func mergeTickets(_ primary: [Ticket], _ secondary: [Ticket]) -> [Ticket] {
+        var seen = Set<String>()
+        var merged: [Ticket] = []
+        merged.reserveCapacity(primary.count + secondary.count)
+        for ticket in primary + secondary {
+            if seen.insert(ticket.localIdentifier).inserted {
+                merged.append(ticket)
+            }
+        }
+        return merged
     }
 
     /// Their outcomes arrive as `URLError.cancelled`, which the engine treats as "not this
@@ -124,7 +143,7 @@ final class BackgroundUploader: NSObject, @unchecked Sendable {
         return try? JSONDecoder().decode(Ticket.self, from: Data(description.utf8))
     }
 
-    private func deliver(_ outcome: Outcome) {
+    func deliver(_ outcome: Outcome) {
         lock.lock()
         guard let handler else {
             undelivered.append(outcome)
@@ -132,10 +151,10 @@ final class BackgroundUploader: NSObject, @unchecked Sendable {
             return
         }
         let id = UUID()
-        recording[id] = Task {
+        recording[id] = (outcome.ticket, Task {
             await handler(outcome)
             self.finishedRecording(id)
-        }
+        })
         lock.unlock()
     }
 
@@ -146,7 +165,9 @@ final class BackgroundUploader: NSObject, @unchecked Sendable {
     static func result(response: URLResponse?, body: Data?,
                        error: Error?) -> Result<Immich.UploadResponse?, Error> {
         if let error { return .failure(error) }
-        guard let http = response as? HTTPURLResponse else { return .success(nil) }
+        guard let http = response as? HTTPURLResponse else {
+            return .failure(URLError(.badServerResponse))
+        }
         switch http.statusCode {
         case 200..<300:
             return .success(body.flatMap { try? JSONDecoder().decode(Immich.UploadResponse.self, from: $0) })
@@ -185,7 +206,7 @@ extension BackgroundUploader: URLSessionDataDelegate {
     /// as `finishEvents` runs, so it waits for them to be recorded first.
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
         lock.lock()
-        let pending = Array(recording.values)
+        let pending = recording.values.map(\.task)
         let finish = finishEvents
         finishEvents = nil
         lock.unlock()

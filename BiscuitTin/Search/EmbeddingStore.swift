@@ -28,7 +28,8 @@ actor EmbeddingStore {
     private var cachedChunks: [Chunk] = []
     private var cacheIsComplete = false
     private var cachedBytes = 0
-    private static let cacheByteCap = 32 * 1024 * 1024
+    private let cacheByteCap: Int
+    private static let defaultCacheByteCap = 32 * 1024 * 1024
     private static let chunkSize = 4096
 
     /// Row-major `count × dimensions` fp32, ready for `vDSP`. Ids are parallel to the rows.
@@ -38,8 +39,9 @@ actor EmbeddingStore {
         var count: Int { ids.count }
     }
 
-    init(database: AppDatabase) {
+    init(database: AppDatabase, cacheByteCap: Int = defaultCacheByteCap) {
         self.database = database
+        self.cacheByteCap = cacheByteCap
     }
 
     // MARK: - Writing
@@ -124,74 +126,119 @@ actor EmbeddingStore {
     /// to read.
     func search(vector query: [Float], limit: Int) async throws -> [(id: AssetID, score: Float)] {
         guard query.count == Self.dimensions else { return [] }
-        let chunks = try await loadChunks()
-        guard !chunks.isEmpty else { return [] }
-
         let normalizedQuery = Self.normalized(query)
-        var heap = TopK(limit: limit)
 
-        for chunk in chunks {
-            var scores = [Float](repeating: 0, count: chunk.count)
-            // (count × dim) · (dim × 1) — one matrix-vector product per chunk.
-            normalizedQuery.withUnsafeBufferPointer { q in
-                chunk.values.withUnsafeBufferPointer { m in
-                    vDSP_mmul(m.baseAddress!, 1, q.baseAddress!, 1, &scores, 1,
-                              vDSP_Length(chunk.count), 1, vDSP_Length(Self.dimensions))
-                }
+        if cacheIsComplete {
+            guard !cachedChunks.isEmpty else { return [] }
+            var heap = TopK(limit: limit)
+            var scores = [Float](repeating: 0, count: Self.chunkSize)
+            for chunk in cachedChunks {
+                try Task.checkCancellation()
+                Self.scoreChunk(ids: chunk.ids, values: chunk.values, count: chunk.count,
+                                query: normalizedQuery, scores: &scores, heap: &heap)
             }
-            for (index, score) in scores.enumerated() {
-                heap.offer(id: chunk.ids[index], score: score)
-            }
+            return heap.sorted()
         }
-        return heap.sorted()
-    }
-
-    // MARK: - Chunk loading
-
-    private func loadChunks() async throws -> [Chunk] {
-        if cacheIsComplete { return cachedChunks }
 
         let writer = try database.writer()
         let version = Self.modelVersion
-        let rows: [(String, Data)] = try await writer.read { db in
-            try Row.fetchAll(db, sql: """
-                SELECT asset_id, vector FROM clip_embedding WHERE model_version = ?
-                """, arguments: [version])
-                .map { ($0["asset_id"], $0["vector"]) }
-        }
+        let byteCap = cacheByteCap
+        let (results, chunksToCache, bytesToCache): ([(id: AssetID, score: Float)], [Chunk]?, Int) =
+            try await writer.read { db in
+                let cursor = try Row.fetchCursor(db, sql: """
+                    SELECT asset_id, vector FROM clip_embedding WHERE model_version = ?
+                    """, arguments: [version])
 
-        var chunks = [Chunk]()
-        var ids = [AssetID]()
-        var values = [Float]()
-        values.reserveCapacity(Self.chunkSize * Self.dimensions)
+                let expectedBlobBytes = Self.dimensions * MemoryLayout<UInt16>.size
+                var batchIDs = [AssetID]()
+                batchIDs.reserveCapacity(Self.chunkSize)
+                var batchHalves = [UInt16](repeating: 0, count: Self.chunkSize * Self.dimensions)
+                var batchFloats = [Float](repeating: 0, count: Self.chunkSize * Self.dimensions)
+                var scores = [Float](repeating: 0, count: Self.chunkSize)
+                var batchCount = 0
 
-        func flush() {
-            guard !ids.isEmpty else { return }
-            chunks.append(Chunk(ids: ids, values: values))
-            ids.removeAll(keepingCapacity: true)
-            values.removeAll(keepingCapacity: true)
-        }
+                var heap = TopK(limit: limit)
+                var collectedChunks = [Chunk]()
+                var collectedBytes = 0
+                var canCache = true
 
-        for (raw, blob) in rows {
-            guard let decoded = Self.decode(blob) else { continue }
-            ids.append(AssetID(raw: raw))
-            values.append(contentsOf: decoded)
-            if ids.count == Self.chunkSize { flush() }
-        }
-        flush()
+                func flushBatch() throws {
+                    guard batchCount > 0 else { return }
+                    try Task.checkCancellation()
+                    let elementCount = batchCount * Self.dimensions
+                    Self.convertHalvesToFloats(halves: &batchHalves, floats: &batchFloats,
+                                               count: elementCount)
+                    Self.scoreChunk(ids: batchIDs, values: batchFloats, count: batchCount,
+                                    query: normalizedQuery, scores: &scores, heap: &heap)
+                    if canCache {
+                        let chunkBytes = elementCount * MemoryLayout<Float>.size
+                        if collectedBytes + chunkBytes <= byteCap {
+                            collectedChunks.append(
+                                Chunk(ids: batchIDs, values: Array(batchFloats[0..<elementCount])))
+                            collectedBytes += chunkBytes
+                        } else {
+                            // Past the cap, drop partial chunks immediately and stream the rest.
+                            canCache = false
+                            collectedChunks.removeAll()
+                            collectedBytes = 0
+                        }
+                    }
+                    batchIDs.removeAll(keepingCapacity: true)
+                    batchCount = 0
+                }
 
-        let bytes = chunks.reduce(0) { $0 + $1.values.count * MemoryLayout<Float>.size }
-        if bytes <= Self.cacheByteCap {
-            cachedChunks = chunks
-            cachedBytes = bytes
+                while let row = try cursor.next() {
+                    let blob: Data = row["vector"]
+                    guard blob.count == expectedBlobBytes else { continue }
+                    let rawID: String = row["asset_id"]
+                    let offset = batchCount * Self.dimensions
+                    batchHalves.withUnsafeMutableBufferPointer { dst in
+                        let target = UnsafeMutableRawBufferPointer(
+                            start: dst.baseAddress!.advanced(by: offset),
+                            count: expectedBlobBytes)
+                        _ = blob.copyBytes(to: target)
+                    }
+                    batchIDs.append(AssetID(raw: rawID))
+                    batchCount += 1
+                    if batchCount == Self.chunkSize {
+                        try flushBatch()
+                    }
+                }
+                try flushBatch()
+
+                return (heap.sorted(), canCache ? collectedChunks : nil, collectedBytes)
+            }
+
+        if let chunksToCache {
+            cachedChunks = chunksToCache
+            cachedBytes = bytesToCache
             cacheIsComplete = true
         } else {
-            // Past the cap the store stays authoritative and each query re-reads. Caching a
-            // partial set would rank the cached assets against a stale view of the rest.
             invalidateCache()
         }
-        return chunks
+        return results
     }
+
+    private static func scoreChunk(ids: [AssetID],
+                                   values: [Float],
+                                   count: Int,
+                                   query: [Float],
+                                   scores: inout [Float],
+                                   heap: inout TopK) {
+        if scores.count < count { scores = [Float](repeating: 0, count: count) }
+        // (count × dim) · (dim × 1) — one matrix-vector product per chunk.
+        query.withUnsafeBufferPointer { q in
+            values.withUnsafeBufferPointer { m in
+                vDSP_mmul(m.baseAddress!, 1, q.baseAddress!, 1, &scores, 1,
+                          vDSP_Length(count), 1, vDSP_Length(dimensions))
+            }
+        }
+        for index in 0..<count {
+            heap.offer(id: ids[index], score: scores[index])
+        }
+    }
+
+    // MARK: - Cache management
 
     private func invalidateCache() {
         cachedChunks = []
@@ -206,22 +253,45 @@ actor EmbeddingStore {
 
     // MARK: - fp16 encoding
 
+    private static func makeBuffer<T>(_ pointer: UnsafeMutableBufferPointer<T>, count: Int) -> vImage_Buffer {
+        vImage_Buffer(data: pointer.baseAddress!,
+                      height: 1,
+                      width: vImagePixelCount(count),
+                      rowBytes: count * MemoryLayout<T>.size)
+    }
+
+    private static func convertHalvesToFloats(halves: inout [UInt16], floats: inout [Float], count: Int) {
+        guard count > 0 else { return }
+        halves.withUnsafeMutableBufferPointer { src in
+            floats.withUnsafeMutableBufferPointer { dst in
+                var sourceBuffer = makeBuffer(src, count: count)
+                var destBuffer = makeBuffer(dst, count: count)
+                vImageConvert_Planar16FtoPlanarF(&sourceBuffer, &destBuffer, 0)
+            }
+        }
+    }
+
     static func encode(_ vector: [Float]) -> Data {
+        guard !vector.isEmpty else { return Data() }
         let unit = normalized(vector)
         var halves = [UInt16](repeating: 0, count: unit.count)
         var source = unit
         source.withUnsafeMutableBufferPointer { src in
             halves.withUnsafeMutableBufferPointer { dst in
-                var sourceBuffer = vImage_Buffer(data: src.baseAddress!, height: 1,
-                                                 width: vImagePixelCount(src.count),
-                                                 rowBytes: src.count * MemoryLayout<Float>.size)
-                var destBuffer = vImage_Buffer(data: dst.baseAddress!, height: 1,
-                                               width: vImagePixelCount(dst.count),
-                                               rowBytes: dst.count * MemoryLayout<UInt16>.size)
+                var sourceBuffer = makeBuffer(src, count: src.count)
+                var destBuffer = makeBuffer(dst, count: dst.count)
                 vImageConvert_PlanarFtoPlanar16F(&sourceBuffer, &destBuffer, 0)
             }
         }
         return halves.withUnsafeBufferPointer { Data(buffer: $0) }
+    }
+
+    static func decodeHalves(_ halves: [UInt16]) -> [Float] {
+        guard !halves.isEmpty else { return [] }
+        var source = halves
+        var floats = [Float](repeating: 0, count: halves.count)
+        convertHalvesToFloats(halves: &source, floats: &floats, count: halves.count)
+        return floats
     }
 
     static func decode(_ data: Data) -> [Float]? {
@@ -230,25 +300,13 @@ actor EmbeddingStore {
 
         var halves = [UInt16](repeating: 0, count: dimensions)
         _ = halves.withUnsafeMutableBytes { data.copyBytes(to: $0) }
-
-        var floats = [Float](repeating: 0, count: dimensions)
-        halves.withUnsafeMutableBufferPointer { src in
-            floats.withUnsafeMutableBufferPointer { dst in
-                var sourceBuffer = vImage_Buffer(data: src.baseAddress!, height: 1,
-                                                 width: vImagePixelCount(src.count),
-                                                 rowBytes: src.count * MemoryLayout<UInt16>.size)
-                var destBuffer = vImage_Buffer(data: dst.baseAddress!, height: 1,
-                                               width: vImagePixelCount(dst.count),
-                                               rowBytes: dst.count * MemoryLayout<Float>.size)
-                vImageConvert_Planar16FtoPlanarF(&sourceBuffer, &destBuffer, 0)
-            }
-        }
-        return floats
+        return decodeHalves(halves)
     }
 
     /// Unit-normalises so that a later dot product is exactly the cosine similarity. Applied at
     /// write time, so the scan never pays for it.
     static func normalized(_ vector: [Float]) -> [Float] {
+        guard !vector.isEmpty else { return [] }
         var sumSquares: Float = 0
         vDSP_svesq(vector, 1, &sumSquares, vDSP_Length(vector.count))
         let norm = sqrt(sumSquares)
@@ -273,6 +331,7 @@ private struct TopK {
     }
 
     mutating func offer(id: AssetID, score: Float) {
+        guard !score.isNaN else { return }
         guard entries.count < limit || score > threshold else { return }
         entries.append((id, score))
         // Amortised: compact only once the buffer has grown to twice the limit, so the common

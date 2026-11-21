@@ -55,6 +55,54 @@ final class BackgroundUploaderTests: XCTestCase {
         }
     }
 
+    func testMissingHTTPResponseIsTreatedAsFailure() {
+        let nilResponse = BackgroundUploader.result(response: nil, body: nil, error: nil)
+        XCTAssertThrowsError(try nilResponse.get()) { error in
+            XCTAssertEqual((error as? URLError)?.code, .badServerResponse)
+        }
+        let nonHTTP = BackgroundUploader.result(
+            response: URLResponse(url: url, mimeType: nil, expectedContentLength: 0, textEncodingName: nil),
+            body: nil,
+            error: nil)
+        XCTAssertThrowsError(try nonHTTP.get()) { error in
+            XCTAssertEqual((error as? URLError)?.code, .badServerResponse)
+        }
+    }
+
+    func testPendingRecordingTicketsStayInFlightUntilHandlerCompletes() async {
+        let uploader = BackgroundUploader()
+        let ticket = BackgroundUploader.Ticket(localIdentifier: "L-inflight",
+                                               checksumHex: "deadbeef",
+                                               filename: "IMG.JPG",
+                                               byteCount: 123,
+                                               bodyFilename: "body.multipart",
+                                               modifiedBeforeExport: nil)
+        let outcome = BackgroundUploader.Outcome(ticket: ticket, result: .success(nil))
+
+        // Before a handler is registered, undelivered outcomes count as pending.
+        uploader.deliver(outcome)
+        XCTAssertEqual(uploader.pendingRecordingTickets(), [ticket])
+
+        let entered = expectation(description: "handler entered")
+        let gate = AsyncStream.makeStream(of: Void.self)
+        uploader.setHandler { _ in
+            entered.fulfill()
+            for await _ in gate.stream { break }
+        }
+        await fulfillment(of: [entered], timeout: 2)
+
+        // While the handler is still running, the ticket remains in-flight.
+        XCTAssertEqual(uploader.pendingRecordingTickets(), [ticket])
+
+        // Release the handler and wait for recording to clear.
+        gate.continuation.yield(())
+        gate.continuation.finish()
+        for _ in 0..<50 where !uploader.pendingRecordingTickets().isEmpty {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(uploader.pendingRecordingTickets().isEmpty)
+    }
+
     func testMultipartBodyIsWrittenWhereAsked() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("multipart-\(UUID().uuidString)", isDirectory: true)

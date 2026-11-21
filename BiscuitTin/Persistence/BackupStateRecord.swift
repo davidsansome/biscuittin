@@ -7,6 +7,8 @@ struct BackupStateRecord: Codable, FetchableRecord, PersistableRecord, Equatable
 
     enum State: String, Codable {
         case pending
+        /// Checksummed and accepted by the server's duplicate check, ready to upload.
+        case deduped
         case uploading
         case uploaded
         case failed
@@ -61,6 +63,6 @@ struct BackupStateRecord: Codable, FetchableRecord, PersistableRecord, Equatable
     /// Assets in these states still owe the server an upload, and so count toward the
     /// "not backed up" badge (requirement 14).
     static let outstandingStates: [String] = [
-        State.pending.rawValue, State.uploading.rawValue, State.failed.rawValue
+        State.pending.rawValue, State.deduped.rawValue, State.uploading.rawValue, State.failed.rawValue
     ]
 }

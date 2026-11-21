@@ -95,7 +95,7 @@ actor SearchIndexer {
 
         for batchStart in stride(from: 0, to: pending.count, by: Self.batchSize) {
             try Task.checkCancellation()
-            await waitWhilePaused()
+            try await waitWhilePaused()
 
             let batch = pending[batchStart..<min(batchStart + Self.batchSize, pending.count)]
             var images = [CGImage]()
@@ -129,9 +129,9 @@ actor SearchIndexer {
             """)
     }
 
-    private func waitWhilePaused() async {
+    private func waitWhilePaused() async throws {
         while isPaused {
-            try? await Task.sleep(nanoseconds: 100_000_000)
+            try await Task.sleep(nanoseconds: 100_000_000)
         }
     }
 
@@ -139,7 +139,7 @@ actor SearchIndexer {
 
     private func sourceImage(for stub: AssetStub) async -> CGImage? {
         if let localIdentifier = stub.id.localIdentifier, stub.hasLocal {
-            return localImage(localIdentifier: localIdentifier)
+            return await localImage(localIdentifier: localIdentifier)
         }
         guard let immichID = stub.id.immichID else { return nil }
 
@@ -155,27 +155,95 @@ actor SearchIndexer {
         .gridThumb(pointSize: CGSize(width: Self.sourceSide, height: Self.sourceSide), scale: 1)
     }
 
-    /// Synchronous by design: this runs on the actor's background executor, and the batch loop
-    /// wants images in hand before it calls CoreML. `isSynchronous` is only unsafe on the main
-    /// thread, which this never is.
-    private func localImage(localIdentifier: String) -> CGImage? {
+    /// Async PhotoKit request so the cooperative thread pool is never blocked by disk decode.
+    private func localImage(localIdentifier: String) async -> CGImage? {
         guard let asset = resolver.resolve(localIdentifier) else { return nil }
 
         let options = PHImageRequestOptions()
-        options.isSynchronous = true
+        options.isSynchronous = false
         options.deliveryMode = .highQualityFormat
         options.resizeMode = .exact
         // iCloud originals are not worth a download here; the asset is retried on a later pass
         // once the user has viewed it and PhotoKit holds a local rendition.
         options.isNetworkAccessAllowed = false
 
-        var result: CGImage?
-        imageManager.requestImage(for: asset,
-                                  targetSize: CGSize(width: Self.sourceSide, height: Self.sourceSide),
-                                  contentMode: .aspectFill,
-                                  options: options) { image, _ in
-            result = image?.cgImage
+        let manager = imageManager
+        let targetSize = CGSize(width: Self.sourceSide, height: Self.sourceSide)
+        let box = ImageRequestBox(manager: manager)
+
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                box.start(continuation: continuation) {
+                    manager.requestImage(for: asset,
+                                         targetSize: targetSize,
+                                         contentMode: .aspectFill,
+                                         options: options) { image, info in
+                        let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+                        if isDegraded { return }
+                        box.complete(with: image?.cgImage)
+                    }
+                }
+            }
+        } onCancel: {
+            box.cancel()
         }
-        return result
+    }
+}
+
+/// Ensures `PHImageManager.requestImage` resumes its continuation exactly once, even when
+/// PhotoKit delivers synchronously or a task cancels mid-flight.
+private final class ImageRequestBox: @unchecked Sendable {
+    private let manager: PHImageManager
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<CGImage?, Never>?
+    private var requestID: PHImageRequestID = PHInvalidImageRequestID
+    private var cancelled = false
+
+    init(manager: PHImageManager) {
+        self.manager = manager
+    }
+
+    func start(continuation: CheckedContinuation<CGImage?, Never>,
+               launch: () -> PHImageRequestID) {
+        lock.lock()
+        if cancelled {
+            lock.unlock()
+            continuation.resume(returning: nil)
+            return
+        }
+        self.continuation = continuation
+        lock.unlock()
+
+        let id = launch()
+
+        lock.lock()
+        self.requestID = id
+        let shouldCancel = cancelled && id != PHInvalidImageRequestID
+        lock.unlock()
+
+        if shouldCancel {
+            manager.cancelImageRequest(id)
+        }
+    }
+
+    func complete(with image: CGImage?) {
+        lock.lock()
+        let cont = continuation
+        continuation = nil
+        lock.unlock()
+        cont?.resume(returning: image)
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let id = requestID
+        let cont = continuation
+        continuation = nil
+        lock.unlock()
+        if id != PHInvalidImageRequestID {
+            manager.cancelImageRequest(id)
+        }
+        cont?.resume(returning: nil)
     }
 }

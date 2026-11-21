@@ -3,7 +3,7 @@ import OSLog
 
 /// Logging categories used across the app (DESIGN.md §15).
 enum Log {
-    private static let subsystem = "dev.biscuittin.app"
+    static let subsystem = "dev.biscuittin.app"
 
     static let timeline = Logger(subsystem: subsystem, category: "timeline")
     static let immich = Logger(subsystem: subsystem, category: "immich")
@@ -30,6 +30,7 @@ enum Log {
         case "immich": immich.error("\(text, privacy: .public)")
         case "timeline": timeline.error("\(text, privacy: .public)")
         case "search": search.error("\(text, privacy: .public)")
+        case "perf": perf.error("\(text, privacy: .public)")
         default: ui.error("\(text, privacy: .public)")
         }
         #if DEBUG

@@ -8,26 +8,28 @@ enum BackupQueue {
     static let persistentFailureThreshold = 5
 
     private static let pending = BackupStateRecord.State.pending.rawValue
+    private static let deduped = BackupStateRecord.State.deduped.rawValue
     private static let uploading = BackupStateRecord.State.uploading.rawValue
     private static let failed = BackupStateRecord.State.failed.rawValue
     private static let ineligible = BackupStateRecord.State.ineligible.rawValue
 
-    /// Pending rows, and failed rows whose wait is over, oldest first.
+    /// Deduped rows, and checksummed failed rows whose wait is over, oldest first.
+    /// Rows still in `pending` (un-checksummed or un-deduped) are never selected for upload.
     static func uploadCandidates(_ db: Database, now: Date, limit: Int) throws -> [String] {
         try String.fetchAll(db, sql: """
             SELECT local_identifier FROM backup_state
-            WHERE state = ? OR (state = ? AND next_attempt_at <= ?)
+            WHERE state = ? OR (state = ? AND checksum_hex IS NOT NULL AND next_attempt_at <= ?)
             ORDER BY updated_at ASC
             LIMIT ?
-            """, arguments: [pending, failed, now.timeIntervalSince1970, limit])
+            """, arguments: [deduped, failed, now.timeIntervalSince1970, limit])
     }
 
-    /// What a run can still act on now: pending, uploading, and failed rows that are due.
+    /// What a run can still act on now: pending, deduped, uploading, and failed rows that are due.
     static func actionableCount(_ db: Database, now: Date) throws -> Int {
         try Int.fetchOne(db, sql: """
             SELECT COUNT(*) FROM backup_state
-            WHERE state IN (?, ?) OR (state = ? AND next_attempt_at <= ?)
-            """, arguments: [pending, uploading, failed, now.timeIntervalSince1970]) ?? 0
+            WHERE state IN (?, ?, ?) OR (state = ? AND next_attempt_at <= ?)
+            """, arguments: [pending, deduped, uploading, failed, now.timeIntervalSince1970]) ?? 0
     }
 
     static func recordFailure(_ db: Database, identifier: String, error: String, now: Date,
@@ -61,8 +63,9 @@ enum BackupQueue {
     }
 
     static func counts(_ db: Database) throws -> (remaining: Int, failed: Int, retrying: Int) {
+        let placeholders = databaseQuestionMarks(count: BackupStateRecord.outstandingStates.count)
         let remaining = try Int.fetchOne(db, sql: """
-            SELECT COUNT(*) FROM backup_state WHERE state IN (?, ?, ?)
+            SELECT COUNT(*) FROM backup_state WHERE state IN (\(placeholders))
             """, arguments: StatementArguments(BackupStateRecord.outstandingStates)) ?? 0
         let failedTotal = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM backup_state WHERE state = ?",
                                            arguments: [failed]) ?? 0

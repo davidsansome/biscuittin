@@ -109,7 +109,7 @@ final class SyncScopeTests: XCTestCase {
         // Uploaded and ineligible are settled; out_of_scope was deliberately excluded, so none
         // of them should make the grid show a pending count.
         let outstanding = Set(BackupStateRecord.outstandingStates)
-        XCTAssertEqual(outstanding, ["pending", "uploading", "failed"])
+        XCTAssertEqual(outstanding, ["pending", "deduped", "uploading", "failed"])
         XCTAssertFalse(outstanding.contains(BackupStateRecord.State.uploaded.rawValue))
         XCTAssertFalse(outstanding.contains(BackupStateRecord.State.outOfScope.rawValue))
         XCTAssertFalse(outstanding.contains(BackupStateRecord.State.ineligible.rawValue))
@@ -224,6 +224,9 @@ final class SyncScopeTests: XCTestCase {
         XCTAssertEqual(meter.bytesPerSecond(at: 102)!, 1_000, accuracy: 0.001)
         // Once samples leave the window, a stalled upload reads as zero, not as its old rate.
         XCTAssertEqual(meter.bytesPerSecond(at: 110)!, 0, accuracy: 0.001)
+        // A later upload session resets its window start rather than dividing by the full 3s window.
+        meter.record(bytes: 1_000, at: 200)
+        XCTAssertEqual(meter.bytesPerSecond(at: 200.5)!, 2_000, accuracy: 0.001)
     }
 
     @MainActor

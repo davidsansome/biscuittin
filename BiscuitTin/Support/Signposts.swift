@@ -3,12 +3,8 @@ import OSLog
 /// Named signpost intervals from the performance contract (DESIGN.md §14 P7).
 /// The names are part of the contract so Instruments runs stay comparable.
 enum Signposts {
-    static let log = OSLog(subsystem: "dev.biscuittin.app", category: .pointsOfInterest)
+    static let log = OSLog(subsystem: Log.subsystem, category: .pointsOfInterest)
 
-    static let launchToFirstFrame: StaticString = "launch-to-first-frame"
-    static let snapshotApply: StaticString = "snapshot-apply"
-    static let photoVisibleLatency: StaticString = "photo-visible-latency"
-    static let tapToTransition: StaticString = "tap-to-transition"
     static let indexBuild: StaticString = "index-build"
     static let bootCacheLoad: StaticString = "boot-cache-load"
 

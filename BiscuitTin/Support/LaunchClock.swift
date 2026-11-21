@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Measures true cold-launch time for the §14 P1 budget (first grid frame < 300 ms).
 ///
@@ -31,13 +32,18 @@ enum LaunchClock {
                                   ms, itemCount, provenance))
     }
 
-    private static var hasReportedContent = false
+    private static let hasReportedContent = OSAllocatedUnfairLock(initialState: false)
 
     /// The measurement P1 actually cares about: photos visible, not merely a view on screen.
     /// Reported once, on the first snapshot that carries any items.
     static func reportFirstContent(itemCount: Int, provenance: String) {
-        guard !hasReportedContent, itemCount > 0, let ms = elapsedMilliseconds else { return }
-        hasReportedContent = true
+        guard itemCount > 0, let ms = elapsedMilliseconds else { return }
+        let shouldReport = hasReportedContent.withLock { reported -> Bool in
+            guard !reported else { return false }
+            reported = true
+            return true
+        }
+        guard shouldReport else { return }
         let verdict = ms <= 300 ? "within" : "OVER"
         Log.device("perf", String(format:
             "launch-to-first-content %.0f ms (%@ the 300 ms budget) items=%d source=%@",
