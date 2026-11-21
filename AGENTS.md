@@ -372,32 +372,21 @@ explanation before the flattering one.
 
 ## Releasing
 
-- **TestFlight** (`.github/workflows/testflight.yml`): every push to `main` that passes CI is
-  archived, uploaded, sent to the internal testers and the "External testers" group, and
-  tagged `build/<N>`. The first build of each version waits for Beta App Review before
-  external testers get it; the reviewer notes are `fastlane/review_notes.txt`, and the
-  contact phone number is the `ASC_REVIEW_PHONE` secret. Documentation-only pushes
-  are skipped. The tester changelog is the titles of the last five commits, and the Beta App
-  Description is `fastlane/description.txt`. The build number is the latest TestFlight build
-  number plus one, set at build time and never committed; `CURRENT_PROJECT_VERSION = 1` in
-  the project is only for local builds.
-- **App Store** (`.github/workflows/appstore.yml`, run by hand): submits an existing TestFlight
-  build, not a rebuild, for review, and it is released automatically on approval. Update
-  `fastlane/release_notes.txt` first. The App Store description, subtitle and promotional
-  text are `fastlane/description.txt`, `subtitle.txt` and `promotional_text.txt`, uploaded on
-  every run; edits made to them in App Store Connect are overwritten. The workflow
-  tags `v<version>` and then commits the next `MARKETING_VERSION` to `main`, because App
+- **TestFlight** (Xcode Cloud): pushes to `main` are archived, signed, and uploaded to
+  TestFlight by Xcode Cloud, which manages signing and incrementing build numbers
+  (`CURRENT_PROJECT_VERSION = 1` in the project is only for local builds).
+  - `ci_scripts/ci_post_clone.sh` runs `Tools/fetch_models.sh` to fetch the gitignored CLIP
+    models before building.
+  - `ci_scripts/ci_post_xcodebuild.sh` fails the archive if the CLIP models are missing from
+    the archived `.app`, rather than shipping a build with no search bar.
+- **App Store** (`.github/workflows/appstore.yml`, run by hand): runs `fastlane app_store`
+  (`fastlane/Fastfile`) with the App Store Connect API key (`ASC_KEY_ID`, `ASC_ISSUER_ID`,
+  `ASC_KEY_P8`) to submit an existing TestFlight build, not a rebuild, for review, and it is
+  released automatically on approval. Update `fastlane/release_notes.txt` first. The App Store
+  description, subtitle and promotional text are `fastlane/description.txt`, `subtitle.txt`
+  and `promotional_text.txt`, uploaded on every run; edits made to them in App Store Connect
+  are overwritten. The workflow commits the next `MARKETING_VERSION` to `main`, because App
   Store Connect refuses uploads to a version once it is approved.
-- Both run `fastlane` (`fastlane/Fastfile`) with one App Store Connect API key in the
-  `ASC_KEY_ID`, `ASC_ISSUER_ID` and `ASC_KEY_P8` secrets. It must have the **Admin** role:
-  signing is cloud-managed via `-allowProvisioningUpdates`, and nothing else holds a
-  distribution certificate.
-- Each `beta` run's archive makes a throwaway Apple Development certificate on the empty
-  runner, and the lane revokes it afterwards. Before that, they built up until Apple's limit
-  failed every archive with "Your account has reached the maximum number of certificates". If
-  that error comes back, revoke the stale CI certificates in the developer portal.
-- The `beta` lane fails if the CLIP models are missing from the archived `.app`, rather than
-  shipping a build with no search bar.
 - App Store screenshots live in `fastlane/screenshots/en-AU/`, and every App Store run uploads
   them, replacing what App Store Connect has. [Tools/screenshots/README.md](Tools/screenshots/README.md)
   has the procedure for remaking them.
