@@ -50,7 +50,9 @@ private struct ServerPage: View {
                             .autocorrectionDisabled()
                             .submitLabel(.continue)
                             .focused($fieldFocused)
-                            .onSubmit { model.submitServer(webAuthenticate: webAuthenticate) }
+                            .onSubmit {
+                                model.submitServer(webAuthenticate: webAuthenticationSession.authenticateWithImmich)
+                            }
                     }
 
                     if model.serverText.isEmpty {
@@ -81,9 +83,11 @@ private struct ServerPage: View {
                                     ? "Connect Anyway" : "Continue",
                                 isLoading: model.serverStatus == .checking
                                     || model.isAuthenticating) {
-                model.submitServer(webAuthenticate: webAuthenticate)
+                model.submitServer(webAuthenticate: webAuthenticationSession.authenticateWithImmich)
             }
-            .disabled(model.serverText.trimmingCharacters(in: .whitespaces).isEmpty)
+            .disabled(model.serverText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                      || model.serverStatus == .checking
+                      || model.isAuthenticating)
         }
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
@@ -102,10 +106,6 @@ private struct ServerPage: View {
             // Straight to the keyboard for a new server; a remembered one is probably right.
             if model.serverText.isEmpty { fieldFocused = true }
         }
-    }
-
-    private func webAuthenticate(_ url: URL) async throws -> URL {
-        try await webAuthenticationSession.authenticateWithImmich(url)
     }
 
     @ViewBuilder
@@ -190,9 +190,13 @@ private struct CredentialsPage: View {
                 Button("Not Now") { model.close() }
             }
         }
+        .navigationBarBackButtonHidden(model.isAuthenticating)
         .navigationBarTitleDisplayMode(.inline)
         .sensoryFeedback(.error, trigger: model.credentialError) { _, new in new != nil }
         .onAppear { focus = initialFocus }
+        .onDisappear {
+            if model.isAuthenticating { model.cancelAuthentication() }
+        }
         .onChange(of: model.credentialMethod) { _, _ in focus = initialFocus }
     }
 
@@ -256,8 +260,9 @@ private struct CredentialsPage: View {
     private var primaryAction: some View {
         if oauthLeads {
             SignInPrimaryButton(title: model.oauthButtonTitle, isLoading: model.isAuthenticating) {
-                model.signInWithOAuth(webAuthenticate: webAuthenticate)
+                model.signInWithOAuth(webAuthenticate: webAuthenticationSession.authenticateWithImmich)
             }
+            .disabled(model.isAuthenticating)
         } else {
             SignInPrimaryButton(title: "Sign In",
                                 isLoading: model.isAuthenticating && !model.isAuthenticatingWithOAuth) {
@@ -278,7 +283,7 @@ private struct CredentialsPage: View {
                 }
                 SignInPrimaryButton(title: model.oauthButtonTitle,
                                     isLoading: model.isAuthenticatingWithOAuth, prominent: false) {
-                    model.signInWithOAuth(webAuthenticate: webAuthenticate)
+                    model.signInWithOAuth(webAuthenticate: webAuthenticationSession.authenticateWithImmich)
                 }
                 .disabled(model.isAuthenticating)
             }
@@ -296,10 +301,6 @@ private struct CredentialsPage: View {
         .frame(maxWidth: .infinity)
         .disabled(model.isAuthenticating)
         .padding(.top, 8)
-    }
-
-    private func webAuthenticate(_ url: URL) async throws -> URL {
-        try await webAuthenticationSession.authenticateWithImmich(url)
     }
 }
 

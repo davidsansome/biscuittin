@@ -13,6 +13,7 @@ final class SettingsViewModel: ObservableObject {
 
     @Published private(set) var state: ImmichAuthSession.State
     @Published private(set) var isWorking = false
+    @Published private(set) var isWorkCancellable = false
     @Published private(set) var statusMessage: String?
     @Published private(set) var errorMessage: String?
     @Published private(set) var syncProgress: SyncProgress?
@@ -27,7 +28,8 @@ final class SettingsViewModel: ObservableObject {
     private let settings: AppSettings
     private let localLibrary: LocalLibraryService
     let backupStatus: BackupStatusStore
-    private var signInTask: Task<Void, Never>?
+    private var activeTask: Task<Void, Never>?
+    private var activeWorkID = UUID()
 
     // MARK: - Sync (requirement 14, D17)
 
@@ -106,25 +108,46 @@ final class SettingsViewModel: ObservableObject {
             })
     }
 
+    private func beginWork(status: String?, cancellable: Bool) -> UUID {
+        activeTask?.cancel()
+        activeTask = nil
+        let id = UUID()
+        activeWorkID = id
+        isWorking = true
+        isWorkCancellable = cancellable
+        statusMessage = status
+        errorMessage = nil
+        return id
+    }
+
+    private func finishWork(_ id: UUID) {
+        guard activeWorkID == id else { return }
+        activeTask = nil
+        statusMessage = nil
+        isWorking = false
+        isWorkCancellable = false
+    }
+
     /// The flow has stored a credential; catalogue the library while the user carries on.
     private func didSignIn() {
         state = session.state
         serverURL = session.baseURL
         email = session.email ?? ""
-        errorMessage = nil
-        statusMessage = "Downloading library details…"
-        isWorking = true
+        let workID = beginWork(status: "Downloading library details…", cancellable: true)
 
-        signInTask?.cancel()
-        signInTask = Task { [weak self] in
+        activeTask = Task { [weak self] in
             guard let self else { return }
+            defer { self.finishWork(workID) }
             do {
                 if let owner = self.session.cacheOwner,
                    try await self.remoteLibrary.claimCache(for: owner) {
                     self.imageCache.clearCache()
                 }
                 try await self.remoteLibrary.syncStream(reset: true) { progress in
-                    Task { @MainActor [weak self] in self?.syncProgress = progress }
+                    Task { @MainActor [weak self] in
+                        guard let self, self.activeWorkID == workID else { return }
+                        self.syncProgress = progress
+                    }
                 }
 
                 // No explicit timeline refresh here. `syncStream` already yields on the remote
@@ -132,21 +155,25 @@ final class SettingsViewModel: ObservableObject {
                 // `refresh()` as well raced that delivery — the stream's yield arrived after the
                 // refresh had run, re-arming the coalescer and costing a second full rebuild of
                 // the whole library for no change in the result.
+                guard !Task.isCancelled, self.activeWorkID == workID else { return }
                 self.lastSyncDate = await self.remoteLibrary.lastSyncDate()
             } catch is CancellationError {
+                return
             } catch {
+                guard !Task.isCancelled, self.activeWorkID == workID else { return }
                 self.state = self.session.state
-                self.errorMessage = (error as? LocalizedError)?.errorDescription
-                    ?? error.localizedDescription
+                self.errorMessage = error.userMessage
             }
-            self.statusMessage = nil
-            self.isWorking = false
         }
     }
 
-    func cancelSignIn() {
-        signInTask?.cancel()
+    func cancelWork() {
+        guard isWorkCancellable else { return }
+        activeTask?.cancel()
+        activeTask = nil
+        activeWorkID = UUID()
         isWorking = false
+        isWorkCancellable = false
         statusMessage = nil
     }
 
@@ -154,13 +181,14 @@ final class SettingsViewModel: ObservableObject {
     /// keeping them would fill the grid with photos that open black. Assets with a local copy
     /// stay, shown from the device library.
     func signOut() {
-        signInTask?.cancel()
+        let workID = beginWork(status: "Signing out…", cancellable: false)
         session.signOut()
         state = session.state
         syncProgress = nil
         lastSyncDate = nil
-        Task { [weak self] in
+        activeTask = Task { [weak self] in
             guard let self else { return }
+            defer { self.finishWork(workID) }
             // Queued uploads carry the credential just signed out of, and would otherwise finish.
             await self.syncEngine.cancelUploads()
             try? await self.remoteLibrary.wipeCache()
@@ -170,9 +198,12 @@ final class SettingsViewModel: ObservableObject {
 
     /// Removes cached server metadata and thumbnails without touching the device library.
     func removeServerData() {
-        Task { [weak self] in
+        guard !isWorking else { return }
+        let workID = beginWork(status: "Removing server data…", cancellable: false)
+        activeTask = Task { [weak self] in
             guard let self else { return }
-            self.isWorking = true
+            defer { self.finishWork(workID) }
+            await self.syncEngine.cancelUploads()
             self.session.forgetServer()
             self.state = self.session.state
             try? await self.remoteLibrary.wipeCache()
@@ -181,7 +212,6 @@ final class SettingsViewModel: ObservableObject {
             self.serverURL = nil
             self.syncProgress = nil
             self.lastSyncDate = nil
-            self.isWorking = false
         }
     }
 
@@ -247,40 +277,41 @@ final class SettingsViewModel: ObservableObject {
 
     /// Deletes local copies of assets verified to exist on the server (D18).
     func performFreeUpSpace() {
+        guard !isWorking else { return }
         let plan = freeUpSpacePlan
         showsFreeUpSpaceConfirmation = false
         guard !plan.isEmpty else { return }
 
-        Task { [weak self] in
+        let workID = beginWork(status: "Freeing up space…", cancellable: false)
+        activeTask = Task { [weak self] in
             guard let self else { return }
-            self.isWorking = true
+            defer { self.finishWork(workID) }
             let outcome = await self.photoActions.freeUpSpace(plan)
             if let error = outcome.firstError {
-                self.errorMessage = error.localizedDescription
+                self.errorMessage = error.userMessage
             }
             self.freeUpSpacePlan = await self.photoActions.freeUpSpacePlan()
-            self.isWorking = false
         }
     }
 
     func refreshNow() {
-        Task { [weak self] in
+        guard !isWorking else { return }
+        let workID = beginWork(status: "Refreshing…", cancellable: true)
+        activeTask = Task { [weak self] in
             guard let self else { return }
-            self.isWorking = true
-            self.statusMessage = "Refreshing…"
+            defer { self.finishWork(workID) }
             do {
                 try await self.remoteLibrary.syncStream(reset: false)
-                await self.timelineStore.refresh()
+                guard !Task.isCancelled, self.activeWorkID == workID else { return }
                 self.lastSyncDate = await self.remoteLibrary.lastSyncDate()
             } catch is CancellationError {
+                return
             } catch {
+                guard !Task.isCancelled, self.activeWorkID == workID else { return }
                 // A 401 has already marked the session expired; show the re-sign-in row.
                 self.state = self.session.state
-                self.errorMessage = (error as? LocalizedError)?.errorDescription
-                    ?? error.localizedDescription
+                self.errorMessage = error.userMessage
             }
-            self.statusMessage = nil
-            self.isWorking = false
         }
     }
 }

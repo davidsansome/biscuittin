@@ -85,7 +85,8 @@ final class SignInFlowModel: ObservableObject {
     /// Re-signing in after expiry should not make the user retype a server they already
     /// confirmed: probe it straight away, and go to credentials if it still answers.
     func start() {
-        guard !serverText.isEmpty, case .idle = serverStatus else { return }
+        guard !serverText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              case .idle = serverStatus else { return }
         let resumesExpiredSession = session.state == .expired
         probe(after: .zero) { [weak self] in
             if resumesExpiredSession { self?.continueFromServer(webAuthenticate: nil) }
@@ -99,9 +100,8 @@ final class SignInFlowModel: ObservableObject {
         return nil
     }
 
-    var canContinueFromServer: Bool { server != nil }
-
     func submitServer(webAuthenticate: @escaping WebAuthenticate) {
+        guard serverStatus != .checking, !isAuthenticating else { return }
         if server != nil {
             continueFromServer(webAuthenticate: webAuthenticate)
         } else {
@@ -140,14 +140,15 @@ final class SignInFlowModel: ObservableObject {
 
     private func serverTextChanged() {
         probeTask?.cancel()
+        hasAutoLaunchedOAuth = false
         serverStatus = .idle
-        guard !serverText.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        guard !serverText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         probe(after: Self.probeDebounce)
     }
 
     private func probe(after delay: Duration, then onFound: (() -> Void)? = nil) {
         probeTask?.cancel()
-        let input = serverText
+        let input = serverText.trimmingCharacters(in: .whitespacesAndNewlines)
         probeTask = Task { [weak self] in
             if delay > .zero {
                 try? await Task.sleep(for: delay)
@@ -171,8 +172,10 @@ final class SignInFlowModel: ObservableObject {
     var canSubmitCredentials: Bool {
         guard !isAuthenticating else { return false }
         switch credentialMethod {
-        case .password: return !email.isEmpty && !password.isEmpty
-        case .apiKey: return !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        case .password:
+            return !email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !password.isEmpty
+        case .apiKey:
+            return !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
     }
 
@@ -193,9 +196,10 @@ final class SignInFlowModel: ObservableObject {
         guard canSubmitCredentials, let server else { return }
         switch credentialMethod {
         case .password:
-            let (email, password) = (email, password)
+            let trimmedEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
+            let password = password
             authenticate { session in
-                try await session.signIn(server: server, email: email, password: password)
+                try await session.signIn(server: server, email: trimmedEmail, password: password)
             }
         case .apiKey:
             let key = apiKey
@@ -222,10 +226,17 @@ final class SignInFlowModel: ObservableObject {
     /// user's back after they chose not to connect.
     func close() {
         probeTask?.cancel()
+        cancelAuthentication()
+        isFinished = true
+    }
+
+    /// Cancels an in-flight authentication attempt (for example, if the credentials page
+    /// disappears while navigating away).
+    func cancelAuthentication() {
         authTask?.cancel()
+        authTask = nil
         isAuthenticating = false
         isAuthenticatingWithOAuth = false
-        isFinished = true
     }
 
     private func authenticate(onFailure: (() -> Void)? = nil,
@@ -292,7 +303,7 @@ final class SignInFlowModel: ObservableObject {
             // The framework's own descriptions are codes, not sentences.
             return "Couldn’t open the sign-in page. Try again."
         }
-        return (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        return error.userMessage
     }
 
     /// Closing the provider's sheet is a choice, not a failure worth a red message.

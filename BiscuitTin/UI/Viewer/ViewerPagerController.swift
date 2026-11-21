@@ -28,6 +28,8 @@ final class ViewerPagerController: UIViewController {
     private var items: [AssetStub]
     private(set) var currentIndex: Int
     private var isChromeVisible = true
+    private var isDeleting = false
+    private var isAudioSessionActive = false
 
     // MARK: - Views
 
@@ -113,7 +115,7 @@ final class ViewerPagerController: UIViewController {
     /// insets are still zero when cells are first configured, which would let the scrubber
     /// collide with the toolbar buttons.
     private func updateVideoControlInsets() {
-        let inset = ViewerToolbar.contentHeight + view.safeAreaInsets.bottom + 8
+        let inset = currentVideoControlInset
         for case let cell as ViewerPageCell in collectionView.visibleCells {
             cell.videoView.bottomInset = inset
         }
@@ -130,7 +132,12 @@ final class ViewerPagerController: UIViewController {
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        currentCell()?.videoView.pause()
+        if isBeingDismissed {
+            currentCell()?.videoView.detachPlayer()
+            deactivateAudioSessionIfNeeded()
+        } else {
+            currentCell()?.videoView.pause()
+        }
     }
 
     // MARK: - Setup
@@ -267,8 +274,12 @@ final class ViewerPagerController: UIViewController {
 
     // MARK: - Paging
 
+    private func cell(at index: Int) -> ViewerPageCell? {
+        collectionView.cellForItem(at: IndexPath(item: index, section: 0)) as? ViewerPageCell
+    }
+
     private func currentCell() -> ViewerPageCell? {
-        collectionView.cellForItem(at: IndexPath(item: currentIndex, section: 0)) as? ViewerPageCell
+        cell(at: currentIndex)
     }
 
     private func updateCurrentIndexFromScroll() {
@@ -278,12 +289,15 @@ final class ViewerPagerController: UIViewController {
         guard clamped != currentIndex else { return }
 
         // Leaving a video page: stop playback and release the player immediately.
-        if let leaving = collectionView.cellForItem(at: IndexPath(item: currentIndex, section: 0)) as? ViewerPageCell {
+        if let leaving = cell(at: currentIndex) {
             leaving.videoView.detachPlayer()
             leaving.resetZoom(animated: false)
             leaving.setCurrentPage(false)
         }
         currentIndex = clamped
+        if items.indices.contains(currentIndex), items[currentIndex].kind != .video {
+            deactivateAudioSessionIfNeeded()
+        }
         activateCurrentPage()
     }
 
@@ -301,13 +315,21 @@ final class ViewerPagerController: UIViewController {
 
         let task = Task { [weak self, weak cell] in
             guard let self else { return }
-            guard let asset = await self.asset(for: stub) else { return }
+            guard let asset = await self.asset(for: stub) else {
+                await MainActor.run {
+                    guard let cell, cell.stub?.id == stub.id else { return }
+                    cell.videoView.showError("This video isn’t available.")
+                    self.deactivateAudioSessionIfNeeded()
+                }
+                return
+            }
             do {
                 let item = try await self.videoProvider.playerItem(for: asset)
                 try Task.checkCancellation()
                 await MainActor.run {
                     guard let cell, cell.stub?.id == stub.id else { return }
                     self.videoProvider.activateAudioSessionForPlayback()
+                    self.isAudioSessionActive = true
                     cell.videoView.attach(player: AVPlayer(playerItem: item), autoplay: true)
                     cell.setChromeVisible(self.isChromeVisible, animated: false)
                 }
@@ -317,10 +339,23 @@ final class ViewerPagerController: UIViewController {
                 await MainActor.run {
                     guard let cell, cell.stub?.id == stub.id else { return }
                     cell.videoView.showError("This video isn’t available.")
+                    self.deactivateAudioSessionIfNeeded()
                 }
             }
         }
         cell.videoView.setLoadTask(task)
+    }
+
+    private func deactivateAudioSessionIfNeeded() {
+        guard isAudioSessionActive else { return }
+        isAudioSessionActive = false
+        DispatchQueue.global(qos: .utility).async {
+            do {
+                try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            } catch {
+                Log.ui.error("Audio session deactivation failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
     }
 
     // MARK: - Live Text (D25)
@@ -342,7 +377,8 @@ final class ViewerPagerController: UIViewController {
     // MARK: - Dismissal (requirement 6)
 
     private func dismissViewer() {
-        currentCell()?.videoView.pause()
+        currentCell()?.videoView.detachPlayer()
+        deactivateAudioSessionIfNeeded()
         dismiss(animated: true)
     }
 
@@ -412,10 +448,13 @@ final class ViewerPagerController: UIViewController {
 
             // A server-only failure still rotated the photo on this device, so the preview must
             // stand; reverting it showed the old orientation for an edit that had landed.
+            let targetIndex = self.items.firstIndex(where: { $0.id == stub.id })
             guard !outcome.succeeded.isEmpty || !outcome.partiallySucceeded.isEmpty else {
-                self.currentCell()?.revertPreviewRotation()
+                if let targetIndex {
+                    self.cell(at: targetIndex)?.revertPreviewRotation()
+                }
                 let message = Toast.message(for: outcome, verb: "rotated")
-                    ?? outcome.firstError?.localizedDescription
+                    ?? outcome.firstError?.userMessage
                     ?? "Rotation failed."
                 Toast.show(message, in: self.view)
                 return
@@ -424,16 +463,20 @@ final class ViewerPagerController: UIViewController {
                 Toast.show(message, in: self.view)
             }
             // The real rendition has different dimensions; reload the page so it re-fits.
-            self.reloadCurrentPageAfterEdit()
+            if let targetIndex {
+                self.reloadPageAfterEdit(at: targetIndex)
+            }
         }
     }
 
     private func deleteCurrent() {
-        guard library == .own, items.indices.contains(currentIndex) else { return }
+        guard library == .own, !isDeleting, items.indices.contains(currentIndex) else { return }
+        isDeleting = true
         let stub = items[currentIndex]
 
         Task { [weak self] in
             guard let self else { return }
+            defer { self.isDeleting = false }
             let plan = await self.env.photoActions.deletePlan(ids: [stub.id])
             if plan.needsInAppConfirmation {
                 guard await self.confirmDelete(plan: plan) else { return }
@@ -441,7 +484,7 @@ final class ViewerPagerController: UIViewController {
             let outcome = await self.env.photoActions.delete(ids: [stub.id])
             guard !outcome.succeeded.isEmpty else {
                 if let error = outcome.firstError {
-                    Toast.show(error.localizedDescription, in: self.view)
+                    Toast.show(error.userMessage, in: self.view)
                 }
                 return
             }
@@ -465,8 +508,7 @@ final class ViewerPagerController: UIViewController {
             }
             let (items, failures) = shared
             guard !items.isEmpty else {
-                let message = (failures.first?.error as? LocalizedError)?.errorDescription
-                    ?? failures.first?.error.localizedDescription
+                let message = failures.first?.error.userMessage
                     ?? "Couldn’t share this item."
                 Toast.show(message, in: self.view)
                 return
@@ -489,7 +531,8 @@ final class ViewerPagerController: UIViewController {
     /// Confirms deletions that reach the server (D11). Purely local deletions rely on the
     /// system's own confirmation and never reach here.
     private func confirmDelete(plan: DeletePlan) async -> Bool {
-        await withCheckedContinuation { continuation in
+        guard presentedViewController == nil else { return false }
+        return await withCheckedContinuation { continuation in
             let count = plan.total
             let noun = count == 1 ? "item" : "\(count) items"
             let alert = UIAlertController(
@@ -506,16 +549,31 @@ final class ViewerPagerController: UIViewController {
         }
     }
 
+    /// Computes the next `currentIndex` after removing an item at `removed`, or `nil` when empty.
+    static func indexAfterRemoving(_ removed: Int, currentIndex: Int, remainingCount: Int) -> Int? {
+        guard remainingCount > 0 else { return nil }
+        if removed < currentIndex {
+            return currentIndex - 1
+        }
+        if removed == currentIndex {
+            return min(removed, remainingCount - 1)
+        }
+        return currentIndex
+    }
+
     /// Moves to the next asset after a delete, or leaves if that was the last one.
     private func advanceAfterDeleting(_ id: AssetID) {
         guard let removed = items.firstIndex(where: { $0.id == id }) else { return }
         items.remove(at: removed)
 
-        guard !items.isEmpty else {
+        guard let nextIndex = Self.indexAfterRemoving(removed,
+                                                      currentIndex: currentIndex,
+                                                      remainingCount: items.count) else {
+            deactivateAudioSessionIfNeeded()
             dismiss(animated: true)
             return
         }
-        currentIndex = min(removed, items.count - 1)
+        currentIndex = nextIndex
         collectionView.reloadData()
         collectionView.layoutIfNeeded()
         collectionView.setContentOffset(
@@ -523,11 +581,14 @@ final class ViewerPagerController: UIViewController {
         activateCurrentPage()
     }
 
-    private func reloadCurrentPageAfterEdit() {
-        let indexPath = IndexPath(item: currentIndex, section: 0)
-        guard indexPath.item < items.count else { return }
+    private func reloadPageAfterEdit(at index: Int) {
+        guard items.indices.contains(index) else { return }
+        let indexPath = IndexPath(item: index, section: 0)
         collectionView.reloadItems(at: [indexPath])
-        activateCurrentPage()
+        collectionView.layoutIfNeeded()
+        if index == currentIndex {
+            activateCurrentPage()
+        }
     }
 
     // MARK: - Info sheet (requirement 9)
@@ -665,5 +726,9 @@ extension ViewerPagerController: ViewerTransitionDestination {
     /// The paged photo and the chrome sitting over it. Both stay hidden until the zoom lands,
     /// so the viewer reads as black while the tile flies in rather than showing the photo at
     /// full size the instant it is presented.
-    var transitionRevealViews: [UIView] { [contentContainer, toolbar] }
+    var transitionRevealViews: [UIView] {
+        expiredBanner.isHidden
+            ? [contentContainer, toolbar]
+            : [contentContainer, toolbar, expiredBanner]
+    }
 }

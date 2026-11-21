@@ -51,7 +51,7 @@ final class ViewerZoomAnimator: NSObject, UIViewControllerAnimatedTransitioning 
 
     func transitionDuration(using context: UIViewControllerContextTransitioning?) -> TimeInterval {
         if ProcessInfo.processInfo.environment["BISCUITTIN_SLOW_TRANSITIONS"] != nil {
-            return isPresenting ? 3.0 : 3.0
+            return 3.0
         }
         return isPresenting ? 0.34 : 0.30
     }

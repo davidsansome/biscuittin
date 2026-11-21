@@ -150,6 +150,7 @@ final class VideoPlayerPageView: UIView {
         self.player = player
         playerContainer.playerLayer.player = player
         playerContainer.isHidden = false
+        controlsStack.isHidden = false
         errorLabel.isHidden = true
         activityIndicator.stopAnimating()
 
@@ -168,6 +169,15 @@ final class VideoPlayerPageView: UIView {
             self?.handlePlaybackEnded()
         }
 
+        statusObservation = player.currentItem?.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
+            guard item.status == .failed else { return }
+            let message = item.error?.userMessage ?? "This video isn’t available."
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.player?.currentItem === item else { return }
+                self.showError(message)
+            }
+        }
+
         if autoplay {
             play()
         } else {
@@ -176,11 +186,13 @@ final class VideoPlayerPageView: UIView {
     }
 
     func showLoading() {
+        errorLabel.isHidden = true
         activityIndicator.startAnimating()
         playPauseButton.isHidden = true
     }
 
     func showError(_ message: String) {
+        player?.pause()
         activityIndicator.stopAnimating()
         playPauseButton.isHidden = true
         controlsStack.isHidden = true
@@ -204,8 +216,13 @@ final class VideoPlayerPageView: UIView {
         player = nil
         playerContainer.playerLayer.player = nil
         playerContainer.isHidden = true
+        controlsStack.isHidden = false
+        errorLabel.isHidden = true
+        activityIndicator.stopAnimating()
+        isScrubbing = false
         scrubber.value = 0
         elapsedLabel.text = "0:00"
+        remainingLabel.text = "0:00"
         updatePlayPauseIcon(isPlaying: false)
     }
 
@@ -225,11 +242,6 @@ final class VideoPlayerPageView: UIView {
     func pause() {
         player?.pause()
         updatePlayPauseIcon(isPlaying: false)
-    }
-
-    var isPlaying: Bool {
-        guard let player else { return false }
-        return player.timeControlStatus == .playing
     }
 
     @objc private func togglePlayback() {
@@ -270,9 +282,13 @@ final class VideoPlayerPageView: UIView {
         let elapsed = time.seconds
         let duration = item.duration.seconds
         scrubber.value = Float(elapsed / duration)
+        updateTimeLabels(elapsed: elapsed, duration: duration)
+        updatePlayPauseIcon(isPlaying: player?.timeControlStatus == .playing)
+    }
+
+    private func updateTimeLabels(elapsed: Double, duration: Double) {
         elapsedLabel.text = AssetCell.durationText(Float(elapsed))
         remainingLabel.text = "-" + AssetCell.durationText(Float(max(0, duration - elapsed)))
-        updatePlayPauseIcon(isPlaying: player?.timeControlStatus == .playing)
     }
 
     private func handlePlaybackEnded() {
@@ -291,9 +307,9 @@ final class VideoPlayerPageView: UIView {
 
     @objc private func scrubbingChanged() {
         guard let item = player?.currentItem, item.duration.isNumeric else { return }
-        let target = Double(scrubber.value) * item.duration.seconds
-        elapsedLabel.text = AssetCell.durationText(Float(target))
-        remainingLabel.text = "-" + AssetCell.durationText(Float(max(0, item.duration.seconds - target)))
+        let duration = item.duration.seconds
+        let target = Double(scrubber.value) * duration
+        updateTimeLabels(elapsed: target, duration: duration)
     }
 
     @objc private func scrubbingEnded() {

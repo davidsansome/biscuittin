@@ -90,11 +90,28 @@ final class ZoomablePhotoView: UIScrollView {
             hasRequestedFullResolution = false
             isUserZooming = false
         }
+        guard image != nil else {
+            isConfiguringZoomScales = true
+            defer { isConfiguringZoomScales = false }
+            minimumZoomScale = 1
+            maximumZoomScale = 1
+            zoomScale = 1
+            contentSize = .zero
+            contentOffset = .zero
+            contentInset = .zero
+            imageView.frame = .zero
+            liveTextInteraction?.setContentsRectNeedsUpdate()
+            return
+        }
         // Must re-run explicitly: the image can arrive long after the last bounds change, and
         // laying out only on bounds changes would leave the image view at zero size.
         configureZoomScales(resetToMinimum: resetZoom)
         centerContent()
         liveTextInteraction?.setContentsRectNeedsUpdate()
+    }
+
+    func resetFullResolutionRequest() {
+        hasRequestedFullResolution = false
     }
 
     // MARK: - Live Text

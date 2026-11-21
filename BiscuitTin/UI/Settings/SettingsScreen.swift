@@ -41,7 +41,7 @@ struct SettingsScreen: View {
             .confirmationDialog("Free up space?",
                                 isPresented: $viewModel.showsFreeUpSpaceConfirmation,
                                 titleVisibility: .visible) {
-                Button("Remove \(viewModel.freeUpSpacePlan.count) Items From \(DeviceName.current)",
+                Button(Self.freeUpSpaceRemoveTitle(count: viewModel.freeUpSpacePlan.count),
                        role: .destructive) {
                     viewModel.performFreeUpSpace()
                 }
@@ -84,6 +84,7 @@ struct SettingsScreen: View {
                               ? "exclamationmark.arrow.circlepath" : "server.rack")
                     }
                 }
+                .disabled(viewModel.isWorking)
             }
 
             if viewModel.isWorking {
@@ -92,8 +93,10 @@ struct SettingsScreen: View {
                     Text(viewModel.statusMessage ?? "Working…")
                         .foregroundStyle(.secondary)
                     Spacer()
-                    Button("Cancel") { viewModel.cancelSignIn() }
-                        .buttonStyle(.borderless)
+                    if viewModel.isWorkCancellable {
+                        Button("Cancel") { viewModel.cancelWork() }
+                            .buttonStyle(.borderless)
+                    }
                 }
                 if let progress = viewModel.syncProgress {
                     Text(Self.progressText(progress))
@@ -118,6 +121,16 @@ struct SettingsScreen: View {
         let own = "\(progress.assets.formatted()) items catalogued"
         guard progress.partnerAssets > 0 else { return own }
         return "\(own), plus \(progress.partnerAssets.formatted()) shared with you"
+    }
+
+    static func freeUpSpaceRemoveTitle(count: Int, deviceName: String = DeviceName.current) -> String {
+        let noun = count == 1 ? "Item" : "Items"
+        return "Remove \(count) \(noun) From \(deviceName)"
+    }
+
+    static func freeUpSpaceSummary(formattedBytes: String, count: Int) -> String {
+        let noun = count == 1 ? "item" : "items"
+        return "\(formattedBytes) in \(count) \(noun) backed up to Immich"
     }
 
     private var accountRow: some View {
@@ -218,8 +231,8 @@ struct SettingsScreen: View {
             } else {
                 Button("Free Up Space") { viewModel.showsFreeUpSpaceConfirmation = true }
                     .disabled(viewModel.isWorking)
-                Text("\(viewModel.freeUpSpacePlan.formattedBytes) in "
-                     + "\(viewModel.freeUpSpacePlan.count) items backed up to Immich")
+                Text(Self.freeUpSpaceSummary(formattedBytes: viewModel.freeUpSpacePlan.formattedBytes,
+                                             count: viewModel.freeUpSpacePlan.count))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -243,8 +256,8 @@ struct SettingsScreen: View {
             LabeledContent("Version",
                            value: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0")
         } footer: {
-            Text("Signing out keeps catalogued server photos browsable offline. "
-                 + "Remove Server Data clears them.")
+            Text("Signing out clears cached server photos while remembering your server address. "
+                 + "Remove Server Data also forgets the server address.")
         }
     }
 }

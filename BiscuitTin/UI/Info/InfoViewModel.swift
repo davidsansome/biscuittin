@@ -5,7 +5,6 @@ import Foundation
 @MainActor
 final class InfoViewModel: ObservableObject {
     @Published private(set) var metadata: AssetMetadata
-    @Published private(set) var isLoading = true
 
     private let stub: AssetStub
     private let resolveAsset: () async -> Asset?
@@ -25,14 +24,10 @@ final class InfoViewModel: ObservableObject {
         guard loadTask == nil else { return }
         loadTask = Task { [weak self] in
             guard let self else { return }
-            guard let asset = await self.resolveAsset() else {
-                self.isLoading = false
-                return
-            }
+            guard let asset = await self.resolveAsset() else { return }
             let full = await self.metadataService.metadata(for: asset)
             guard !Task.isCancelled else { return }
             self.metadata = full
-            self.isLoading = false
         }
     }
 

@@ -154,7 +154,12 @@ final class ViewerPageCell: UICollectionViewCell {
 
         fullResolutionToken = loader.requestImage(for: stub, variant: .fullResolution) {
             [weak self] image, degraded in
-            guard let self, !degraded, let image, self.stub?.id == stub.id else { return }
+            guard let self, !degraded, self.stub?.id == stub.id else { return }
+            guard let image else {
+                self.fullResolutionToken = nil
+                self.photoView.resetFullResolutionRequest()
+                return
+            }
             self.hasFullResolution = true
             self.photoView.setImage(image, resetZoom: false)
             self.offerLiveTextSource(image)
@@ -239,7 +244,7 @@ final class ViewerPageCell: UICollectionViewCell {
 
         previewRotationAngle += clockwise ? .pi / 2 : -.pi / 2
         let angle = previewRotationAngle
-        let fitted = Self.fitScale(for: rotationOverlay.frame.size,
+        let fitted = Self.fitScale(for: rotationOverlay.bounds.size,
                                    rotatedBy: angle,
                                    in: contentView.bounds)
 

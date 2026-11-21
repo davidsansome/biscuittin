@@ -240,4 +240,36 @@ final class SignInTests: XCTestCase {
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
         XCTAssertTrue(first.codeVerifier.unicodeScalars.allSatisfy(unreserved.contains))
     }
+
+    // MARK: - SignInFlowModel & Settings formatting
+
+    @MainActor
+    func testCanSubmitCredentialsRejectsWhitespaceOnlyEmail() {
+        let suite = "SignInTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let session = ImmichAuthSession(defaults: defaults)
+        let model = SignInFlowModel(session: session,
+                                    asksForBackupScope: false,
+                                    countLocalItems: { 0 },
+                                    onSignedIn: {},
+                                    onBackupChosen: { _ in })
+        model.email = "   \n  "
+        model.password = "secret"
+        XCTAssertFalse(model.canSubmitCredentials)
+
+        model.email = " user@example.com \n"
+        XCTAssertTrue(model.canSubmitCredentials)
+    }
+
+    func testFreeUpSpacePluralization() {
+        XCTAssertEqual(SettingsScreen.freeUpSpaceRemoveTitle(count: 1, deviceName: "iPhone"),
+                       "Remove 1 Item From iPhone")
+        XCTAssertEqual(SettingsScreen.freeUpSpaceRemoveTitle(count: 5, deviceName: "iPhone"),
+                       "Remove 5 Items From iPhone")
+        XCTAssertEqual(SettingsScreen.freeUpSpaceSummary(formattedBytes: "12 MB", count: 1),
+                       "12 MB in 1 item backed up to Immich")
+        XCTAssertEqual(SettingsScreen.freeUpSpaceSummary(formattedBytes: "12 MB", count: 5),
+                       "12 MB in 5 items backed up to Immich")
+    }
 }
