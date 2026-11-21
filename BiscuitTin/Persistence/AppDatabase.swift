@@ -32,11 +32,7 @@ final class AppDatabase: @unchecked Sendable {
 
         try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(),
                                                 withIntermediateDirectories: true)
-        var config = Configuration()
-        config.prepareDatabase { db in
-            try db.execute(sql: "PRAGMA journal_mode = WAL")
-        }
-        let newPool = try DatabasePool(path: fileURL.path, configuration: config)
+        let newPool = try DatabasePool(path: fileURL.path)
         try Self.migrator.migrate(newPool)
         pool = newPool
         Log.timeline.info("Database opened at \(self.fileURL.lastPathComponent, privacy: .public)")
@@ -48,6 +44,17 @@ final class AppDatabase: @unchecked Sendable {
     var isOpen: Bool {
         lock.lock(); defer { lock.unlock() }
         return pool != nil
+    }
+
+    static func getKV(_ key: String, in db: Database) throws -> String? {
+        try String.fetchOne(db, sql: "SELECT value FROM kv WHERE key = ?", arguments: [key])
+    }
+
+    static func setKV(_ key: String, value: String, in db: Database) throws {
+        try db.execute(sql: """
+            INSERT INTO kv (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """, arguments: [key, value])
     }
 
     static var migrator: DatabaseMigrator {
@@ -122,11 +129,15 @@ final class AppDatabase: @unchecked Sendable {
             }
             // Backfill from the EXIF already cached, so existing installs get a populated map
             // without waiting for a full re-sync.
-            let rows = try Row.fetchAll(db, sql: "SELECT immich_id, exif_json FROM remote_assets WHERE exif_json IS NOT NULL")
-            for row in rows {
+            let decoder = JSONDecoder()
+            let cursor = try Row.fetchCursor(
+                db,
+                sql: "SELECT immich_id, exif_json FROM remote_assets WHERE exif_json IS NOT NULL"
+            )
+            while let row = try cursor.next() {
                 guard let json: String = row["exif_json"],
                       let data = json.data(using: .utf8),
-                      let exif = try? JSONDecoder().decode(Immich.ExifInfo.self, from: data),
+                      let exif = try? decoder.decode(Immich.ExifInfo.self, from: data),
                       let latitude = exif.latitude, let longitude = exif.longitude else { continue }
                 try db.execute(sql: "UPDATE remote_assets SET latitude = ?, longitude = ? WHERE immich_id = ?",
                                arguments: [latitude, longitude, row["immich_id"] as String])

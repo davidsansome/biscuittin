@@ -122,9 +122,25 @@ struct PendingEditRecord: Codable, FetchableRecord, PersistableRecord, Equatable
         }
 
         if var row = existing {
+            if localIdentifier == nil,
+               editType == .rotation,
+               row.uploadedID == nil,
+               uploadedID == nil,
+               let existingPayloadString = row.payload,
+               let existingPayload = RotationPayload(jsonString: existingPayloadString),
+               let incomingPayloadString = payload,
+               let incomingPayload = RotationPayload(jsonString: incomingPayloadString) {
+                let combined = existingPayload.composed(with: incomingPayload)
+                if combined.quarterTurns == 0 {
+                    try row.delete(db)
+                    return
+                }
+                row.payload = combined.jsonString
+            } else {
+                row.payload = payload
+            }
             row.immichID = immichID
             row.mediaKindRaw = Int(mediaKind.rawValue)
-            row.payload = payload
             row.retryCount = 0
             row.lastError = nil
             row.updatedAt = now
@@ -147,15 +163,47 @@ struct PendingEditRecord: Codable, FetchableRecord, PersistableRecord, Equatable
 
 /// The remote-only fallback payload for `EditType.rotation` — see `PendingEditRecord`'s doc
 /// comment for why this is only meaningful when there is no local facet to read state from.
-struct RotationPayload: Codable {
-    let clockwise: Bool
+struct RotationPayload: Codable, Equatable {
+    /// Net clockwise 90° quarter-turns, normalized to `0..<4` (1 = 90° CW, 2 = 180°, 3 = 90° CCW).
+    let quarterTurns: Int
+
+    /// True for a single clockwise turn; false for a single counter-clockwise turn.
+    var clockwise: Bool { quarterTurns == 1 }
 
     var jsonString: String? {
         (try? JSONEncoder().encode(self)).flatMap { String(data: $0, encoding: .utf8) }
     }
 
     init(clockwise: Bool) {
-        self.clockwise = clockwise
+        self.quarterTurns = clockwise ? 1 : 3
+    }
+
+    init(quarterTurns: Int) {
+        self.quarterTurns = ((quarterTurns % 4) + 4) % 4
+    }
+
+    func composed(with other: RotationPayload) -> RotationPayload {
+        RotationPayload(quarterTurns: quarterTurns + other.quarterTurns)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case quarterTurns, clockwise
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if let turns = try container.decodeIfPresent(Int.self, forKey: .quarterTurns) {
+            self.quarterTurns = ((turns % 4) + 4) % 4
+        } else {
+            let cw = try container.decode(Bool.self, forKey: .clockwise)
+            self.quarterTurns = cw ? 1 : 3
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(quarterTurns, forKey: .quarterTurns)
+        try container.encode(clockwise, forKey: .clockwise)
     }
 
     init?(jsonString: String) {

@@ -14,21 +14,26 @@ final class RemoteThumbnailCache: @unchecked Sendable {
         // NSCache evicts on memory pressure; the count limit just bounds steady-state usage.
     }
 
-    func image(for key: String) -> UIImage? {
-        if let cached = memory.object(forKey: key as NSString) { return cached }
-        guard let data = disk.data(for: key) else { return nil }
-        guard let image = UIImage(data: data) else { return nil }
-        memory.setObject(image, forKey: key as NSString)
+    /// Memory-only lookup — safe to call on the main thread during scrolling without any disk I/O.
+    func memoryImage(for key: String) -> UIImage? {
+        memory.object(forKey: key as NSString)
+    }
+
+    /// Reads encoded bytes from disk and decodes/downsamples them for `memoryKey`. Call off-main.
+    func diskImage(for diskKey: String, memoryKey: String, downsamplingTo pixelSize: CGFloat?) -> UIImage? {
+        guard let data = disk.data(for: diskKey) else { return nil }
+        guard let image = Self.decode(data, maxPixelSize: pixelSize) else { return nil }
+        memory.setObject(image, forKey: memoryKey as NSString)
         return image
     }
 
-    /// Stores the encoded bytes and returns the decoded image, downsampled when a target size
-    /// is given.
+    /// Stores the encoded bytes under `diskKey` and returns the decoded image (cached in memory
+    /// under `memoryKey`), downsampled when a target size is given.
     @discardableResult
-    func store(_ data: Data, for key: String, downsamplingTo pixelSize: CGFloat?) -> UIImage? {
-        disk.store(data, for: key)
+    func store(_ data: Data, diskKey: String, memoryKey: String, downsamplingTo pixelSize: CGFloat?) -> UIImage? {
+        disk.store(data, for: diskKey)
         guard let image = Self.decode(data, maxPixelSize: pixelSize) else { return nil }
-        memory.setObject(image, forKey: key as NSString)
+        memory.setObject(image, forKey: memoryKey as NSString)
         return image
     }
 
@@ -36,8 +41,6 @@ final class RemoteThumbnailCache: @unchecked Sendable {
         memory.removeAllObjects()
         disk.removeAll()
     }
-
-    func currentDiskSize() -> Int { disk.currentSize() }
 
     /// ImageIO downsampling: decodes straight to the needed size rather than allocating the
     /// full-resolution bitmap first.

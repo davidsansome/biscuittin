@@ -103,11 +103,16 @@ enum Immich {
 
     // MARK: - Assets
 
-    enum AssetType: String, Decodable {
+    enum AssetType: String, Decodable, Equatable {
         case image = "IMAGE"
         case video = "VIDEO"
         case audio = "AUDIO"
         case other = "OTHER"
+
+        init(from decoder: Decoder) throws {
+            let raw = try decoder.singleValueContainer().decode(String.self)
+            self = AssetType(rawValue: raw) ?? .other
+        }
     }
 
     struct ExifInfo: Codable {
@@ -336,8 +341,13 @@ enum Immich {
         let ack: String
     }
 
-    enum AssetVisibility: String, Decodable {
-        case archive, timeline, hidden, locked
+    enum AssetVisibility: String, Decodable, Equatable {
+        case archive, timeline, hidden, locked, unknown
+
+        init(from decoder: Decoder) throws {
+            let raw = try decoder.singleValueContainer().decode(String.self)
+            self = AssetVisibility(rawValue: raw) ?? .unknown
+        }
     }
 
     struct SyncAssetV2: Decodable {
@@ -349,9 +359,8 @@ enum Immich {
         let fileCreatedAt: String?
         let fileModifiedAt: String?
         let localDateTime: String?
-        /// Milliseconds, nullable — unlike the mixed string/int `Duration` the old
-        /// `search/metadata` endpoint sends (see `Duration` above).
-        let duration: Int?
+        /// Accepts both integer milliseconds and `"H:MM:SS.sss"` strings.
+        let duration: Duration?
         let type: AssetType
         /// Non-nil once trashed; still present, not yet purged (D9).
         let deletedAt: String?
@@ -361,7 +370,7 @@ enum Immich {
         let height: Int?
 
         var checksumHex: String { Immich.normalizedChecksumHex(checksum) }
-        var durationSeconds: Double { Double(duration ?? 0) / 1000 }
+        var durationSeconds: Double { duration?.seconds ?? 0 }
     }
 
     /// A separate sync line from the asset it describes — may arrive before, after, or without
@@ -427,12 +436,30 @@ enum Immich {
     /// backfill would replay on every sync.
     struct SyncAcks {
         private var latestByCheckpoint: [String: String] = [:]
+        private var taintedCheckpoints: Set<String> = []
 
         mutating func record(_ ack: String) {
-            latestByCheckpoint[String(ack.prefix { $0 != "|" })] = ack
+            let checkpoint = Self.checkpoint(of: ack)
+            guard !taintedCheckpoints.contains(checkpoint) else { return }
+            latestByCheckpoint[checkpoint] = ack
+        }
+
+        /// Marks the checkpoint of `ack` as tainted so neither earlier nor later lines of that
+        /// checkpoint in this batch are acknowledged past a failed or deferred line.
+        mutating func taint(_ ack: String) {
+            taintCheckpoint(Self.checkpoint(of: ack))
+        }
+
+        mutating func taintCheckpoint(_ checkpoint: String) {
+            taintedCheckpoints.insert(checkpoint)
+            latestByCheckpoint.removeValue(forKey: checkpoint)
         }
 
         var all: [String] { Array(latestByCheckpoint.values) }
+
+        private static func checkpoint(of ack: String) -> String {
+            String(ack.prefix { $0 != "|" })
+        }
     }
 
     // MARK: - Mutations
@@ -495,12 +522,19 @@ enum Immich {
         return data.map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Immich emits ISO-8601 with and without fractional seconds depending on the field.
+    /// Immich emits ISO-8601 with and without fractional seconds, and `localDateTime` can arrive
+    /// without a timezone designator. Uses thread-safe `Date.ISO8601FormatStyle` value types.
     static func parseDate(_ string: String?) -> Date? {
         guard let string, !string.isEmpty else { return nil }
-        if let date = iso8601WithFraction.date(from: string) { return date }
-        if let date = iso8601.date(from: string) { return date }
-        return plainDateTime.date(from: string)
+        let withFraction = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+        if let date = try? withFraction.parse(string) { return date }
+        let withoutFraction = Date.ISO8601FormatStyle(includingFractionalSeconds: false)
+        if let date = try? withoutFraction.parse(string) { return date }
+        // `localDateTime` can arrive without a zone designator (with or without fractional
+        // seconds), interpreted as UTC wall-clock time.
+        let utcCandidate = string + "Z"
+        if let date = try? withFraction.parse(utcCandidate) { return date }
+        return try? withoutFraction.parse(utcCandidate)
     }
 
     /// "0:01:23.500" → 83.5
@@ -513,29 +547,8 @@ enum Immich {
         }
     }
 
-    private static let iso8601WithFraction: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f
-    }()
-
-    private static let iso8601: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        return f
-    }()
-
-    /// `localDateTime` can arrive without a zone designator.
-    private static let plainDateTime: DateFormatter = {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.timeZone = TimeZone(secondsFromGMT: 0)
-        f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSS"
-        return f
-    }()
-
     static func iso8601String(from date: Date) -> String {
-        iso8601WithFraction.string(from: date)
+        Date.ISO8601FormatStyle(includingFractionalSeconds: true).format(date)
     }
 
     /// ISO 8601 with a numeric offset, e.g. "2026-08-18T10:00:00.000+11:00". Immich derives

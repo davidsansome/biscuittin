@@ -112,7 +112,7 @@ enum ImmichServerProbe {
     }
 
     static func probe(candidate: URL, session: URLSession = .shared) async throws -> ImmichServerInfo {
-        let base = await resolveWellKnown(candidate, session: session) ?? candidate
+        let base = try await resolveWellKnown(candidate, session: session) ?? candidate
         let client = ImmichClient(baseURL: base, session: session, credentialProvider: { nil })
 
         do {
@@ -141,12 +141,23 @@ enum ImmichServerProbe {
 
     /// Follows `/.well-known/immich` when the server publishes it. Absence is normal — it is
     /// served by Immich's web frontend, which not every deployment exposes at the root.
-    static func resolveWellKnown(_ candidate: URL, session: URLSession) async -> URL? {
+    /// Transport errors and cancellation are propagated so a firewalled host fails in one timeout.
+    static func resolveWellKnown(_ candidate: URL, session: URLSession) async throws -> URL? {
         var request = URLRequest(url: candidate.appendingPathComponent(".well-known/immich"),
                                  timeoutInterval: 10)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        guard let (data, response) = try? await session.data(for: request),
-              (response as? HTTPURLResponse)?.statusCode == 200,
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch let error as URLError where error.code == .cancelled {
+            throw CancellationError()
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw ImmichError.unreachable
+        }
+        guard (response as? HTTPURLResponse)?.statusCode == 200,
               let wellKnown = try? JSONDecoder().decode(Immich.WellKnown.self, from: data) else {
             return nil
         }

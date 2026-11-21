@@ -15,10 +15,11 @@ final class RemoteImageFetcher: RemoteImageFetching, @unchecked Sendable {
     private let session: ImmichAuthSession
     private let cache: RemoteThumbnailCache
     private let clientFactory: @Sendable (URL) -> ImmichClient
-    private let onCredentialRejected: @Sendable () -> Void
+    private let onCredentialRejected: @Sendable (ImmichCredential?) -> Void
 
     private let lock = NSLock()
     private var credentialCheck: Task<Void, Never>?
+    private var inFlight: [String: Task<UIImage, Error>] = [:]
 
     init(session: ImmichAuthSession,
          cache: RemoteThumbnailCache,
@@ -29,42 +30,73 @@ final class RemoteImageFetcher: RemoteImageFetching, @unchecked Sendable {
         self.clientFactory = clientFactory ?? { url in
             ImmichClient(baseURL: url, credentialProvider: { session.credential })
         }
-        self.onCredentialRejected = onCredentialRejected ?? { session.markExpired() }
+        if let onCredentialRejected {
+            self.onCredentialRejected = { _ in onCredentialRejected() }
+        } else {
+            self.onCredentialRejected = { rejected in
+                session.markExpired(ifCredentialMatches: rejected)
+            }
+        }
     }
 
+    /// Strictly memory-only so main-thread callers never perform disk I/O.
     func cachedImage(immichID: String, variant: ImageVariant) -> UIImage? {
-        cache.image(for: RemoteThumbnailCache.key(immichID: immichID,
-                                                  variant: Self.variantKey(variant)))
+        cache.memoryImage(for: Self.memoryKey(immichID: immichID, variant: variant))
     }
 
     func image(immichID: String, variant: ImageVariant) async throws -> UIImage {
-        let key = RemoteThumbnailCache.key(immichID: immichID, variant: Self.variantKey(variant))
-        if let cached = cache.image(for: key) { return cached }
+        let memoryKey = Self.memoryKey(immichID: immichID, variant: variant)
+        if let cached = cache.memoryImage(for: memoryKey) { return cached }
 
-        guard let baseURL = session.baseURL, session.credential != nil else {
-            throw ImmichError.notConfigured
-        }
-        let client = clientFactory(baseURL)
+        let diskKey = Self.diskKey(immichID: immichID, variant: variant)
+        let maxPixelSize = Self.maxPixelSize(variant)
 
-        let data: Data
-        do {
-            switch variant {
-            case .gridThumb:
-                data = try await client.thumbnailData(id: immichID, size: .thumbnail)
-            case .viewerPreview:
-                data = try await client.thumbnailData(id: immichID, size: .preview)
-            case .fullResolution:
-                data = try await client.originalData(id: immichID)
+        let task: Task<UIImage, Error> = lock.withLock {
+            if let existing = inFlight[memoryKey] { return existing }
+            let created = Task<UIImage, Error> { [self] in
+                if let fromDisk = cache.diskImage(for: diskKey, memoryKey: memoryKey,
+                                                  downsamplingTo: maxPixelSize) {
+                    return fromDisk
+                }
+
+                guard let baseURL = session.baseURL, let credential = session.credential else {
+                    throw ImmichError.notConfigured
+                }
+                let client = clientFactory(baseURL)
+
+                let data: Data
+                do {
+                    switch variant {
+                    case .gridThumb:
+                        data = try await client.thumbnailData(id: immichID, size: .thumbnail)
+                    case .viewerPreview:
+                        data = try await client.thumbnailData(id: immichID, size: .preview)
+                    case .fullResolution:
+                        data = try await client.originalData(id: immichID)
+                    }
+                } catch ImmichError.unauthorized {
+                    await confirmCredentialRejected(using: client, rejectedCredential: credential)
+                    throw ImmichError.unauthorized
+                }
+
+                guard let image = cache.store(data, diskKey: diskKey, memoryKey: memoryKey,
+                                              downsamplingTo: maxPixelSize) else {
+                    throw ImmichError.decoding("thumbnail was not a decodable image")
+                }
+                return image
             }
-        } catch ImmichError.unauthorized {
-            await confirmCredentialRejected(using: client)
-            throw ImmichError.unauthorized
+            inFlight[memoryKey] = created
+            return created
         }
 
-        guard let image = cache.store(data, for: key, downsamplingTo: Self.maxPixelSize(variant)) else {
-            throw ImmichError.decoding("thumbnail was not a decodable image")
+        defer {
+            lock.withLock {
+                if inFlight[memoryKey] == task {
+                    inFlight.removeValue(forKey: memoryKey)
+                }
+            }
         }
-        return image
+        return try await task.value
     }
 
     /// Expires the session only once an account-level call is refused too.
@@ -74,14 +106,15 @@ final class RemoteImageFetcher: RemoteImageFetching, @unchecked Sendable {
     /// because `ImmichClient` reports 401 and 403 alike, and an asset endpoint can refuse one
     /// asset — an API key without `asset.view` — while the credential itself is fine; expiring
     /// on that would delete a working key. Concurrent failures share one check.
-    func confirmCredentialRejected(using client: ImmichClient) async {
+    func confirmCredentialRejected(using client: ImmichClient,
+                                   rejectedCredential: ImmichCredential? = nil) async {
         let check: Task<Void, Never> = lock.withLock {
             if let credentialCheck { return credentialCheck }
             let task = Task { [onCredentialRejected] in
                 do {
                     _ = try await client.me()
                 } catch ImmichError.unauthorized {
-                    onCredentialRejected()
+                    onCredentialRejected(rejectedCredential)
                 } catch {}
             }
             credentialCheck = task
@@ -94,9 +127,25 @@ final class RemoteImageFetcher: RemoteImageFetching, @unchecked Sendable {
     }
 
     func clearCache() { cache.removeAll() }
-    func cacheSize() -> Int { cache.currentDiskSize() }
 
-    private static func variantKey(_ variant: ImageVariant) -> String {
+    static func diskKey(immichID: String, variant: ImageVariant) -> String {
+        RemoteThumbnailCache.key(immichID: immichID, variant: diskVariantKey(variant))
+    }
+
+    static func memoryKey(immichID: String, variant: ImageVariant) -> String {
+        switch variant {
+        case let .gridThumb(pointSize, scale):
+            let raw = max(pointSize.width, pointSize.height) * scale
+            let bucket = max(64, Int((raw / 64).rounded(.up)) * 64)
+            return RemoteThumbnailCache.key(immichID: immichID, variant: "thumb@\(bucket)")
+        case .viewerPreview:
+            return RemoteThumbnailCache.key(immichID: immichID, variant: "preview")
+        case .fullResolution:
+            return RemoteThumbnailCache.key(immichID: immichID, variant: "original")
+        }
+    }
+
+    private static func diskVariantKey(_ variant: ImageVariant) -> String {
         switch variant {
         case .gridThumb: return "thumb"
         case .viewerPreview: return "preview"

@@ -156,13 +156,25 @@ actor ImmichClient {
         try await data(path: "/api/assets/\(id)/original")
     }
 
-    /// Built, not executed: handed to `AVURLAsset` so the player streams directly (§10.1).
-    func videoPlaybackRequest(id: String) async throws -> URLRequest {
-        var request = try makeRequest(path: "/api/assets/\(id)/video/playback",
-                                      method: "GET",
+    /// Streams an original asset directly to `destination` so multi-gigabyte videos never sit in RAM.
+    func downloadOriginal(id: String, to destination: URL) async throws {
+        var request = try makeRequest(path: "/api/assets/\(id)/original", method: "GET",
                                       timeout: Self.binaryTimeout)
         await applyCredential(to: &request)
-        return request
+        let tempURL: URL
+        let response: URLResponse
+        do {
+            (tempURL, response) = try await session.download(for: request)
+        } catch {
+            throw Self.mapTransportError(error)
+        }
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            let body = (try? Data(contentsOf: tempURL)) ?? Data()
+            if let error = Self.error(forStatus: http.statusCode, body: body) { throw error }
+        }
+        try? FileManager.default.removeItem(at: destination)
+        try FileManager.default.moveItem(at: tempURL, to: destination)
     }
 
     /// Headers `AVURLAsset` needs to authenticate its own range requests.
@@ -246,43 +258,29 @@ actor ImmichClient {
                            fileCreatedAt: Date,
                            fileModifiedAt: Date) async throws -> ReplacementUpload {
         let checksum = try Self.sha1Hex(ofFileAt: fileURL)
-
-        var request = try makeRequest(path: "/api/assets", method: "POST",
-                                      timeout: Self.binaryTimeout)
-        await applyCredential(to: &request)
-        request.setValue(checksum, forHTTPHeaderField: "x-immich-checksum")
-
-        let boundary = "BiscuitTin-\(UUID().uuidString)"
-        request.setValue("multipart/form-data; boundary=\(boundary)",
-                         forHTTPHeaderField: "Content-Type")
-
-        let bodyURL = try MultipartBuilder.buildBody(
-            boundary: boundary,
-            fields: [
-                "deviceAssetId": "rotated-\(UUID().uuidString)",
-                "deviceId": deviceID,
-                "fileCreatedAt": Immich.iso8601String(from: fileCreatedAt),
-                "fileModifiedAt": Immich.iso8601String(from: fileModifiedAt),
-                "isFavorite": "false",
-                "filename": filename
-            ],
-            fileField: "assetData",
+        let (request, bodyURL) = try await makeUploadRequest(
             fileURL: fileURL,
-            filename: filename)
+            deviceAssetId: "rotated-\(UUID().uuidString)",
+            deviceId: deviceID,
+            fileCreatedAt: fileCreatedAt,
+            fileModifiedAt: fileModifiedAt,
+            filename: filename,
+            checksumHex: checksum,
+            isFavorite: false)
         defer { try? FileManager.default.removeItem(at: bodyURL) }
 
-        let (data, response) = try await session.upload(for: request, fromFile: bodyURL)
-        guard let http = response as? HTTPURLResponse else { throw ImmichError.unreachable }
-        switch http.statusCode {
-        case 200..<300:
-            let decoded = try JSONDecoder().decode(Immich.UploadResponse.self, from: data)
-            return ReplacementUpload(id: decoded.id, isDuplicate: decoded.status == "duplicate",
-                                     checksumHex: checksum)
-        case 401, 403:
-            throw ImmichError.unauthorized
-        default:
-            throw ImmichError.http(status: http.statusCode)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.upload(for: request, fromFile: bodyURL)
+        } catch {
+            throw Self.mapTransportError(error)
         }
+        guard let http = response as? HTTPURLResponse else { throw ImmichError.unreachable }
+        if let error = Self.error(forStatus: http.statusCode, body: data) { throw error }
+        let decoded: Immich.UploadResponse = try decode(data)
+        return ReplacementUpload(id: decoded.id, isDuplicate: decoded.status == "duplicate",
+                                 checksumHex: checksum)
     }
 
     /// Forces an asset's capture date.
@@ -457,29 +455,131 @@ struct NDJSONLineSplitter {
     private static let newline = UInt8(ascii: "\n")
 }
 
-/// Feeds a data task's body to an `AsyncThrowingStream` as complete lines.
+/// Feeds a data task's body to an `AsyncThrowingStream` as complete lines, with bounded
+/// backpressure: suspends `dataTask` once buffered bytes exceed `highWaterBytes` and resumes it
+/// once the consumer drains below `lowWaterBytes`, so fast LAN 100k+ syncs cannot buffer
+/// unboundedly in RAM.
 ///
 /// A per-task delegate rather than `URLSession.bytes(for:)`: that yields one byte per
 /// iteration, which is far too slow for a body that can run past a hundred megabytes.
 private final class LineStreamDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
-    // URLSession calls one task's delegate methods serially, so this state needs no lock.
-    private let continuation: AsyncThrowingStream<[Data], Error>.Continuation
+    private static let highWaterBytes = 4 * 1024 * 1024
+    private static let lowWaterBytes = 1 * 1024 * 1024
+
+    private struct Batch {
+        let lines: [Data]
+        let bytes: Int
+    }
+
+    private enum NextAction {
+        case yield([Data], resumeTask: Bool)
+        case throwError(Error)
+        case finish
+        case waiting
+    }
+
+    private final class StreamLifetimeToken: Sendable {
+        private let onDeinit: @Sendable () -> Void
+        init(_ onDeinit: @escaping @Sendable () -> Void) { self.onDeinit = onDeinit }
+        deinit { onDeinit() }
+    }
+
+    // URLSession calls one task's delegate methods serially; `splitter`, `status`, and `errorBody`
+    // are touched only on the delegate queue.
     private var splitter = NDJSONLineSplitter()
     private var status: Int?
     /// The body of a failure response, kept whole for `ImmichClient.error(forStatus:body:)`.
     private var errorBody = Data()
 
-    private init(continuation: AsyncThrowingStream<[Data], Error>.Continuation) {
-        self.continuation = continuation
-    }
+    // Shared between the delegate queue and the stream consumer; guarded by `lock`.
+    private let lock = NSLock()
+    private var queue: [Batch] = []
+    private var head = 0
+    private var bufferedBytes = 0
+    private var isSuspended = false
+    private var finished = false
+    private var cancelled = false
+    private var failure: Error?
+    private var waiter: CheckedContinuation<[Data]?, Error>?
+    private weak var task: URLSessionDataTask?
 
     static func lines(for request: URLRequest, session: URLSession) -> AsyncThrowingStream<[Data], Error> {
-        AsyncThrowingStream { continuation in
-            let task = session.dataTask(with: request)
-            task.delegate = LineStreamDelegate(continuation: continuation)
-            continuation.onTermination = { _ in task.cancel() }
-            task.resume()
+        let delegate = LineStreamDelegate()
+        let task = session.dataTask(with: request)
+        delegate.lock.withLock { delegate.task = task }
+        task.delegate = delegate
+        task.resume()
+
+        // Capturing `token` solely in the unfolding closure ensures breaking out of `for try await`
+        // early cancels the underlying URLSessionDataTask once the stream is released.
+        let token = StreamLifetimeToken { delegate.cancel() }
+        return AsyncThrowingStream {
+            _ = token
+            return try await delegate.next()
         }
+    }
+
+    func next() async throws -> [Data]? {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let action: NextAction = lock.withLock {
+                    if cancelled {
+                        return .throwError(CancellationError())
+                    }
+                    if head < queue.count {
+                        let item = queue[head]
+                        head += 1
+                        bufferedBytes -= item.bytes
+                        if head >= 64 && head * 2 >= queue.count {
+                            queue.removeFirst(head)
+                            head = 0
+                        }
+                        var shouldResume = false
+                        if isSuspended && bufferedBytes <= Self.lowWaterBytes && !finished {
+                            isSuspended = false
+                            shouldResume = true
+                        }
+                        return .yield(item.lines, resumeTask: shouldResume)
+                    }
+                    if finished {
+                        if let failure { return .throwError(failure) }
+                        return .finish
+                    }
+                    waiter = continuation
+                    return .waiting
+                }
+                switch action {
+                case let .yield(lines, resumeTask):
+                    if resumeTask { task?.resume() }
+                    continuation.resume(returning: lines)
+                case let .throwError(error):
+                    continuation.resume(throwing: error)
+                case .finish:
+                    continuation.resume(returning: nil)
+                case .waiting:
+                    break
+                }
+            }
+        } onCancel: {
+            self.cancel()
+        }
+    }
+
+    func cancel() {
+        let (waiterToResume, taskToCancel): (CheckedContinuation<[Data]?, Error>?, URLSessionDataTask?) =
+            lock.withLock {
+                guard !cancelled else { return (nil, nil) }
+                cancelled = true
+                finished = true
+                queue.removeAll()
+                head = 0
+                bufferedBytes = 0
+                let w = waiter
+                waiter = nil
+                return (w, task)
+            }
+        taskToCancel?.cancel()
+        waiterToResume?.resume(throwing: CancellationError())
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
@@ -494,19 +594,68 @@ private final class LineStreamDelegate: NSObject, URLSessionDataDelegate, @unche
             return
         }
         let lines = splitter.append(data)
-        if !lines.isEmpty { continuation.yield(lines) }
+        guard !lines.isEmpty else { return }
+        enqueue(lines, dataTask: dataTask)
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        let finalError: Error?
+        var trailingLines: [Data] = []
         if let error {
-            continuation.finish(throwing: ImmichClient.mapTransportError(error))
+            finalError = ImmichClient.mapTransportError(error)
         } else if let status, let failure = ImmichClient.error(forStatus: status, body: errorBody) {
-            continuation.finish(throwing: failure)
+            finalError = failure
         } else {
-            let rest = splitter.finish()
-            if !rest.isEmpty { continuation.yield(rest) }
-            continuation.finish()
+            finalError = nil
+            trailingLines = splitter.finish()
         }
+
+        let resumeAction: (CheckedContinuation<[Data]?, Error>?, Result<[Data]?, Error>?) = lock.withLock {
+            guard !cancelled else { return (nil, nil) }
+            if !trailingLines.isEmpty {
+                let bytes = trailingLines.reduce(0) { $0 + $1.count }
+                queue.append(Batch(lines: trailingLines, bytes: bytes))
+                bufferedBytes += bytes
+            }
+            finished = true
+            failure = finalError
+
+            guard let w = waiter else { return (nil, nil) }
+            waiter = nil
+            if head < queue.count {
+                let item = queue[head]
+                head += 1
+                bufferedBytes -= item.bytes
+                return (w, .success(item.lines))
+            }
+            if let finalError {
+                return (w, .failure(finalError))
+            }
+            return (w, .success(nil))
+        }
+        if let w = resumeAction.0, let result = resumeAction.1 {
+            w.resume(with: result)
+        }
+    }
+
+    private func enqueue(_ lines: [Data], dataTask: URLSessionDataTask) {
+        let bytes = lines.reduce(0) { $0 + $1.count }
+        let (waiterToResume, shouldSuspend): (CheckedContinuation<[Data]?, Error>?, Bool) = lock.withLock {
+            guard !cancelled, !finished else { return (nil, false) }
+            if let w = waiter {
+                waiter = nil
+                return (w, false)
+            }
+            queue.append(Batch(lines: lines, bytes: bytes))
+            bufferedBytes += bytes
+            if bufferedBytes >= Self.highWaterBytes && !isSuspended {
+                isSuspended = true
+                return (nil, true)
+            }
+            return (nil, false)
+        }
+        if shouldSuspend { dataTask.suspend() }
+        waiterToResume?.resume(returning: lines)
     }
 
     private var isSuccess: Bool { status.map { (200..<300).contains($0) } ?? true }
@@ -524,33 +673,47 @@ enum MultipartBuilder {
             .appendingPathComponent("upload-\(UUID().uuidString).multipart")
         FileManager.default.createFile(atPath: outputURL.path, contents: nil)
 
-        guard let handle = try? FileHandle(forWritingTo: outputURL) else {
-            throw ImmichError.invalidURL
-        }
-        defer { try? handle.close() }
+        do {
+            guard let handle = try? FileHandle(forWritingTo: outputURL) else {
+                throw ImmichError.invalidURL
+            }
+            defer { try? handle.close() }
 
-        func write(_ string: String) throws {
-            try handle.write(contentsOf: Data(string.utf8))
-        }
+            func write(_ string: String) throws {
+                try handle.write(contentsOf: Data(string.utf8))
+            }
 
-        for (name, value) in fields.sorted(by: { $0.key < $1.key }) {
+            for (name, value) in fields.sorted(by: { $0.key < $1.key }) {
+                try write("--\(boundary)\r\n")
+                try write("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n")
+                try write("\(value)\r\n")
+            }
+
+            let safeFilename = sanitizeFilename(filename)
             try write("--\(boundary)\r\n")
-            try write("Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n")
-            try write("\(value)\r\n")
+            try write("Content-Disposition: form-data; name=\"\(fileField)\"; filename=\"\(safeFilename)\"\r\n")
+            try write("Content-Type: application/octet-stream\r\n\r\n")
+
+            // Copy in chunks: originals can be multi-gigabyte videos.
+            let input = try FileHandle(forReadingFrom: fileURL)
+            defer { try? input.close() }
+            while let chunk = try input.read(upToCount: 1024 * 1024), !chunk.isEmpty {
+                try handle.write(contentsOf: chunk)
+            }
+
+            try write("\r\n--\(boundary)--\r\n")
+            return outputURL
+        } catch {
+            try? FileManager.default.removeItem(at: outputURL)
+            throw error
         }
+    }
 
-        try write("--\(boundary)\r\n")
-        try write("Content-Disposition: form-data; name=\"\(fileField)\"; filename=\"\(filename)\"\r\n")
-        try write("Content-Type: application/octet-stream\r\n\r\n")
-
-        // Copy in chunks: originals can be multi-gigabyte videos.
-        let input = try FileHandle(forReadingFrom: fileURL)
-        defer { try? input.close() }
-        while let chunk = try input.read(upToCount: 1024 * 1024), !chunk.isEmpty {
-            try handle.write(contentsOf: chunk)
-        }
-
-        try write("\r\n--\(boundary)--\r\n")
-        return outputURL
+    private static func sanitizeFilename(_ filename: String) -> String {
+        filename
+            .replacingOccurrences(of: "\r", with: "")
+            .replacingOccurrences(of: "\n", with: "")
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
     }
 }

@@ -30,9 +30,13 @@ final class ImmichAuthSession: @unchecked Sendable {
     private let defaults: UserDefaults
     private let lock = NSLock()
     private var cachedState: State
+    private var _onStateChange: ((State) -> Void)?
 
     /// Fires whenever sign-in state changes, so the UI and sync engine can react.
-    var onStateChange: ((State) -> Void)?
+    var onStateChange: ((State) -> Void)? {
+        get { lock.withLock { _onStateChange } }
+        set { lock.withLock { _onStateChange = newValue } }
+    }
 
     /// Posted on every state change, for the several screens that show an expired session.
     /// It can be posted from any thread: a 401 is noticed wherever the request ran.
@@ -51,12 +55,13 @@ final class ImmichAuthSession: @unchecked Sendable {
     // MARK: - State
 
     var state: State {
-        lock.lock(); defer { lock.unlock() }
-        return cachedState
+        lock.withLock { cachedState }
     }
 
     var isConfigured: Bool {
-        baseURL != nil && Keychain.get(Key.token) != nil
+        lock.withLock {
+            defaults.string(forKey: Key.baseURL) != nil && Keychain.get(Key.token) != nil
+        }
     }
 
     var baseURL: URL? {
@@ -73,20 +78,28 @@ final class ImmichAuthSession: @unchecked Sendable {
     }
 
     var credential: ImmichCredential? {
-        guard let secret = Keychain.get(Key.token) else { return nil }
-        return defaults.string(forKey: Key.credentialKind) == Key.apiKeyKind
-            ? .apiKey(secret) : .accessToken(secret)
+        lock.withLock { currentCredentialLocked() }
     }
 
-    var usesAPIKey: Bool { defaults.string(forKey: Key.credentialKind) == Key.apiKeyKind }
+    var usesAPIKey: Bool {
+        lock.withLock { defaults.string(forKey: Key.credentialKind) == Key.apiKeyKind }
+    }
 
     /// Stable per-install identifier sent with uploads, so our own uploads link back to their
     /// local asset without waiting for a checksum pass (D5).
     var deviceID: String {
-        if let existing = defaults.string(forKey: Key.deviceID) { return existing }
-        let generated = UUID().uuidString
-        defaults.set(generated, forKey: Key.deviceID)
-        return generated
+        lock.withLock {
+            if let existing = defaults.string(forKey: Key.deviceID) { return existing }
+            let generated = UUID().uuidString
+            defaults.set(generated, forKey: Key.deviceID)
+            return generated
+        }
+    }
+
+    private func currentCredentialLocked() -> ImmichCredential? {
+        guard let secret = Keychain.get(Key.token) else { return nil }
+        return defaults.string(forKey: Key.credentialKind) == Key.apiKeyKind
+            ? .apiKey(secret) : .accessToken(secret)
     }
 
     // MARK: - Sign in / out
@@ -170,47 +183,74 @@ final class ImmichAuthSession: @unchecked Sendable {
     }
 
     private func store(_ credential: ImmichCredential, email: String, server: ImmichServerInfo) {
-        switch credential {
-        case let .accessToken(token):
-            Keychain.set(token, for: Key.token)
-            defaults.removeObject(forKey: Key.credentialKind)
-        case let .apiKey(key):
-            Keychain.set(key, for: Key.token)
-            defaults.set(Key.apiKeyKind, forKey: Key.credentialKind)
+        let newState = State.signedIn(email: email, serverVersion: server.version.description)
+        let handler: ((State) -> Void)? = lock.withLock {
+            switch credential {
+            case let .accessToken(token):
+                Keychain.set(token, for: Key.token)
+                defaults.removeObject(forKey: Key.credentialKind)
+            case let .apiKey(key):
+                Keychain.set(key, for: Key.token)
+                defaults.set(Key.apiKeyKind, forKey: Key.credentialKind)
+            }
+            defaults.set(server.baseURL.absoluteString, forKey: Key.baseURL)
+            defaults.set(email, forKey: Key.email)
+            defaults.set(server.version.description, forKey: Key.serverVersion)
+            cachedState = newState
+            return _onStateChange
         }
-        defaults.set(server.baseURL.absoluteString, forKey: Key.baseURL)
-        defaults.set(email, forKey: Key.email)
-        defaults.set(server.version.description, forKey: Key.serverVersion)
-        updateState(.signedIn(email: email, serverVersion: server.version.description))
+        notifyStateChange(newState, handler: handler)
     }
 
     func signOut() {
-        Keychain.remove(Key.token)
-        defaults.removeObject(forKey: Key.credentialKind)
-        defaults.removeObject(forKey: Key.email)
-        defaults.removeObject(forKey: Key.serverVersion)
-        // The base URL is kept so the settings form stays pre-filled for the next sign-in.
-        updateState(.signedOut)
+        let handler: ((State) -> Void)? = lock.withLock {
+            clearCredentialsLocked(removeBaseURL: false)
+            cachedState = .signedOut
+            return _onStateChange
+        }
+        notifyStateChange(.signedOut, handler: handler)
     }
 
     /// Called when a request comes back 401: the token is dead and cannot be renewed without
     /// the password, which is never stored.
-    func markExpired() {
-        guard case .signedIn = state else { return }
-        Keychain.remove(Key.token)
-        updateState(.expired)
+    ///
+    /// When `rejected` is supplied, expiration only takes effect if the session still holds that
+    /// exact credential, preventing a stale 401 from wiping a newer sign-in.
+    func markExpired(ifCredentialMatches rejected: ImmichCredential? = nil) {
+        let result: (expired: Bool, handler: ((State) -> Void)?) = lock.withLock {
+            guard case .signedIn = cachedState else { return (false, nil) }
+            if let rejected, currentCredentialLocked() != rejected {
+                return (false, nil)
+            }
+            Keychain.remove(Key.token)
+            cachedState = .expired
+            return (true, _onStateChange)
+        }
+        guard result.expired else { return }
+        notifyStateChange(.expired, handler: result.handler)
     }
 
     func forgetServer() {
-        signOut()
-        defaults.removeObject(forKey: Key.baseURL)
+        let handler: ((State) -> Void)? = lock.withLock {
+            clearCredentialsLocked(removeBaseURL: true)
+            cachedState = .signedOut
+            return _onStateChange
+        }
+        notifyStateChange(.signedOut, handler: handler)
     }
 
-    private func updateState(_ new: State) {
-        lock.lock()
-        cachedState = new
-        lock.unlock()
-        onStateChange?(new)
+    private func clearCredentialsLocked(removeBaseURL: Bool) {
+        Keychain.remove(Key.token)
+        defaults.removeObject(forKey: Key.credentialKind)
+        defaults.removeObject(forKey: Key.email)
+        defaults.removeObject(forKey: Key.serverVersion)
+        if removeBaseURL {
+            defaults.removeObject(forKey: Key.baseURL)
+        }
+    }
+
+    private func notifyStateChange(_ new: State, handler: ((State) -> Void)?) {
+        handler?(new)
         NotificationCenter.default.post(name: Self.stateDidChangeNotification, object: self)
     }
 

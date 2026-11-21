@@ -156,13 +156,13 @@ struct RemoteAssetRecord: Codable, FetchableRecord, PersistableRecord, Equatable
 
     /// Overlays a `sync/stream` `AssetExifV1` line. Dimensions fill in only where `apply(_
     /// asset:)` had none (v3.1.0 reports them at the asset's top level too, which takes priority).
-    mutating func apply(_ exif: Immich.SyncAssetExifV1) {
+    mutating func apply(_ exif: Immich.SyncAssetExifV1, encoder: JSONEncoder = JSONEncoder()) {
         if width == nil { width = exif.exifImageWidth }
         if height == nil { height = exif.exifImageHeight }
         latitude = exif.latitude
         longitude = exif.longitude
         let info = Immich.ExifInfo(exif)
-        exifJSON = (try? JSONEncoder().encode(info)).flatMap { String(data: $0, encoding: .utf8) }
+        exifJSON = (try? encoder.encode(info)).flatMap { String(data: $0, encoding: .utf8) }
     }
 }
 
@@ -179,11 +179,4 @@ struct FacetLinkRecord: Codable, FetchableRecord, PersistableRecord, Equatable {
         case localIdentifier = "local_identifier"
         case immichID = "immich_id"
     }
-}
-
-/// Row in `kv` — sync cursors and small scalars.
-struct KeyValueRecord: Codable, FetchableRecord, PersistableRecord {
-    static let databaseTableName = "kv"
-    var key: String
-    var value: String?
 }
