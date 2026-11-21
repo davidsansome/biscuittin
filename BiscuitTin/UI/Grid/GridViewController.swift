@@ -23,52 +23,65 @@ final class GridViewController: UIViewController {
         case partner(Partner)
     }
 
-    private typealias DataSource = UICollectionViewDiffableDataSource<String, AssetID>
-    private typealias Snapshot = NSDiffableDataSourceSnapshot<String, AssetID>
+    typealias DataSource = UICollectionViewDiffableDataSource<String, AssetID>
+    typealias Snapshot = NSDiffableDataSourceSnapshot<String, AssetID>
 
-    private let env: AppEnvironment
-    private let mode: Mode
-    private var collectionView: UICollectionView!
-    private var dataSource: DataSource!
+    let env: AppEnvironment
+    let mode: Mode
+    var collectionView: UICollectionView!
+    var dataSource: DataSource!
     private var pinchController: PinchColumnsController
 
     /// The live, date-grouped timeline. Kept even while search results are on screen, so
     /// cancelling search restores instantly and snapshot updates keep flowing underneath.
-    private var timeline: TimelineSnapshot
+    var timeline: TimelineSnapshot {
+        didSet { fullStubsByIDCache = nil }
+    }
     /// Ranked search results, when a search is active. `displayed` is what the grid draws;
     /// everything that resolves an index path must go through it, not `timeline`.
-    private var searchResults: TimelineSnapshot?
+    var searchResults: TimelineSnapshot?
 
     /// What the collection view is currently showing.
-    private var displayed: TimelineSnapshot { searchResults ?? timeline }
+    var displayed: TimelineSnapshot { searchResults ?? timeline }
+
+    /// Lazily populated `[AssetID: AssetStub]` index over `fullTimeline`, invalidated whenever
+    /// `timeline` or `pendingFullTimeline` changes. Keeps search result hydration and selection
+    /// rotatability checks O(1) instead of scanning all buckets.
+    private var fullStubsByIDCache: [AssetID: AssetStub]?
+
+    /// Broadcasts live timeline snapshots to child/presented screens (like `MapViewController`)
+    /// so `GridViewController` stays the sole consumer of `TimelineStore.snapshots`.
+    let timelineUpdates = PassthroughSubject<TimelineSnapshot, Never>()
 
     /// The newest timeline from the store while its full snapshot is still being built off the
     /// main thread. `timeline` meanwhile holds whatever the collection view actually shows —
     /// a prefix of this, or the previous timeline — so everything resolving index paths stays
     /// consistent with the screen; anything that needs the whole library reads `fullTimeline`.
-    private var pendingFullTimeline: TimelineSnapshot?
+    var pendingFullTimeline: TimelineSnapshot? {
+        didSet { fullStubsByIDCache = nil }
+    }
     /// Bumped whenever `pendingFullTimeline` is replaced, so a finished build knows whether it
     /// is already stale.
-    private var pendingFullTimelineGeneration = 0
-    private var pendingPlaceholder = Placeholder.prefix
+    var pendingFullTimelineGeneration = 0
+    var pendingPlaceholder = Placeholder.prefix
     /// The item to keep in place on screen when the finished build replaces the grid.
-    private var pendingAnchor: ScrollAnchor?
-    private var fullBuildTask: Task<Void, Never>?
+    var pendingAnchor: ScrollAnchor?
+    var fullBuildTask: Task<Void, Never>?
 
     /// The newest timeline from the store while a patch to it is computed off the main thread
     /// (~105–150 ms at 70k items on an iPhone 13). `timeline` keeps describing what the data
     /// source shows until the patch lands.
-    private var patchTarget: TimelineSnapshot?
+    var patchTarget: TimelineSnapshot?
     /// Bumped whenever `patchTarget` is replaced, so a finished patch knows whether it is behind.
-    private var patchTargetVersion = 0
+    var patchTargetVersion = 0
     /// Bumped when anything else takes over the data source, so a patch computed against the
     /// old contents is dropped rather than applied over the new.
-    private var patchGeneration = 0
-    private var patchTask: Task<Void, Never>?
-    private var fullTimeline: TimelineSnapshot { pendingFullTimeline ?? timeline }
+    var patchGeneration = 0
+    var patchTask: Task<Void, Never>?
+    var fullTimeline: TimelineSnapshot { pendingFullTimeline ?? timeline }
 
     /// What the grid shows while a full snapshot builds in the background.
-    private enum Placeholder {
+    enum Placeholder {
         /// The newest items of the target, kept live. Used when there is nothing sensible
         /// already on screen: first paint, and leaving search.
         case prefix
@@ -77,7 +90,7 @@ final class GridViewController: UIViewController {
         case current
     }
 
-    private struct ScrollAnchor {
+    struct ScrollAnchor {
         let id: AssetID
         /// The item's top edge relative to the visible top of the collection view.
         let offsetFromTop: CGFloat
@@ -86,21 +99,23 @@ final class GridViewController: UIViewController {
     /// Item count above which a full snapshot is built in the background rather than on the
     /// main thread, and the size of the prefix shown meanwhile. Building one costs ~40 µs per
     /// item across many sections (see `patch`), so this is a few screens' worth.
-    private static let backgroundBuildThreshold = 1_000
+    static let backgroundBuildThreshold = 1_000
 
     /// The timeline's snapshot as it stood when search took over the screen, so leaving search
-    /// is a patch rather than a rebuild.
-    private var timelineSnapshotBeforeSearch: Snapshot?
+    /// is a fast restore or background patch rather than a rebuild.
+    var timelineSnapshotBeforeSearch: Snapshot?
+    var timelineChangedDuringSearch = false
 
     private var columns: Int
-    private var snapshotTask: Task<Void, Never>?
+    var snapshotTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
     private var hasSignalledFirstFrame = false
 
-    private let selection = SelectionController()
+    let selection = SelectionController()
     private let selectionToolbar = SelectionToolbar()
     private var selectionToolbarBottom: NSLayoutConstraint?
-    private var defaultRightBarButtonItem: UIBarButtonItem?
+    private var isPerformingAction = false
+    var defaultRightBarButtonItem: UIBarButtonItem?
     private var mapBarButtonItem: UIBarButtonItem?
     /// Shown only while someone shares a library with the user (§22), so it costs nothing to
     /// everyone else.
@@ -109,7 +124,11 @@ final class GridViewController: UIViewController {
     private var partnersTask: Task<Void, Never>?
     /// Whether the first snapshot has arrived, so an empty partner library is not reported as
     /// empty before it has been read.
-    private var hasReceivedSnapshot = false
+    var hasReceivedSnapshot = false
+
+    private var desiredIndexingPaused = false
+    private var appliedIndexingPaused = false
+    private var indexingPauseTask: Task<Void, Never>?
 
     private let dateScrubber = DateScrubber()
 
@@ -241,11 +260,23 @@ final class GridViewController: UIViewController {
         observePartners()
     }
 
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        setIndexingPaused(false)
+    }
+
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
-        env.imageLoader.updateScreenMetrics(scale: view.window?.screen.scale ?? traitCollection.displayScale,
+        env.imageLoader.updateScreenMetrics(scale: view.window?.screen.scale ?? effectiveDisplayScale,
                                             size: view.bounds.size)
         updateScrubberVisibility()
+    }
+
+    override func viewSafeAreaInsetsDidChange() {
+        super.viewSafeAreaInsetsDidChange()
+        if selection.isActive {
+            updateSelectionInsets()
+        }
     }
 
     // MARK: - Setup
@@ -289,11 +320,7 @@ final class GridViewController: UIViewController {
                                                           for: indexPath)
             guard let self, let cell = cell as? AssetCell else { return cell }
             guard let stub = self.stub(at: indexPath, expecting: itemID) else { return cell }
-            cell.configure(stub: stub,
-                           loader: self.env.imageLoader,
-                           tileSize: self.currentTileSize(),
-                           isSelected: self.selection.isActive && self.selection.contains(stub.id),
-                           showsCloudBadge: !self.isPartnerLibrary)
+            self.configure(cell, with: stub)
             return cell
         }
 
@@ -407,11 +434,13 @@ final class GridViewController: UIViewController {
         // An expired session has its own notice in the nav bar, and nothing uploads until it
         // is renewed, so progress here would only be stale.
         let text = env.immichSession.state == .expired ? nil : status.infoBarText
-        if let text, let count = status.progressText {
+        if text != nil, let count = status.progressText {
             backupInfoBar.configure(title: status.stateTitle, rate: status.rateText, count: count,
                                     symbol: status.infoBarSymbol, progress: status.progress)
+            setBackupInfoBarVisible(true)
+        } else {
+            setBackupInfoBarVisible(false)
         }
-        setBackupInfoBarVisible(text != nil)
     }
 
     private func setBackupInfoBarVisible(_ visible: Bool) {
@@ -501,7 +530,7 @@ final class GridViewController: UIViewController {
     /// Full screen: the map owns the whole window, and its own close button dismisses it
     /// (§20.2). A sheet would put a second dismissal affordance next to that one.
     @objc private func presentMap() {
-        let map = MapViewController(env: env)
+        let map = MapViewController(env: env, timelineUpdates: timelineUpdates.eraseToAnyPublisher())
         map.modalPresentationStyle = .fullScreen
         present(map, animated: true)
     }
@@ -566,8 +595,7 @@ final class GridViewController: UIViewController {
         searchController = controller
 
         searchSession.stubProvider = { [weak self] id in
-            guard let self, let indexPath = self.fullTimeline.indexPath(of: id) else { return nil }
-            return self.fullTimeline.stub(at: indexPath)
+            self?.fullStubsByID()[id]
         }
         searchSession.onResults = { [weak self] results in
             self?.showSearchResults(results)
@@ -579,11 +607,13 @@ final class GridViewController: UIViewController {
         if results == nil, searchResults == nil { return }
         if searchResults == nil, results != nil, pendingFullTimeline == nil {
             timelineSnapshotBeforeSearch = dataSource.snapshot()
+            timelineChangedDuringSearch = false
         }
         if results != nil, let target = patchTarget {
             // Search takes the screen; leaving it patches the saved snapshot to the newest timeline.
             dropPendingPatch()
             timeline = target
+            timelineChangedDuringSearch = true
         }
         searchResults = results
         // A selection carried from the timeline into a result set (or back) would act on items
@@ -593,36 +623,11 @@ final class GridViewController: UIViewController {
             showTimelineAfterSearch()
         } else {
             applyDisplayedSnapshot(reloading: true)
-            collectionView.setContentOffset(.zero, animated: false)
+            collectionView.setContentOffset(CGPoint(x: 0, y: -collectionView.adjustedContentInset.top),
+                                            animated: false)
         }
         updateStatusViews()
         updateScrubberVisibility()
-    }
-
-    private func showTimelineAfterSearch() {
-        let saved = timelineSnapshotBeforeSearch
-        timelineSnapshotBeforeSearch = nil
-        // A build still running keeps going; its placeholder just needs putting back.
-        if let pending = pendingFullTimeline {
-            timeline = pending.prefix(maxItems: Self.backgroundBuildThreshold)
-            pendingPlaceholder = .prefix
-            pendingAnchor = nil
-            applyDisplayedSnapshot(reloading: true)
-            return
-        }
-        if let saved, let patch = Self.patch(saved, to: timeline) {
-            var snapshot = patch.snapshot
-            let reconfigurable = timeline.reconfiguredIDs.filter { snapshot.indexOfItem($0) != nil }
-            if !reconfigurable.isEmpty { snapshot.reconfigureItems(reconfigurable) }
-            dataSource.applySnapshotUsingReloadData(snapshot)
-            retainSelection(in: timeline)
-            return
-        }
-        if timeline.totalCount > Self.backgroundBuildThreshold {
-            beginBackgroundBuild(of: timeline, placeholder: .prefix)
-        } else {
-            applyDisplayedSnapshot(reloading: true)
-        }
     }
 
     // MARK: - Date scrubber (fast-scroll index)
@@ -636,7 +641,9 @@ final class GridViewController: UIViewController {
             dateScrubber.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
             dateScrubber.widthAnchor.constraint(equalToConstant: DateScrubber.hitTargetWidth)
         ])
+        dateScrubber.onScrubBegin = { [weak self] in self?.setIndexingPaused(true) }
         dateScrubber.onScrub = { [weak self] fraction in self?.scrub(toFraction: fraction) }
+        dateScrubber.onScrubEnd = { [weak self] in self?.setIndexingPaused(false) }
     }
 
     /// Total scrollable distance, accounting for content insets — 0 (or negative) when
@@ -654,7 +661,7 @@ final class GridViewController: UIViewController {
         return max(0, min(1, offset / scrollable))
     }
 
-    private func updateScrubberVisibility() {
+    func updateScrubberVisibility() {
         // Search results are ranked by relevance, not date, so a date scrubber over them would
         // be lying about what it scrolls to.
         dateScrubber.isHidden = selection.isActive
@@ -672,6 +679,7 @@ final class GridViewController: UIViewController {
         guard scrollable > 0 else { return nil }
         let y = fraction * scrollable - collectionView.adjustedContentInset.top
         collectionView.setContentOffset(CGPoint(x: 0, y: y), animated: false)
+        collectionView.layoutIfNeeded()
         return topmostVisibleBucketTitle()
     }
 
@@ -706,25 +714,42 @@ final class GridViewController: UIViewController {
         selectionToolbar.update(selectionCount: selection.count,
                                 canRotateAny: selectionContainsRotatable())
 
-        let height = SelectionToolbar.contentHeight + view.safeAreaInsets.bottom
-        selectionToolbarBottom?.constant = active ? -height : 0
-        collectionView.contentInset.bottom = active ? height : 0
-        collectionView.verticalScrollIndicatorInsets.bottom = active ? height : 0
+        updateSelectionInsets()
 
         UIView.animate(withDuration: 0.22) { self.view.layoutIfNeeded() }
         refreshSelectionAppearance()
         updateScrubberVisibility()
     }
 
+    private func updateSelectionInsets() {
+        let active = selection.isActive
+        let height = SelectionToolbar.contentHeight + view.safeAreaInsets.bottom
+        selectionToolbarBottom?.constant = active ? -height : 0
+        collectionView.contentInset.bottom = active ? height : 0
+        collectionView.verticalScrollIndicatorInsets.bottom = active ? height : 0
+    }
+
     @objc private func cancelSelection() {
         selection.end()
     }
 
-    private func selectionContainsRotatable() -> Bool {
-        for bucket in displayed.buckets {
-            for stub in bucket.items where selection.contains(stub.id) {
-                if env.photoActions.canRotate(stub.kind) { return true }
+    private func fullStubsByID() -> [AssetID: AssetStub] {
+        if let cached = fullStubsByIDCache { return cached }
+        var map = [AssetID: AssetStub](minimumCapacity: fullTimeline.totalCount)
+        for bucket in fullTimeline.buckets {
+            for stub in bucket.items {
+                map[stub.id] = stub
             }
+        }
+        fullStubsByIDCache = map
+        return map
+    }
+
+    private func selectionContainsRotatable() -> Bool {
+        guard !selection.isEmpty else { return false }
+        let lookup = fullStubsByID()
+        for id in selection.selected {
+            if let stub = lookup[id], env.photoActions.canRotate(stub.kind) { return true }
         }
         return false
     }
@@ -734,16 +759,19 @@ final class GridViewController: UIViewController {
     private func refreshSelectionAppearance() {
         for case let cell as AssetCell in collectionView.visibleCells {
             guard let id = cell.representedID else { continue }
-            cell.setSelected(selection.isActive && selection.contains(id), animated: false)
+            cell.setSelected(selection.isActive && selection.contains(id))
         }
     }
 
     private func rotateSelection(clockwise: Bool) {
+        guard !isPerformingAction else { return }
         let ids = selection.orderedIDs
         guard !ids.isEmpty else { return }
 
+        isPerformingAction = true
         Task { [weak self] in
             guard let self else { return }
+            defer { self.isPerformingAction = false }
             let outcome = await self.env.photoActions.rotate(ids: ids, clockwise: clockwise)
             if let message = Toast.message(for: outcome, verb: "rotated") {
                 Toast.show(message, in: self.view)
@@ -753,11 +781,14 @@ final class GridViewController: UIViewController {
     }
 
     private func deleteSelection() {
+        guard !isPerformingAction else { return }
         let ids = selection.orderedIDs
         guard !ids.isEmpty else { return }
 
+        isPerformingAction = true
         Task { [weak self] in
             guard let self else { return }
+            defer { self.isPerformingAction = false }
             let plan = await self.env.photoActions.deletePlan(ids: ids)
             if plan.needsInAppConfirmation, await !self.confirmDelete(plan: plan) { return }
 
@@ -770,16 +801,17 @@ final class GridViewController: UIViewController {
     }
 
     private func shareSelection() {
+        guard !isPerformingAction else { return }
         let ids = selection.orderedIDs
         guard !ids.isEmpty else { return }
 
+        isPerformingAction = true
         Task { [weak self] in
             guard let self else { return }
+            defer { self.isPerformingAction = false }
             let (items, failures) = await self.env.shareService.activityItems(for: ids)
             guard !items.isEmpty else {
-                let message = (failures.first?.error as? LocalizedError)?.errorDescription
-                    ?? failures.first?.error.localizedDescription
-                    ?? "Couldn’t share the selection."
+                let message = failures.first?.error.userMessage ?? "Couldn’t share the selection."
                 Toast.show(message, in: self.view)
                 return
             }
@@ -803,7 +835,8 @@ final class GridViewController: UIViewController {
     }
 
     private func confirmDelete(plan: DeletePlan) async -> Bool {
-        await withCheckedContinuation { continuation in
+        guard presentedViewController == nil else { return false }
+        return await withCheckedContinuation { continuation in
             let noun = plan.total == 1 ? "item" : "\(plan.total) items"
             let alert = UIAlertController(
                 title: "Delete \(noun)?",
@@ -832,7 +865,7 @@ final class GridViewController: UIViewController {
         ])
     }
 
-    private func makeGroupingMenu() -> UIMenu {
+    func makeGroupingMenu() -> UIMenu {
         // The chosen grouping, even while the grid still shows the previous one during a build.
         let current = fullTimeline.grouping
         let actions = Grouping.allCases.map { grouping in
@@ -842,19 +875,6 @@ final class GridViewController: UIViewController {
             }
         }
         return UIMenu(title: "Group by", children: actions)
-    }
-
-    // MARK: - Snapshot plumbing
-
-    private func subscribeToSnapshots(_ snapshots: AsyncStream<TimelineSnapshot>) {
-        // Holds self weakly between snapshots: a partner's library is popped and must be freed,
-        // which in turn cancels this task and ends the stream.
-        snapshotTask = Task { [weak self] in
-            for await snapshot in snapshots {
-                guard let self else { return }
-                await MainActor.run { self.apply(snapshot) }
-            }
-        }
     }
 
     /// Pull-to-refresh (D9): a manual `sync/stream` catch-up, including any server-side deletes.
@@ -867,334 +887,25 @@ final class GridViewController: UIViewController {
             } else {
                 await startup.pullToRefresh()
             }
-            await MainActor.run { self?.collectionView.refreshControl?.endRefreshing() }
+            self?.collectionView.refreshControl?.endRefreshing()
         }
-    }
-
-    private func apply(_ new: TimelineSnapshot) {
-        let previous = patchTarget ?? fullTimeline
-        hasReceivedSnapshot = true
-
-        // §14 P1 is about photos being visible, not just a view existing. Measured from the
-        // live timeline even mid-search: it is a launch metric, not a display one.
-        if mode == .timeline {
-            LaunchClock.reportFirstContent(
-                itemCount: new.totalCount,
-                provenance: new.provenance == .bootCache ? "boot-cache" : "live")
-        }
-
-        let isFirstPaint = previous.totalCount == 0
-        let groupingChanged = new.grouping != previous.grouping
-        let patchesInBackground = pendingFullTimeline == nil && searchResults == nil
-            && new.totalCount > Self.backgroundBuildThreshold && !isFirstPaint && !groupingChanged
-        if !patchesInBackground { dropPendingPatch() }
-
-        if pendingFullTimeline != nil {
-            pendingFullTimeline = new
-            pendingFullTimelineGeneration += 1
-            // A live prefix follows the timeline; a frozen grid waits for the build.
-            if pendingPlaceholder == .prefix {
-                let groupingChanged = new.grouping != timeline.grouping
-                timeline = new.prefix(maxItems: Self.backgroundBuildThreshold)
-                if searchResults == nil { applyDisplayedSnapshot(reloading: groupingChanged) }
-            }
-            defaultRightBarButtonItem?.menu = makeGroupingMenu()
-            return
-        }
-
-        // While search results are on screen the timeline keeps updating underneath but must not
-        // replace them. Leaving search re-applies whatever the timeline has become by then.
-        guard searchResults == nil else {
-            timeline = new
-            defaultRightBarButtonItem?.menu = makeGroupingMenu()
-            return
-        }
-
-        if new.totalCount <= Self.backgroundBuildThreshold {
-            timeline = new
-            applyDisplayedSnapshot(reloading: isFirstPaint || groupingChanged)
-        } else if isFirstPaint {
-            beginBackgroundBuild(of: new, placeholder: .prefix)
-        } else if patchesInBackground {
-            beginBackgroundPatch(to: new)
-        } else {
-            // Regrouping.
-            beginBackgroundBuild(of: new, placeholder: .current)
-        }
-        defaultRightBarButtonItem?.menu = makeGroupingMenu()
-    }
-
-    // MARK: - Background patches
-
-    private func beginBackgroundPatch(to target: TimelineSnapshot) {
-        patchTarget = target
-        patchTargetVersion += 1
-        // A patch already running applies what it has, then chases this one.
-        if patchTask == nil { startPatch() }
-    }
-
-    private func startPatch() {
-        guard let target = patchTarget else { return }
-        let base = dataSource.snapshot()
-        let version = patchTargetVersion
-        let generation = patchGeneration
-        patchTask = Task.detached(priority: .userInitiated) { [weak self] in
-            let patch = GridViewController.patch(base, to: target)
-            await self?.finishPatch(patch, target: target, version: version, generation: generation)
-        }
-    }
-
-    private func finishPatch(_ patch: (snapshot: Snapshot, changed: Bool)?, target: TimelineSnapshot,
-                             version: Int, generation: Int) {
-        patchTask = nil
-        guard generation == patchGeneration, let latest = patchTarget else { return }
-
-        guard let patch else {
-            // More change than a patch covers (a bulk sync, an item moving day).
-            dropPendingPatch()
-            beginBackgroundBuild(of: latest, placeholder: .current)
-            return
-        }
-        // Applied even when a newer timeline has arrived meanwhile, so a steady stream of
-        // updates cannot hold the screen back indefinitely.
-        timeline = target
-        applyPatch(patch.snapshot, changed: patch.changed)
-        if version == patchTargetVersion {
-            patchTarget = nil
-        } else {
-            startPatch()
-        }
-    }
-
-    /// For anything else about to write the data source: whatever patch is in flight was
-    /// computed against contents that are about to change.
-    private func dropPendingPatch() {
-        patchTarget = nil
-        patchGeneration += 1
-    }
-
-    /// Pushes `displayed` — timeline or search results — into the diffable data source, building
-    /// or patching on the main thread. Only for content small enough to do that, or a patch.
-    private func applyDisplayedSnapshot(reloading: Bool) {
-        let current = displayed
-        if !reloading, let patch = Self.patch(dataSource.snapshot(), to: current) {
-            applyPatch(patch.snapshot, changed: patch.changed)
-            return
-        }
-        var snapshot = Self.fullSnapshot(of: current)
-        reconfigure(&snapshot, for: current)
-        if reloading {
-            dataSource.applySnapshotUsingReloadData(snapshot)
-        } else {
-            dataSource.apply(snapshot, animatingDifferences: true)
-        }
-        didApply(current)
-    }
-
-    private func applyPatch(_ patched: Snapshot, changed: Bool) {
-        let current = displayed
-        var snapshot = patched
-        let reconfigured = reconfigure(&snapshot, for: current)
-        if changed || reconfigured {
-            dataSource.apply(snapshot, animatingDifferences: true)
-        }
-        didApply(current)
-    }
-
-    /// Content-only changes keep their identifiers, so the diff misses them entirely.
-    @discardableResult
-    private func reconfigure(_ snapshot: inout Snapshot, for timeline: TimelineSnapshot) -> Bool {
-        let reconfigurable = timeline.reconfiguredIDs.filter { snapshot.indexOfItem($0) != nil }
-        guard !reconfigurable.isEmpty else { return false }
-        snapshot.reconfigureItems(reconfigurable)
-        return true
-    }
-
-    private func didApply(_ current: TimelineSnapshot) {
-        retainSelection(in: current)
-        updateStatusViews()
-        updateScrubberVisibility()
-    }
-
-    /// Assets can disappear underneath a live selection (deleted here or on another device).
-    private func retainSelection(in current: TimelineSnapshot) {
-        // The set costs 22–30 ms at 70k items on an iPhone 13, on every update.
-        guard selection.isActive else { return }
-        selection.retain(only: Set(current.buckets.flatMap { $0.items.map(\.id) }))
-    }
-
-    // MARK: - Background snapshot builds
-
-    private func beginBackgroundBuild(of target: TimelineSnapshot, placeholder: Placeholder) {
-        pendingFullTimeline = target
-        pendingFullTimelineGeneration += 1
-        pendingPlaceholder = placeholder
-        switch placeholder {
-        case .prefix:
-            pendingAnchor = nil
-            timeline = target.prefix(maxItems: Self.backgroundBuildThreshold)
-            applyDisplayedSnapshot(reloading: true)
-        case .current:
-            // `timeline` and the data source stay as they are, which keeps them consistent.
-            pendingAnchor = topVisibleAnchor()
-        }
-        if fullBuildTask == nil { startFullBuild() }
-    }
-
-    /// Builds `pendingFullTimeline`'s snapshot off the main thread. Snapshots are values and may
-    /// be built on any thread; only applying them is confined to the main queue.
-    private func startFullBuild() {
-        guard let target = pendingFullTimeline else { return }
-        let generation = pendingFullTimelineGeneration
-        fullBuildTask = Task.detached(priority: .userInitiated) { [weak self] in
-            let snapshot = GridViewController.fullSnapshot(of: target)
-            await self?.finishFullBuild(snapshot, generation: generation)
-        }
-    }
-
-    private func finishFullBuild(_ built: Snapshot, generation: Int) {
-        fullBuildTask = nil
-        guard let latest = pendingFullTimeline else { return }
-
-        var snapshot = built
-        if generation != pendingFullTimelineGeneration {
-            // The timeline moved on while building. Usually a small delta; a regroup or a
-            // bulk sync is not, and gets another background build rather than a main-thread one.
-            guard let patched = Self.patch(built, to: latest) else {
-                startFullBuild()
-                return
-            }
-            snapshot = patched.snapshot
-        }
-
-        let anchor = pendingAnchor
-        pendingFullTimeline = nil
-        pendingAnchor = nil
-        timeline = latest
-        defaultRightBarButtonItem?.menu = makeGroupingMenu()
-        guard searchResults == nil else {
-            // Search keeps the screen; leaving it patches from this rather than rebuilding.
-            timelineSnapshotBeforeSearch = snapshot
-            return
-        }
-        dataSource.applySnapshotUsingReloadData(snapshot)
-        if let anchor { restore(anchor) }
-        didApply(latest)
-    }
-
-    private func topVisibleAnchor() -> ScrollAnchor? {
-        let top = collectionView.contentOffset.y + collectionView.adjustedContentInset.top
-        let candidates = collectionView.indexPathsForVisibleItems.sorted()
-        for indexPath in candidates {
-            guard let stub = displayed.stub(at: indexPath),
-                  let frame = collectionView.layoutAttributesForItem(at: indexPath)?.frame,
-                  frame.maxY > top else { continue }
-            return ScrollAnchor(id: stub.id, offsetFromTop: frame.minY - top)
-        }
-        return nil
-    }
-
-    private func restore(_ anchor: ScrollAnchor) {
-        guard let indexPath = timeline.indexPath(of: anchor.id) else { return }
-        collectionView.layoutIfNeeded()
-        guard let frame = collectionView.layoutAttributesForItem(at: indexPath)?.frame else { return }
-        let inset = collectionView.adjustedContentInset
-        let maxY = max(-inset.top,
-                       collectionView.contentSize.height + inset.bottom - collectionView.bounds.height)
-        let y = min(max(frame.minY - anchor.offsetFromTop - inset.top, -inset.top), maxY)
-        collectionView.setContentOffset(CGPoint(x: collectionView.contentOffset.x, y: y), animated: false)
-    }
-
-    nonisolated static func fullSnapshot(of timeline: TimelineSnapshot) -> NSDiffableDataSourceSnapshot<String, AssetID> {
-        var snapshot = NSDiffableDataSourceSnapshot<String, AssetID>()
-        snapshot.appendSections(timeline.buckets.map(\.id))
-        for bucket in timeline.buckets {
-            snapshot.appendItems(bucket.items.map(\.id), toSection: bucket.id)
-        }
-        return snapshot
-    }
-
-    /// Above this many inserted plus removed items, a fresh snapshot is built instead.
-    nonisolated static let maxPatchedChanges = 500
-
-    /// Edits `snapshot` into one matching `target`, rather than building a new one.
-    ///
-    /// Building a snapshot with thousands of sections is dominated by a per-call cost in
-    /// `appendItems(_:toSection:)`: ~3 s for 70k photos in 4k day sections on an iPhone 13, all
-    /// on the main thread, where the same items appended in a single call take 60 ms. Deleting
-    /// one item from the existing snapshot takes ~20 ms.
-    ///
-    /// Returns nil when the result does not reproduce `target` exactly (an item moved between
-    /// days, sections reordered), so correctness never rests on the delta logic being complete.
-    nonisolated static func patch(_ original: NSDiffableDataSourceSnapshot<String, AssetID>,
-                      to target: TimelineSnapshot)
-        -> (snapshot: NSDiffableDataSourceSnapshot<String, AssetID>, changed: Bool)? {
-        var snapshot = original
-        guard snapshot.numberOfItems > 0 else { return nil }
-
-        let sectionIDs = target.buckets.map(\.id)
-        let itemIDs = target.buckets.flatMap { $0.items.map(\.id) }
-
-        let oldItemIDs = snapshot.itemIdentifiers
-        let oldItemSet = Set(oldItemIDs)
-        let newItemSet = Set(itemIDs)
-        let removed = oldItemIDs.filter { !newItemSet.contains($0) }
-        let inserted = Set(itemIDs.filter { !oldItemSet.contains($0) })
-        guard removed.count + inserted.count <= maxPatchedChanges else { return nil }
-
-        let newSectionSet = Set(sectionIDs)
-        let removedSections = snapshot.sectionIdentifiers.filter { !newSectionSet.contains($0) }
-        var presentSections = Set(snapshot.sectionIdentifiers)
-        let insertsSections = sectionIDs.contains { !presentSections.contains($0) }
-
-        if !removed.isEmpty { snapshot.deleteItems(removed) }
-        if !removedSections.isEmpty { snapshot.deleteSections(removedSections) }
-
-        if insertsSections {
-            // In target order, so each section's predecessor is already in place.
-            for (i, id) in sectionIDs.enumerated() where !presentSections.contains(id) {
-                if i > 0 {
-                    snapshot.insertSections([id], afterSection: sectionIDs[i - 1])
-                } else if let first = snapshot.sectionIdentifiers.first {
-                    snapshot.insertSections([id], beforeSection: first)
-                } else {
-                    snapshot.appendSections([id])
-                }
-                presentSections.insert(id)
-            }
-        }
-
-        if !inserted.isEmpty {
-            // Also in target order: an item's predecessor in its bucket is either an existing
-            // item or one inserted on an earlier iteration.
-            for bucket in target.buckets {
-                for (j, stub) in bucket.items.enumerated() where inserted.contains(stub.id) {
-                    if j > 0 {
-                        snapshot.insertItems([stub.id], afterItem: bucket.items[j - 1].id)
-                    } else if let first = snapshot.itemIdentifiers(inSection: bucket.id).first {
-                        snapshot.insertItems([stub.id], beforeItem: first)
-                    } else {
-                        snapshot.appendItems([stub.id], toSection: bucket.id)
-                    }
-                }
-            }
-        }
-
-        guard snapshot.sectionIdentifiers == sectionIDs,
-              snapshot.itemIdentifiers == itemIDs,
-              target.buckets.allSatisfy({ snapshot.numberOfItems(inSection: $0.id) == $0.items.count })
-        else { return nil }
-
-        let changed = !removed.isEmpty || !inserted.isEmpty || !removedSections.isEmpty || insertsSections
-        return (snapshot, changed)
     }
 
     private func stub(at indexPath: IndexPath, expecting id: AssetID) -> AssetStub? {
         if let stub = displayed.stub(at: indexPath), stub.id == id { return stub }
         // Index paths and the local snapshot can disagree for one frame mid-apply; fall back
         // to an identity lookup rather than showing the wrong photo.
+        if searchResults == nil, let cached = fullStubsByID()[id] { return cached }
         guard let fallback = displayed.indexPath(of: id) else { return nil }
         return displayed.stub(at: fallback)
+    }
+
+    private func configure(_ cell: AssetCell, with stub: AssetStub, tileSize: CGSize? = nil) {
+        cell.configure(stub: stub,
+                       loader: env.imageLoader,
+                       tileSize: tileSize ?? currentTileSize(),
+                       isSelected: selection.isActive && selection.contains(stub.id),
+                       showsCloudBadge: !isPartnerLibrary)
     }
 
     private func currentTileSize() -> CGSize {
@@ -1240,8 +951,7 @@ final class GridViewController: UIViewController {
         for case let cell as AssetCell in collectionView.visibleCells {
             guard let indexPath = collectionView.indexPath(for: cell),
                   let stub = displayed.stub(at: indexPath) else { continue }
-            cell.configure(stub: stub, loader: env.imageLoader, tileSize: tileSize, isSelected: false,
-                           showsCloudBadge: !isPartnerLibrary)
+            configure(cell, with: stub, tileSize: tileSize)
         }
     }
 
@@ -1254,13 +964,20 @@ final class GridViewController: UIViewController {
             .store(in: &cancellables)
     }
 
-    private func updateStatusViews() {
+    func updateStatusViews() {
         let phase = env.startup.phase
         let isEmpty = displayed.isEmpty
 
         if case let .partner(partner) = mode {
             statusLabel.text = !isEmpty ? nil
                 : hasReceivedSnapshot ? "\(partner.name) hasn’t shared any photos yet." : "Loading…"
+            statusLabel.isHidden = !isEmpty
+            settingsButton.isHidden = true
+            return
+        }
+
+        if mode == .map {
+            statusLabel.text = isEmpty ? "No photos in this area." : nil
             statusLabel.isHidden = !isEmpty
             settingsButton.isHidden = true
             return
@@ -1294,18 +1011,20 @@ final class GridViewController: UIViewController {
 // MARK: - Prefetching
 
 extension GridViewController: UICollectionViewDataSourcePrefetching {
-    func collectionView(_ collectionView: UICollectionView, prefetchItemsAt indexPaths: [IndexPath]) {
+    private func prefetchPayload(for indexPaths: [IndexPath]) -> (stubs: [AssetStub], variant: ImageVariant)? {
         let stubs = indexPaths.compactMap { displayed.stub(at: $0) }
-        guard !stubs.isEmpty else { return }
-        let scale = traitCollection.displayScale > 0 ? traitCollection.displayScale : 2
-        env.imageLoader.startPrefetch(stubs, variant: .gridThumb(pointSize: currentTileSize(), scale: scale))
+        guard !stubs.isEmpty else { return nil }
+        return (stubs, .gridThumb(pointSize: currentTileSize(), scale: effectiveDisplayScale))
+    }
+
+    func collectionView(_ collectionView: UICollectionView, prefetchItemsAt indexPaths: [IndexPath]) {
+        guard let payload = prefetchPayload(for: indexPaths) else { return }
+        env.imageLoader.startPrefetch(payload.stubs, variant: payload.variant)
     }
 
     func collectionView(_ collectionView: UICollectionView, cancelPrefetchingForItemsAt indexPaths: [IndexPath]) {
-        let stubs = indexPaths.compactMap { displayed.stub(at: $0) }
-        guard !stubs.isEmpty else { return }
-        let scale = traitCollection.displayScale > 0 ? traitCollection.displayScale : 2
-        env.imageLoader.cancelPrefetch(stubs, variant: .gridThumb(pointSize: currentTileSize(), scale: scale))
+        guard let payload = prefetchPayload(for: indexPaths) else { return }
+        env.imageLoader.cancelPrefetch(payload.stubs, variant: payload.variant)
     }
 }
 
@@ -1344,7 +1063,16 @@ extension GridViewController: UICollectionViewDelegate {
     }
 
     private func setIndexingPaused(_ paused: Bool) {
-        Task { await env.searchIndexer.setPaused(paused) }
+        desiredIndexingPaused = paused
+        guard indexingPauseTask == nil else { return }
+        indexingPauseTask = Task { [weak self] in
+            while let self, self.appliedIndexingPaused != self.desiredIndexingPaused {
+                let next = self.desiredIndexingPaused
+                await self.env.searchIndexer.setPaused(next)
+                self.appliedIndexingPaused = next
+            }
+            self?.indexingPauseTask = nil
+        }
     }
 }
 

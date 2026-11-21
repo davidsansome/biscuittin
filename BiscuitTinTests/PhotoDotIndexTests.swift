@@ -50,4 +50,43 @@ final class PhotoDotIndexTests: XCTestCase {
     func testNoPhotosMeansNoDots() {
         XCTAssertTrue(index([]).dots(in: everywhere, cellSize: 16).isEmpty)
     }
+
+    /// Zooming across a power-of-2 boundary must never collide keys even when `(cellX, cellY)` match.
+    func testZoomAcrossPowerOfTwoBoundaryProducesDistinctDotKeys() {
+        let dotA = PhotoDotIndex.Dot(cellX: 6, cellY: 6, cell: 16, point: MKMapPoint(x: 100, y: 100))
+        let dotB = PhotoDotIndex.Dot(cellX: 6, cellY: 6, cell: 32, point: MKMapPoint(x: 200, y: 200))
+        XCTAssertNotEqual(dotA, dotB)
+        XCTAssertEqual(Set([dotA, dotB]).count, 2)
+
+        let photos = index([(1000, 1000), (1100, 1000)])
+        let zoomedIn = photos.dots(in: everywhere, cellSize: 16)
+        let zoomedOut = photos.dots(in: everywhere, cellSize: 32)
+        XCTAssertTrue(zoomedIn.isDisjoint(with: zoomedOut))
+    }
+
+    /// Queries straddling the western edge (`minX < 0`) wrap to the eastern side of the world.
+    func testAntimeridianWrappingWesternEdge() {
+        let midY = MKMapRect.world.midY
+        let nearEast = MKMapPoint(x: MKMapRect.world.maxX - 500, y: midY).coordinate
+        let nearWest = MKMapPoint(x: 500, y: midY).coordinate
+        let middle = MKMapPoint(x: MKMapRect.world.midX, y: midY).coordinate
+        let photos = PhotoDotIndex(coordinates: [nearEast, nearWest, middle])
+
+        let rect = MKMapRect(x: -1000, y: midY - 1000, width: 2000, height: 2000)
+        let dots = photos.dots(in: rect, cellSize: 16)
+        XCTAssertEqual(dots.count, 2)
+    }
+
+    /// Queries straddling the eastern edge (`maxX > world.maxX`) wrap to the western side of the world.
+    func testAntimeridianWrappingEasternEdge() {
+        let midY = MKMapRect.world.midY
+        let nearEast = MKMapPoint(x: MKMapRect.world.maxX - 500, y: midY).coordinate
+        let nearWest = MKMapPoint(x: 500, y: midY).coordinate
+        let middle = MKMapPoint(x: MKMapRect.world.midX, y: midY).coordinate
+        let photos = PhotoDotIndex(coordinates: [nearEast, nearWest, middle])
+
+        let rect = MKMapRect(x: MKMapRect.world.maxX - 1000, y: midY - 1000, width: 2000, height: 2000)
+        let dots = photos.dots(in: rect, cellSize: 16)
+        XCTAssertEqual(dots.count, 2)
+    }
 }

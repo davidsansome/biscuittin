@@ -6,8 +6,12 @@ enum GridLayoutProvider {
     /// gap between two neighbours is `gutter * 2` and tiles stay exactly square.
     static let gutter: CGFloat = 1
 
+    static func clampedColumns(_ columns: Int) -> Int {
+        min(max(columns, AppSettings.minColumns), AppSettings.maxColumns)
+    }
+
     static func make(columns: Int) -> UICollectionViewCompositionalLayout {
-        let clamped = min(max(columns, AppSettings.minColumns), AppSettings.maxColumns)
+        let clamped = clampedColumns(columns)
 
         // The item claims 1/columns of the group width and the group repeats it to fill the
         // row. Sizing the item itself (rather than passing `count:`) is what actually
@@ -43,7 +47,7 @@ enum GridLayoutProvider {
 
     /// Point size of one tile, used to size image requests.
     static func tileSize(forWidth width: CGFloat, columns: Int) -> CGSize {
-        let clamped = min(max(columns, AppSettings.minColumns), AppSettings.maxColumns)
+        let clamped = clampedColumns(columns)
         let side = max(1, width / CGFloat(clamped) - gutter * 2)
         return CGSize(width: side, height: side)
     }

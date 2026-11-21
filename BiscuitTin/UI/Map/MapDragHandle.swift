@@ -9,6 +9,9 @@ final class MapDragHandle: UIView {
 
     static let height: CGFloat = 28
 
+    var onIncrement: (() -> Void)?
+    var onDecrement: (() -> Void)?
+
     private let blur = UIVisualEffectView(effect: UIBlurEffect(style: .systemChromeMaterial))
     private let grabber = UIView()
     private let separator = UIView()
@@ -33,7 +36,7 @@ final class MapDragHandle: UIView {
             separator.leadingAnchor.constraint(equalTo: leadingAnchor),
             separator.trailingAnchor.constraint(equalTo: trailingAnchor),
             separator.topAnchor.constraint(equalTo: topAnchor),
-            separator.heightAnchor.constraint(equalToConstant: 1 / UIScreen.main.scale),
+            separator.heightAnchor.constraint(equalToConstant: 1 / effectiveDisplayScale),
 
             grabber.centerXAnchor.constraint(equalTo: centerXAnchor),
             grabber.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -44,15 +47,24 @@ final class MapDragHandle: UIView {
         isAccessibilityElement = true
         accessibilityTraits = .adjustable
         accessibilityLabel = "Map size"
-        accessibilityHint = "Swipe up to show photos full screen"
+        setRaised(false)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     /// Points the hint at whichever move is available from the current stop.
     func setRaised(_ raised: Bool) {
+        accessibilityValue = raised ? "Minimised" : "Half screen"
         accessibilityHint = raised
             ? "Swipe down to show the map"
             : "Swipe up to show photos full screen"
+    }
+
+    override func accessibilityIncrement() {
+        onIncrement?()
+    }
+
+    override func accessibilityDecrement() {
+        onDecrement?()
     }
 }

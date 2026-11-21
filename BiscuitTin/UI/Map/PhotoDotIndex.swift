@@ -17,12 +17,19 @@ struct PhotoDotIndex {
         /// the same keys and only the edges change.
         let cellX: Int64
         let cellY: Int64
+        /// Quantized power-of-2 cell size (in map points). Included in equality/hashing so
+        /// zooming across a power-of-2 boundary never collides a new cell with an old annotation
+        /// at a different coordinate.
+        let cell: Double
         let point: MKMapPoint
 
-        static func == (lhs: Dot, rhs: Dot) -> Bool { lhs.cellX == rhs.cellX && lhs.cellY == rhs.cellY }
+        static func == (lhs: Dot, rhs: Dot) -> Bool {
+            lhs.cellX == rhs.cellX && lhs.cellY == rhs.cellY && lhs.cell == rhs.cell
+        }
         func hash(into hasher: inout Hasher) {
             hasher.combine(cellX)
             hasher.combine(cellY)
+            hasher.combine(cell)
         }
     }
 
@@ -36,21 +43,40 @@ struct PhotoDotIndex {
     /// One dot per occupied cell of side `cellSize` (map points) inside `rect`.
     ///
     /// `cellSize` is rounded to a power of two, so small zoom changes keep the same cells and do
-    /// not churn every annotation.
+    /// not churn every annotation. Handles rects wrapping across the antimeridian (`minX < 0` or
+    /// `maxX > MKMapRect.world.maxX`).
     func dots(in rect: MKMapRect, cellSize: Double) -> Set<Dot> {
-        guard cellSize > 0, !points.isEmpty else { return [] }
+        guard cellSize > 0, !points.isEmpty, !rect.isNull, rect.width >= 0, rect.height >= 0 else { return [] }
         let cell = Self.quantized(cellSize)
         var dots = Set<Dot>()
-        var i = firstIndex(atOrAfterX: rect.minX)
-        while i < points.count, points[i].x <= rect.maxX {
-            let point = points[i]
-            i += 1
-            guard point.y >= rect.minY, point.y <= rect.maxY else { continue }
-            dots.insert(Dot(cellX: Int64((point.x / cell).rounded(.down)),
-                            cellY: Int64((point.y / cell).rounded(.down)),
-                            point: point))
+        for range in Self.wrappedXRanges(for: rect) {
+            var i = firstIndex(atOrAfterX: range.lowerBound)
+            while i < points.count, points[i].x <= range.upperBound {
+                let point = points[i]
+                i += 1
+                guard point.y >= rect.minY, point.y <= rect.maxY else { continue }
+                dots.insert(Dot(cellX: Int64((point.x / cell).rounded(.down)),
+                                cellY: Int64((point.y / cell).rounded(.down)),
+                                cell: cell,
+                                point: point))
+            }
         }
         return dots
+    }
+
+    /// Splits a map rect's X interval into one or two ranges within `[0, MKMapRect.world.maxX]`.
+    private static func wrappedXRanges(for rect: MKMapRect) -> [ClosedRange<Double>] {
+        let worldWidth = MKMapRect.world.maxX
+        if rect.width >= worldWidth {
+            return [0...worldWidth]
+        }
+        var start = rect.minX.truncatingRemainder(dividingBy: worldWidth)
+        if start < 0 { start += worldWidth }
+        let end = start + rect.width
+        if end <= worldWidth {
+            return [start...end]
+        }
+        return [start...worldWidth, 0...(end - worldWidth)]
     }
 
     static func quantized(_ cellSize: Double) -> Double {

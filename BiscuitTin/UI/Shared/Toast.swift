@@ -5,8 +5,14 @@ import UIKit
 /// Used for partial failures and skipped items — cases where a blanket alert would be too
 /// heavy but silence would be wrong. Never blocks interaction.
 enum Toast {
+    private final class ContainerView: UIView {}
+
     static func show(_ message: String, in view: UIView, duration: TimeInterval = 2.4) {
-        let container = UIView()
+        for case let existing as ContainerView in view.subviews {
+            existing.removeFromSuperview()
+        }
+
+        let container = ContainerView()
         container.translatesAutoresizingMaskIntoConstraints = false
         container.backgroundColor = UIColor.black.withAlphaComponent(0.82)
         container.layer.cornerRadius = 14
@@ -52,13 +58,13 @@ enum Toast {
         if outcome.failures.count == 1, let error = outcome.failures.first?.error {
             // With a single failure there is room to say *why*. "1 couldn't be rotated" tells
             // the user nothing and gives a bug report nothing to go on.
-            parts.append((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+            parts.append(error.userMessage)
         } else if !outcome.failures.isEmpty {
             parts.append("\(outcome.failures.count) couldn’t be \(verb)")
         }
         if !outcome.skippedUnsupported.isEmpty {
             let n = outcome.skippedUnsupported.count
-            parts.append("\(n) \(n == 1 ? "item" : "items") can’t be rotated yet")
+            parts.append("\(n) \(n == 1 ? "item" : "items") can’t be \(verb) yet")
         }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }

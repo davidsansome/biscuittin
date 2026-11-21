@@ -44,25 +44,27 @@ final class AssetCell: UICollectionViewCell {
         representedID = nil
         imageView.image = nil
         imageView.alpha = 1
+        contentView.alpha = 1
         setVideoChrome(visible: false, duration: 0)
         cloudBadge?.isHidden = true
-        setSelected(false, animated: false)
+        setSelected(false)
     }
 
     /// - Parameter showsCloudBadge: false where every tile is a server photo — a partner's
     ///   library (§22) — so the badge would mark everything and distinguish nothing.
     func configure(stub: AssetStub, loader: ImageLoader, tileSize: CGSize, isSelected: Bool,
                    showsCloudBadge: Bool = true) {
+        self.loader?.cancel(token)
+        token = nil
         self.loader = loader
         representedID = stub.id
 
         setVideoChrome(visible: stub.kind == .video, duration: stub.durationSeconds)
         setCloudBadge(visible: showsCloudBadge && stub.isRemoteOnly)
-        setSelected(isSelected, animated: false)
+        setSelected(isSelected)
 
-        let scale = traitCollection.displayScale > 0 ? traitCollection.displayScale : 2
         token = loader.requestImage(for: stub,
-                                    variant: .gridThumb(pointSize: tileSize, scale: scale)) { [weak self] image, _ in
+                                    variant: .gridThumb(pointSize: tileSize, scale: effectiveDisplayScale)) { [weak self] image, _ in
             // Guard against a cell that was reused while the request was in flight.
             guard let self, self.representedID == stub.id, let image else { return }
             self.imageView.image = image
@@ -71,7 +73,7 @@ final class AssetCell: UICollectionViewCell {
 
     // MARK: - Selection (used from M4)
 
-    func setSelected(_ selected: Bool, animated: Bool) {
+    func setSelected(_ selected: Bool) {
         guard selected else {
             selectionOverlay?.isHidden = true
             checkmark?.isHidden = true
@@ -94,6 +96,8 @@ final class AssetCell: UICollectionViewCell {
             ])
             checkmark = mark
         }
+        if let overlay = selectionOverlay { contentView.bringSubviewToFront(overlay) }
+        if let mark = checkmark { contentView.bringSubviewToFront(mark) }
         selectionOverlay?.isHidden = false
         checkmark?.isHidden = false
     }
@@ -143,7 +147,7 @@ final class AssetCell: UICollectionViewCell {
                 scrim.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
                 scrim.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
                 scrim.heightAnchor.constraint(equalToConstant: 26),
-                label.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -4),
+                label.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 4),
                 label.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -3)
             ])
             scrimView = scrim
@@ -155,12 +159,7 @@ final class AssetCell: UICollectionViewCell {
     }
 
     static func durationText(_ seconds: Float) -> String {
-        let total = Int(seconds.rounded())
-        let hours = total / 3600
-        let minutes = (total % 3600) / 60
-        let secs = total % 60
-        if hours > 0 { return String(format: "%d:%02d:%02d", hours, minutes, secs) }
-        return String(format: "%d:%02d", minutes, secs)
+        DurationFormatting.text(for: Double(seconds))
     }
 }
 

@@ -14,11 +14,7 @@ final class PinchColumnsController {
     var onChange: ((Int, CGPoint) -> Void)?
 
     init(columns: Int) {
-        self.columns = min(max(columns, AppSettings.minColumns), AppSettings.maxColumns)
-    }
-
-    func setColumnsWithoutNotifying(_ value: Int) {
-        columns = min(max(value, AppSettings.minColumns), AppSettings.maxColumns)
+        self.columns = GridLayoutProvider.clampedColumns(columns)
     }
 
     @objc func handle(_ gesture: UIPinchGestureRecognizer) {
@@ -45,7 +41,7 @@ final class PinchColumnsController {
     }
 
     private func step(by delta: Int, at point: CGPoint) {
-        let next = min(max(columns + delta, AppSettings.minColumns), AppSettings.maxColumns)
+        let next = GridLayoutProvider.clampedColumns(columns + delta)
         guard next != columns else { return }
         columns = next
         onChange?(next, point)

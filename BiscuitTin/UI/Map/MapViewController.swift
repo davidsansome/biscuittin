@@ -1,5 +1,6 @@
 import UIKit
 import MapKit
+import Combine
 
 /// Split-screen map and grid: a map of where photos were taken above, the photos in the visible
 /// region below (DESIGN.md §20).
@@ -11,6 +12,10 @@ import MapKit
 final class MapViewController: UIViewController {
 
     private let env: AppEnvironment
+    /// Live timeline updates forwarded from the owning grid (avoiding a second consumer on
+    /// `TimelineStore.snapshots`, which is a single-consumer `AsyncStream`).
+    private let timelineUpdates: AnyPublisher<TimelineSnapshot, Never>?
+    private var cancellables = Set<AnyCancellable>()
     /// Clips the map. Only this changes height when the bar moves — see `configureMap`.
     private let mapContainer = UIView()
     private let mapView = MKMapView()
@@ -44,6 +49,7 @@ final class MapViewController: UIViewController {
     private var mapHeightConstraint: NSLayoutConstraint!
     private var mapViewHeightConstraint: NSLayoutConstraint!
     private var dragStartFraction: CGFloat = 0
+    private var lastLayoutHeight: CGFloat = 0
 
     /// All stubs that carry a coordinate, held once. Filtering per map move is a scan over this
     /// rather than a query, which is what lets the grid track a pan without lag (§20.1).
@@ -52,15 +58,27 @@ final class MapViewController: UIViewController {
     /// The annotations currently on the map, keyed by the cell each stands for.
     private var annotationsByDot: [PhotoDotIndex.Dot: MKPointAnnotation] = [:]
     private var regionChangeWork: DispatchWorkItem?
+    private var indexBuildTask: Task<Void, Never>?
+    private var indexGeneration = 0
+    private var gridFilterTask: Task<Void, Never>?
     /// Bumped per region change, so a filter finishing after the map has moved on is dropped.
     private var gridGeneration = 0
+    private var hasLoadedTimeline = false
+    private var hasShownInitialRegion = false
 
-    init(env: AppEnvironment) {
+    init(env: AppEnvironment, timelineUpdates: AnyPublisher<TimelineSnapshot, Never>? = nil) {
         self.env = env
+        self.timelineUpdates = timelineUpdates
         super.init(nibName: nil, bundle: nil)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    deinit {
+        indexBuildTask?.cancel()
+        gridFilterTask?.cancel()
+        regionChangeWork?.cancel()
+    }
 
     // MARK: - Lifecycle
 
@@ -73,6 +91,7 @@ final class MapViewController: UIViewController {
         configureHandle()
         configureCloseButton()
 
+        observeTimeline()
         loadLocatedAssets()
     }
 
@@ -151,6 +170,8 @@ final class MapViewController: UIViewController {
         // dragging when the user just wants the photos.
         dragHandle.addGestureRecognizer(UITapGestureRecognizer(target: self,
                                                                action: #selector(toggleExpansion)))
+        dragHandle.onIncrement = { [weak self] in self?.settle(on: .raised) }
+        dragHandle.onDecrement = { [weak self] in self?.settle(on: .centered) }
     }
 
     private func configureCloseButton() {
@@ -180,7 +201,11 @@ final class MapViewController: UIViewController {
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
-        applyMapFraction(animated: false)
+        if view.bounds.height != lastLayoutHeight {
+            lastLayoutHeight = view.bounds.height
+            updateMapConstraints()
+        }
+        showInitialRegionIfReady()
     }
 
     @objc private func closeTapped() {
@@ -189,19 +214,60 @@ final class MapViewController: UIViewController {
 
     // MARK: - Data
 
+    private func observeTimeline() {
+        timelineUpdates?
+            .receive(on: RunLoop.main)
+            .sink { [weak self] snapshot in
+                self?.rebuildIndex(from: snapshot)
+            }
+            .store(in: &cancellables)
+    }
+
     private func loadLocatedAssets() {
         let store = env.timelineStore
-        Task.detached(priority: .userInitiated) { [weak self] in
+        indexGeneration += 1
+        let generation = indexGeneration
+        indexBuildTask?.cancel()
+        indexBuildTask = Task.detached(priority: .userInitiated) { [weak self] in
             let snapshot = await store.currentSnapshot()
+            guard !Task.isCancelled else { return }
             let located = snapshot.flattened().filter(\.hasCoordinate)
             let index = PhotoDotIndex(coordinates: located.compactMap(\.coordinate))
-            await self?.show(located: located, index: index)
+            guard !Task.isCancelled else { return }
+            await self?.apply(located: located, index: index, generation: generation)
         }
     }
 
-    private func show(located: [AssetStub], index: PhotoDotIndex) {
+    private func rebuildIndex(from snapshot: TimelineSnapshot) {
+        indexGeneration += 1
+        let generation = indexGeneration
+        indexBuildTask?.cancel()
+        indexBuildTask = Task.detached(priority: .userInitiated) { [weak self] in
+            let located = snapshot.flattened().filter(\.hasCoordinate)
+            guard !Task.isCancelled else { return }
+            let index = PhotoDotIndex(coordinates: located.compactMap(\.coordinate))
+            guard !Task.isCancelled else { return }
+            await self?.apply(located: located, index: index, generation: generation)
+        }
+    }
+
+    private func apply(located: [AssetStub], index: PhotoDotIndex, generation: Int) {
+        guard generation == indexGeneration else { return }
         self.located = located
         dotIndex = index
+        hasLoadedTimeline = true
+        if !hasShownInitialRegion {
+            showInitialRegionIfReady()
+        } else {
+            // Keep the user's current map region intact when photos are deleted/edited/synced.
+            updateDots()
+            updateGridForVisibleRegion()
+        }
+    }
+
+    private func showInitialRegionIfReady() {
+        guard !hasShownInitialRegion, hasLoadedTimeline, mapView.bounds.width > 0 else { return }
+        hasShownInitialRegion = true
         showInitialRegion()
     }
 
@@ -263,15 +329,18 @@ final class MapViewController: UIViewController {
     private func updateGridForVisibleRegion() {
         let region = mapView.visibleMapRect
         let located = self.located
+        gridFilterTask?.cancel()
         gridGeneration += 1
         let generation = gridGeneration
-        Task.detached(priority: .userInitiated) { [weak self] in
+        gridFilterTask = Task.detached(priority: .userInitiated) { [weak self] in
             let matching = located.filter { stub in
                 guard let coordinate = stub.coordinate else { return false }
                 return region.contains(MKMapPoint(coordinate))
             }
+            guard !Task.isCancelled else { return }
             let snapshot = MapViewController.snapshot(for: matching)
             let built = GridViewController.fullSnapshot(of: snapshot)
+            guard !Task.isCancelled else { return }
             await self?.showGrid(snapshot, built: built, generation: generation)
         }
     }
@@ -285,14 +354,8 @@ final class MapViewController: UIViewController {
     /// One bucket, newest first — `located` comes from the flattened timeline, which is already
     /// in that order, so the filter preserves it.
     nonisolated private static func snapshot(for stubs: [AssetStub]) -> TimelineSnapshot {
-        guard !stubs.isEmpty else {
-            return TimelineSnapshot(grouping: .day, buckets: [], totalCount: 0, provenance: .live)
-        }
         let title = stubs.count == 1 ? "1 photo here" : "\(stubs.count) photos here"
-        return TimelineSnapshot(grouping: .day,
-                                buckets: [.init(id: "map-region", title: title, items: stubs)],
-                                totalCount: stubs.count,
-                                provenance: .live)
+        return .singleBucket(id: "map-region", title: title, stubs: stubs)
     }
 
     // MARK: - Split behaviour
@@ -341,11 +404,15 @@ final class MapViewController: UIViewController {
         max(0, view.bounds.height - MapDragHandle.height)
     }
 
-    private func applyMapFraction(animated: Bool) {
+    private func updateMapConstraints() {
         mapHeightConstraint.constant = availableHeight() * mapFraction
         // Fixed at the centred height whatever the split is doing, so the map's own region — and
         // therefore the grid's filter — never moves when the bar does.
         mapViewHeightConstraint.constant = availableHeight() * SplitPosition.centered.fraction
+    }
+
+    private func applyMapFraction(animated: Bool) {
+        updateMapConstraints()
         guard animated else {
             view.layoutIfNeeded()
             return

@@ -14,6 +14,7 @@ final class DateScrubber: UIView {
     /// Fired for every drag update, and once on touch-down, with the touch's normalized
     /// position (0 = top, 1 = bottom). Returns the bucket title to show in the bubble, or nil
     /// to hide it (an empty timeline).
+    var onScrubBegin: (() -> Void)?
     var onScrub: ((CGFloat) -> String?)?
     var onScrubEnd: (() -> Void)?
 
@@ -74,12 +75,13 @@ final class DateScrubber: UIView {
         case .began:
             isDragging = true
             feedback.prepare()
+            onScrubBegin?()
             update(with: gesture)
-            UIView.animate(withDuration: 0.16) { self.bubble.alpha = self.lastTitle == nil ? 0 : 1 }
         case .changed:
             update(with: gesture)
         case .ended, .cancelled, .failed:
             isDragging = false
+            lastTitle = nil
             UIView.animate(withDuration: 0.2) {
                 self.bubble.alpha = 0
                 self.positionHandle(fraction: self.scrollFraction)
