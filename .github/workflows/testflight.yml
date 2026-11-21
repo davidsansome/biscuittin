@@ -20,7 +20,7 @@ jobs:
   upload:
     name: Archive and upload
     if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 120 # includes waiting for App Store Connect to process the build
     steps:
       - uses: actions/checkout@v4
