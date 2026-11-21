@@ -160,6 +160,21 @@ final class BootCacheTests: XCTestCase {
         XCTAssertNil(BootCache.decode(data))
     }
 
+    func testHugeUntrustedCountDecodesToNilWithoutAllocating() {
+        var data = BootCache.encode(stubs: [stub("a", 0)], grouping: .day)
+        // UInt32.max records in a tiny file must be rejected before `reserveCapacity`.
+        data.replaceSubrange(12..<16, with: [0xFF, 0xFF, 0xFF, 0xFF])
+        XCTAssertNil(BootCache.decode(data))
+    }
+
+    func testEncodePatchesCountHeaderWhenOversizedIDIsSkipped() {
+        let oversizedID = String(repeating: "x", count: Int(UInt16.max) + 10)
+        let valid = stub("L:ok", 0)
+        let data = BootCache.encode(stubs: [stub(oversizedID, 1), valid], grouping: .day)
+        let decoded = BootCache.decode(data)
+        XCTAssertEqual(decoded?.stubs.map(\.id), [valid.id])
+    }
+
     // MARK: - Launch-path budget
 
     func testLargeIndexRoundTripStaysWithinLaunchBudget() throws {

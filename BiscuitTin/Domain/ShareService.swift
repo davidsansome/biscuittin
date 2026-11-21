@@ -53,18 +53,21 @@ actor ShareService {
     /// Best-effort, mirroring `ActionOutcome`'s partial-success shape used by rotate and delete:
     /// one unresolvable item in a multi-select share should not block the rest.
     func activityItems(for ids: [AssetID]) async -> (items: [Any], failures: [(id: AssetID, error: Error)]) {
-        var items = [Any]()
-        var failures = [(id: AssetID, error: Error)]()
+        let resolved = await timelineStore.assets(for: ids)
+        var assetsToShare = [Asset]()
+        var missingFailures = [(id: AssetID, error: Error)]()
+        assetsToShare.reserveCapacity(ids.count)
 
         for id in ids {
-            do {
-                guard let asset = await timelineStore.asset(for: id) else { throw ShareError.unresolvable }
-                items.append(try await activityItem(for: asset))
-            } catch {
-                failures.append((id, error))
+            if let asset = resolved[id] {
+                assetsToShare.append(asset)
+            } else {
+                missingFailures.append((id, ShareError.unresolvable))
             }
         }
-        return (items, failures)
+
+        let result = await activityItems(for: assetsToShare)
+        return (result.items, missingFailures + result.failures)
     }
 
     /// For assets resolved by the caller — a partner's (§22), which the timeline does not hold.
@@ -92,16 +95,36 @@ actor ShareService {
         return try await remoteImages.image(immichID: immichID, variant: .fullResolution)
     }
 
+    /// Moves `exportedURL` into a unique subdirectory under `temporaryDirectory` preserving
+    /// `filename`, so multi-select shares with colliding names never overwrite each other.
+    static func stageShareFile(from exportedURL: URL, filename: String) throws -> (directory: URL, fileURL: URL) {
+        let fm = FileManager.default
+        let directory = fm.temporaryDirectory
+            .appendingPathComponent("share-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        let safeFilename = (filename as NSString).lastPathComponent
+        let destination = directory.appendingPathComponent(safeFilename.isEmpty ? "item" : safeFilename)
+        do {
+            try fm.moveItem(at: exportedURL, to: destination)
+        } catch {
+            try? fm.removeItem(at: exportedURL)
+            try? fm.removeItem(at: directory)
+            throw error
+        }
+        return (directory, destination)
+    }
+
     private func shareProvider(for phAsset: PHAsset) async throws -> NSItemProvider {
         let export = try await exporter.export(asset: phAsset)
 
         // The exporter names its temp file for upload bookkeeping ("upload-<uuid>-<name>"); a
         // share target that surfaces the filename (Mail, Files, AirDrop) should see the real one.
-        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(export.filename)
-        try? FileManager.default.removeItem(at: destination)
-        try FileManager.default.moveItem(at: export.fileURL, to: destination)
+        let staged = try Self.stageShareFile(from: export.fileURL, filename: export.filename)
 
-        guard let provider = NSItemProvider(contentsOf: destination) else { throw ShareError.unresolvable }
+        guard let provider = NSItemProvider(contentsOf: staged.fileURL) else {
+            try? FileManager.default.removeItem(at: staged.directory)
+            throw ShareError.unresolvable
+        }
         return provider
     }
 }

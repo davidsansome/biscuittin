@@ -38,9 +38,10 @@ struct RemoteMergeState {
     private(set) var stubs = TimelineIndex()
     private(set) var stubsByID: [String: AssetStub] = [:]
     private(set) var localIdentifierByImmichID: [String: String] = [:]
-    /// How many server assets link to each local asset. A local stub has a server facet while
-    /// its count is non-zero.
-    private var linkCounts: [String: Int] = [:]
+    /// Server assets linked to each local asset. A local stub has a server facet while its set
+    /// is non-empty, and removing that local asset promotes these remote stubs back into the
+    /// timeline.
+    private var immichIDsByLocalIdentifier: [String: Set<String>] = [:]
 
     /// Above this many changed assets, the bulk `TimelineIndex` operations are cheaper than one
     /// binary-search splice per asset.
@@ -53,18 +54,33 @@ struct RemoteMergeState {
             if let immichID = stub.id.immichID { stubsByID[immichID] = stub }
         }
         localIdentifierByImmichID = links
-        for localIdentifier in links.values { linkCounts[localIdentifier, default: 0] += 1 }
+        for (immichID, localIdentifier) in links {
+            immichIDsByLocalIdentifier[localIdentifier, default: []].insert(immichID)
+        }
     }
 
     func isLinked(_ localIdentifier: String) -> Bool {
-        linkCounts[localIdentifier] != nil
+        immichIDsByLocalIdentifier[localIdentifier] != nil
+    }
+
+    /// Server stubs linked to `localIdentifier` (used when the local copy is deleted so its
+    /// surviving server copy can be promoted back into the timeline).
+    func remoteStubs(linkedTo localIdentifier: String) -> [AssetStub] {
+        guard let ids = immichIDsByLocalIdentifier[localIdentifier] else { return [] }
+        return ids.compactMap { stubsByID[$0] }
+    }
+
+    /// Immich IDs linked to `localIdentifier` (used when a linked local asset is inserted so any
+    /// standalone remote stub for it is hidden).
+    func linkedImmichIDs(for localIdentifier: String) -> Set<String> {
+        immichIDsByLocalIdentifier[localIdentifier] ?? []
     }
 
     var mergeData: RemoteMergeData {
         var data = RemoteMergeData()
         data.stubs = stubs.stubs
         data.localIdentifierByImmichID = localIdentifierByImmichID
-        data.linkedLocalIdentifiers = Set(linkCounts.keys)
+        data.linkedLocalIdentifiers = Set(immichIDsByLocalIdentifier.keys)
         return data
     }
 
@@ -117,11 +133,14 @@ struct RemoteMergeState {
             guard old != new else { continue }
             if let old {
                 transition.localIdentifiers.insert(old)
-                linkCounts[old] = linkCounts[old].flatMap { $0 > 1 ? $0 - 1 : nil }
+                if var ids = immichIDsByLocalIdentifier[old] {
+                    ids.remove(immichID)
+                    immichIDsByLocalIdentifier[old] = ids.isEmpty ? nil : ids
+                }
             }
             if let new {
                 transition.localIdentifiers.insert(new)
-                linkCounts[new, default: 0] += 1
+                immichIDsByLocalIdentifier[new, default: []].insert(immichID)
             }
             localIdentifierByImmichID[immichID] = new
         }
@@ -134,15 +153,22 @@ struct RemoteMergeState {
         return transition
     }
 
+    struct PatchResult: Equatable {
+        var changed = false
+        /// Asset IDs whose content or facet flags changed under the same identity, so the UI
+        /// knows to reconfigure their cells.
+        var reconfiguredIDs: [AssetID] = []
+    }
+
     /// Brings `index` in line with this state for the assets `transition` touched, giving what
     /// `RemoteMergeData.merged` would. Idempotent, so it is safe after a rebuild that already
     /// saw this state.
     ///
     /// `localCaptureDates` gives, for each of `transition.localIdentifiers` that PhotoKit still
-    /// has, the date its stub is indexed under. Returns whether `index` changed.
+    /// has, the date its stub is indexed under.
     func patch(_ index: inout TimelineIndex, for transition: Transition,
-               localCaptureDates: [String: Date]) -> Bool {
-        var changed = false
+               localCaptureDates: [String: Date]) -> PatchResult {
+        var result = PatchResult()
 
         var presentLocals = Set<String>()
         for localIdentifier in transition.localIdentifiers {
@@ -154,7 +180,8 @@ struct RemoteMergeState {
             let linked = isLinked(localIdentifier)
             if stub.hasRemote != linked {
                 index.replace(at: position, with: stub.withFacets(hasLocal: stub.hasLocal, hasRemote: linked))
-                changed = true
+                result.changed = true
+                result.reconfiguredIDs.append(stub.id)
             }
         }
 
@@ -170,12 +197,20 @@ struct RemoteMergeState {
             let hidden = localIdentifierByImmichID[immichID].map(presentLocals.contains) ?? false
             let desired = hidden ? nil : current
 
-            if let existing, let desired, index.stubs[existing] == desired { continue }
-            if existing == nil, desired == nil { continue }
-            if let existing { index.remove(at: existing) }
-            if let desired { index.insertAbsent(desired) }
-            changed = true
+            if let existing, let desired {
+                if index.stubs[existing] == desired { continue }
+                index.remove(at: existing)
+                index.insertAbsent(desired)
+                result.changed = true
+                result.reconfiguredIDs.append(id)
+            } else if let existing {
+                index.remove(at: existing)
+                result.changed = true
+            } else if let desired {
+                index.insertAbsent(desired)
+                result.changed = true
+            }
         }
-        return changed
+        return result
     }
 }

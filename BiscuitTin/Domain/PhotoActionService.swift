@@ -92,13 +92,14 @@ actor PhotoActionService {
     func rotate(ids: [AssetID], clockwise: Bool) async -> ActionOutcome {
         var outcome = ActionOutcome()
         var work: [(Asset, any AssetRotator)] = []
+        let resolved = await timelineStore.fullyResolvedAssets(for: ids)
 
         for id in ids {
             // Must be the *fully resolved* asset: a photo held both on the device and the
             // server carries a `.local` id, so its Immich id only appears after a facet-link
             // lookup. Using the unresolved asset here silently rotated the local copy alone and
             // left the server's copy in the old orientation.
-            guard let asset = await timelineStore.fullyResolvedAsset(for: id) else {
+            guard let asset = resolved[id] else {
                 outcome.failures.append((id, RotationError.assetUnavailable))
                 continue
             }
@@ -141,7 +142,7 @@ actor PhotoActionService {
             return collected
         }
 
-        var rotatedStubs: [AssetStub] = []
+        var localRotatedIDs: [AssetID] = []
         for (id, error) in results {
             if let error {
                 outcome.failures.append((id, error))
@@ -150,20 +151,29 @@ actor PhotoActionService {
             } else {
                 outcome.succeeded.append(id)
             }
-            if let stub = await timelineStore.asset(for: id)?.stub {
-                // Dimensions swap on a quarter turn; publishing the updated stub keeps grid
-                // tiles and the viewer's aspect-fit correct without a full rebuild.
-                rotatedStubs.append(AssetStub(id: stub.id,
-                                              captureDate: stub.captureDate,
-                                              hasLocal: stub.hasLocal,
-                                              hasRemote: stub.hasRemote,
-                                              kind: stub.kind,
-                                              durationSeconds: stub.durationSeconds,
-                                              pixelWidth: stub.pixelHeight,
-                                              pixelHeight: stub.pixelWidth,
-                                              latitude: stub.latitude,
-                                              longitude: stub.longitude))
+            // Only local-backed stubs keep their AssetID across rotation. Remote-only rotation
+            // replaces `oldID` with a new server asset via `remoteLibrary.changes`; pushing an
+            // `.update` for `oldID` here would race `drainRemoteRefreshes` and resurrect `oldID`.
+            if id.localIdentifier != nil {
+                localRotatedIDs.append(id)
             }
+        }
+
+        let currentLocal = await timelineStore.assets(for: localRotatedIDs)
+        let rotatedStubs: [AssetStub] = localRotatedIDs.compactMap { id in
+            guard let stub = currentLocal[id]?.stub, stub.hasLocal else { return nil }
+            // Dimensions swap on a quarter turn; publishing the updated stub keeps grid
+            // tiles and the viewer's aspect-fit correct without a full rebuild.
+            return AssetStub(id: stub.id,
+                             captureDate: stub.captureDate,
+                             hasLocal: stub.hasLocal,
+                             hasRemote: stub.hasRemote,
+                             kind: stub.kind,
+                             durationSeconds: stub.durationSeconds,
+                             pixelWidth: stub.pixelHeight,
+                             pixelHeight: stub.pixelWidth,
+                             latitude: stub.latitude,
+                             longitude: stub.longitude)
         }
 
         // Invalidate *before* publishing: the update makes the grid reconfigure those cells
@@ -238,8 +248,9 @@ actor PhotoActionService {
 
     func deletePlan(ids: [AssetID]) async -> DeletePlan {
         var plan = DeletePlan()
+        let resolved = await timelineStore.assets(for: ids)
         for id in ids {
-            guard let stub = await timelineStore.asset(for: id)?.stub else { continue }
+            guard let stub = resolved[id]?.stub else { continue }
             switch (stub.hasLocal, stub.hasRemote) {
             case (true, true): plan.both.append(id)
             case (true, false): plan.localOnly.append(id)
@@ -255,24 +266,35 @@ actor PhotoActionService {
     /// is why nothing is removed from the timeline until PhotoKit reports success.
     func delete(ids: [AssetID]) async -> ActionOutcome {
         var outcome = ActionOutcome()
+        var localOnly: [AssetID] = []
+        var remoteOnly: [AssetID] = []
+        var both: [AssetID] = []
         var localIdentifiers: [String] = []
         var immichIDs: [String] = []
 
+        let resolved = await timelineStore.fullyResolvedAssets(for: ids)
         for id in ids {
-            guard let asset = await timelineStore.fullyResolvedAsset(for: id) else {
+            guard let asset = resolved[id] else {
                 outcome.failures.append((id, RotationError.assetUnavailable))
                 continue
             }
-            if let localIdentifier = asset.localIdentifier {
-                localIdentifiers.append(localIdentifier)
-            }
-            if let immichID = asset.immichID {
+            switch (asset.localIdentifier, asset.immichID) {
+            case let (localID?, immichID?):
+                both.append(id)
+                localIdentifiers.append(localID)
                 immichIDs.append(immichID)
+            case let (localID?, nil):
+                localOnly.append(id)
+                localIdentifiers.append(localID)
+            case let (nil, immichID?):
+                remoteOnly.append(id)
+                immichIDs.append(immichID)
+            case (nil, nil):
+                outcome.failures.append((id, RotationError.assetUnavailable))
             }
         }
 
-        let failedIDs = Set(outcome.failures.map(\.id))
-        let attempted = ids.filter { !failedIDs.contains($0) }
+        let attempted = localOnly + remoteOnly + both
         guard !attempted.isEmpty else { return outcome }
 
         // Local first: it is the step the user can still cancel, and cancelling must leave the
@@ -294,21 +316,35 @@ actor PhotoActionService {
         }
 
         // Then the server copy (D11): Immich moves it to its own trash, so this is recoverable.
+        var remoteFailed = false
         if !immichIDs.isEmpty, let remoteLibrary {
             do {
                 try await remoteLibrary.deleteRemote(ids: immichIDs)
             } catch {
-                // The local copy is already gone; report the partial failure rather than
-                // pretending the whole delete succeeded.
-                for id in attempted { outcome.failures.append((id, error)) }
+                remoteFailed = true
+                // Only remote-backed IDs failed; local-only IDs succeeded above.
+                for id in remoteOnly + both { outcome.failures.append((id, error)) }
             }
         }
 
-        outcome.succeeded = attempted.filter { id in !outcome.failures.contains { $0.id == id } }
-        // PhotoKit's change notification also removes these, but applying directly keeps the
-        // grid in step on the same runloop turn.
-        await timelineStore.applyChange(.remove(attempted))
-        invalidateCaches(for: attempted)
+        if remoteFailed {
+            outcome.succeeded = localOnly
+            if !localOnly.isEmpty {
+                await timelineStore.applyChange(.remove(localOnly))
+            }
+            if !both.isEmpty {
+                // Local copies of `both` were deleted while their server copies survived; refresh
+                // so they downgrade to remote-only instead of vanishing from the timeline.
+                await timelineStore.refresh()
+            }
+            invalidateCaches(for: localOnly + both)
+        } else {
+            outcome.succeeded = attempted
+            // PhotoKit's change notification also removes these, but applying directly keeps the
+            // grid in step on the same runloop turn.
+            await timelineStore.applyChange(.remove(attempted))
+            invalidateCaches(for: attempted)
+        }
         return outcome
     }
 

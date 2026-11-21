@@ -122,8 +122,14 @@ final class StartupSequencer: ObservableObject {
     /// bounded delta fetch rather than a full page-through of the library.
     func pullToRefresh() async {
         guard hasStarted else { return }
-        await runRemoteSync()
-        await timelineStore.refresh()
+        if session.isConfigured {
+            // `syncStream` yields on `remoteLibrary.changes`, which `TimelineStore` observes and
+            // patches/rebuilds from directly. Calling `timelineStore.refresh()` right after would
+            // race that stream and trigger a second full rebuild.
+            await runRemoteSync()
+        } else {
+            await timelineStore.refresh()
+        }
     }
 
     /// Pull-to-refresh on a partner's library (§22): the same sync, without rebuilding the
@@ -137,20 +143,43 @@ final class StartupSequencer: ObservableObject {
     func refreshAuthorization() {
         let status = localLibrary.authorizationStatus
         guard status != authorizationStatus else { return }
+        let hadAccess = authorizationStatus == .authorized || authorizationStatus == .limited
+        let hasAccess = status == .authorized || status == .limited
         authorizationStatus = status
-        if status == .authorized || status == .limited {
+
+        if hasAccess && !hadAccess {
             phase = .buildingIndex
             Task {
                 await timelineStore.startLive()
-                await timelineStore.refresh()
                 phase = .ready
+                await syncEngine.publishStatus(uploading: false)
+                syncEngine.scheduleBackgroundTask()
+                await syncEngine.kick()
+                await searchIndexer.run()
+            }
+        } else if !hasAccess && hadAccess {
+            phase = .accessDenied
+            Task {
+                await timelineStore.refresh()
+            }
+        } else if hasAccess {
+            // e.g. limited -> authorized: pick up newly exposed assets.
+            Task {
+                await timelineStore.refresh()
+                await syncEngine.kick()
             }
         }
     }
 
     /// Scene moved to the background: make sure the freshest index survives to next launch.
     func sceneDidEnterBackground() {
-        Task { await timelineStore.writeBootCache() }
+        let cacheGrant = BackgroundTimeGrant()
+        let cacheWork = Task { [timelineStore] in await timelineStore.writeBootCache() }
+        cacheGrant.begin(name: "Write boot cache") { cacheWork.cancel() }
+        Task {
+            await cacheWork.value
+            cacheGrant.end()
+        }
         finishBackupRunInBackground()
     }
 

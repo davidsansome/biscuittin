@@ -34,18 +34,23 @@ final class ImageRequestToken: @unchecked Sendable {
     private let lock = NSLock()
     private var requestID: PHImageRequestID?
     private var remoteTask: Task<Void, Never>?
-    private(set) var isCancelled = false
+    private var _isCancelled = false
+
+    var isCancelled: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _isCancelled
+    }
 
     fileprivate func attach(_ id: PHImageRequestID) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        guard !isCancelled else { return false }
+        guard !_isCancelled else { return false }
         requestID = id
         return true
     }
 
     fileprivate func attach(remote task: Task<Void, Never>) {
         lock.lock()
-        let cancelled = isCancelled
+        let cancelled = _isCancelled
         remoteTask = task
         lock.unlock()
         if cancelled { task.cancel() }
@@ -53,7 +58,7 @@ final class ImageRequestToken: @unchecked Sendable {
 
     fileprivate func cancel(using manager: PHImageManager) {
         lock.lock()
-        isCancelled = true
+        _isCancelled = true
         let id = requestID
         let task = remoteTask
         requestID = nil
@@ -122,7 +127,10 @@ final class ImageLoader: @unchecked Sendable {
             // Remote-only asset: serve from cache synchronously when possible, otherwise fetch.
             if let immichID = stub.id.immichID, let remote = remoteFetcher {
                 if let cached = remote.cachedImage(immichID: immichID, variant: variant) {
-                    DispatchQueue.main.async { completion(cached, false) }
+                    DispatchQueue.main.async {
+                        guard !token.isCancelled else { return }
+                        completion(cached, false)
+                    }
                     return token
                 }
                 let task = Task { [weak self] in
@@ -130,16 +138,25 @@ final class ImageLoader: @unchecked Sendable {
                     do {
                         let image = try await remote.image(immichID: immichID, variant: variant)
                         guard !Task.isCancelled, !token.isCancelled else { return }
-                        await MainActor.run { completion(image, false) }
+                        await MainActor.run {
+                            guard !token.isCancelled else { return }
+                            completion(image, false)
+                        }
                     } catch {
-                        guard !Task.isCancelled else { return }
-                        await MainActor.run { completion(nil, false) }
+                        guard !Task.isCancelled, !token.isCancelled else { return }
+                        await MainActor.run {
+                            guard !token.isCancelled else { return }
+                            completion(nil, false)
+                        }
                     }
                 }
                 token.attach(remote: task)
                 return token
             }
-            DispatchQueue.main.async { completion(nil, false) }
+            DispatchQueue.main.async {
+                guard !token.isCancelled else { return }
+                completion(nil, false)
+            }
             return token
         }
 
@@ -147,7 +164,10 @@ final class ImageLoader: @unchecked Sendable {
         workQueue.async { [weak self] in
             guard let self, !token.isCancelled else { return }
             guard let asset = self.resolver.resolve(localIdentifier) else {
-                DispatchQueue.main.async { completion(nil, false) }
+                DispatchQueue.main.async {
+                    guard !token.isCancelled else { return }
+                    completion(nil, false)
+                }
                 return
             }
             guard !token.isCancelled else { return }
@@ -178,9 +198,13 @@ final class ImageLoader: @unchecked Sendable {
                 let cancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
                 guard !cancelled, !token.isCancelled else { return }
                 if Thread.isMainThread {
+                    guard !token.isCancelled else { return }
                     completion(image, degraded)
                 } else {
-                    DispatchQueue.main.async { completion(image, degraded) }
+                    DispatchQueue.main.async {
+                        guard !token.isCancelled else { return }
+                        completion(image, degraded)
+                    }
                 }
             }
 
@@ -197,6 +221,14 @@ final class ImageLoader: @unchecked Sendable {
 
     // MARK: - Prefetching (driven by UICollectionViewDataSourcePrefetching)
 
+    private static func prefetchOptions() -> PHImageRequestOptions {
+        let options = PHImageRequestOptions()
+        options.deliveryMode = .opportunistic
+        options.resizeMode = .fast
+        options.isNetworkAccessAllowed = true
+        return options
+    }
+
     func startPrefetch(_ stubs: [AssetStub], variant: ImageVariant) {
         let identifiers = stubs.compactMap { $0.hasLocal ? $0.id.localIdentifier : nil }
         guard !identifiers.isEmpty else { return }
@@ -207,14 +239,10 @@ final class ImageLoader: @unchecked Sendable {
             guard let self else { return }
             let assets = Array(self.resolver.resolve(identifiers).values)
             guard !assets.isEmpty else { return }
-            let options = PHImageRequestOptions()
-            options.deliveryMode = .opportunistic
-            options.resizeMode = .fast
-            options.isNetworkAccessAllowed = true
             self.manager.startCachingImages(for: assets,
                                             targetSize: size,
                                             contentMode: variant.contentMode,
-                                            options: options)
+                                            options: Self.prefetchOptions())
         }
     }
 
@@ -231,7 +259,7 @@ final class ImageLoader: @unchecked Sendable {
             self.manager.stopCachingImages(for: assets,
                                            targetSize: size,
                                            contentMode: variant.contentMode,
-                                           options: nil)
+                                           options: Self.prefetchOptions())
         }
     }
 

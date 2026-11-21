@@ -106,24 +106,44 @@ final class LocalLibraryService: NSObject, @unchecked Sendable {
         PHPhotoLibrary.shared().currentChangeToken
     }
 
+    /// Folds a chronological sequence of persistent-change transactions into net `touched` and
+    /// `deleted` sets. Applying subtractions per transaction ensures an asset deleted earlier and
+    /// later restored (e.g. from Recently Deleted) lands in `touched`, while one updated then
+    /// deleted lands in `deleted`.
+    static func foldPersistentChanges(
+        _ transactions: [(inserted: Set<String>, updated: Set<String>, deleted: Set<String>)]
+    ) -> (touched: Set<String>, deleted: Set<String>) {
+        var touched = Set<String>()
+        var deleted = Set<String>()
+        for tx in transactions {
+            deleted.subtract(tx.inserted)
+            deleted.subtract(tx.updated)
+            touched.formUnion(tx.inserted)
+            touched.formUnion(tx.updated)
+
+            touched.subtract(tx.deleted)
+            deleted.formUnion(tx.deleted)
+        }
+        return (touched, deleted)
+    }
+
     /// The net asset changes since `token`, or nil when PhotoKit can no longer describe them
     /// (an expired token, most often) and the caller must enumerate the whole library.
     func delta(since token: PHPersistentChangeToken) -> Delta? {
-        var touched = Set<String>()
-        var deleted = Set<String>()
+        var transactions: [(inserted: Set<String>, updated: Set<String>, deleted: Set<String>)] = []
         do {
             for change in try PHPhotoLibrary.shared().fetchPersistentChanges(since: token) {
                 let details = try change.changeDetails(for: .asset)
-                touched.formUnion(details.insertedLocalIdentifiers)
-                touched.formUnion(details.updatedLocalIdentifiers)
-                deleted.formUnion(details.deletedLocalIdentifiers)
+                transactions.append((inserted: details.insertedLocalIdentifiers,
+                                     updated: details.updatedLocalIdentifiers,
+                                     deleted: details.deletedLocalIdentifiers))
             }
         } catch {
             Log.timeline.error("Persistent changes unavailable: \(error.localizedDescription, privacy: .public)")
             return nil
         }
 
-        touched.subtract(deleted)
+        let (touched, deleted) = Self.foldPersistentChanges(transactions)
         var delta = Delta(removedIdentifiers: Array(deleted))
         guard !touched.isEmpty else { return delta }
 

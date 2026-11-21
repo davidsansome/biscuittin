@@ -23,12 +23,16 @@ struct TimelineIndex: Equatable {
             : newStubs.sorted { $0.captureDate > $1.captureDate }
     }
 
-    /// Inserts stubs, ignoring ones already present. Uses a linear merge for bulk inserts
-    /// and binary-search splices for small ones.
+    /// Inserts stubs, ignoring ones already present (including duplicates within `incoming`).
+    /// Uses a linear merge for bulk inserts and binary-search splices for small ones.
     mutating func insert(_ incoming: [AssetStub]) {
         guard !incoming.isEmpty else { return }
-        let existing = Set(stubs.map(\.id))
-        let fresh = incoming.filter { !existing.contains($0.id) }
+        var seen = Set(stubs.map(\.id))
+        var fresh = [AssetStub]()
+        fresh.reserveCapacity(incoming.count)
+        for stub in incoming where seen.insert(stub.id).inserted {
+            fresh.append(stub)
+        }
         guard !fresh.isEmpty else { return }
 
         let sorted = fresh.sorted { $0.captureDate > $1.captureDate }

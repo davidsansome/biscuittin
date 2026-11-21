@@ -30,13 +30,24 @@ final class LocalAssetEditor: @unchecked Sendable {
                                                             clockwise: clockwise,
                                                             outputType: renderedType)
             defer { try? FileManager.default.removeItem(at: producedURL) }
-            let data = try Data(contentsOf: producedURL)
-            try data.write(to: destination, options: .atomic)
+            try Self.moveOrCopy(from: producedURL, to: destination)
         }
 
         try await PHPhotoLibrary.shared().performChanges {
             let request = PHAssetChangeRequest(for: asset)
             request.contentEditingOutput = output
+        }
+    }
+
+    /// Moves `source` to `destination` without loading the file into RAM, falling back to a
+    /// streaming copy if the two URLs live on different volumes.
+    static func moveOrCopy(from source: URL, to destination: URL) throws {
+        let fm = FileManager.default
+        try? fm.removeItem(at: destination)
+        do {
+            try fm.moveItem(at: source, to: destination)
+        } catch {
+            try fm.copyItem(at: source, to: destination)
         }
     }
 
@@ -75,20 +86,26 @@ final class LocalAssetEditor: @unchecked Sendable {
     /// *currently rendered* image rather than the untouched original, so each rotation composes
     /// on the last one. Returning true would require re-deriving the full edit stack ourselves.
     private func contentEditingInput(for asset: PHAsset) async throws -> PHContentEditingInput {
-        try await withCheckedThrowingContinuation { continuation in
-            let options = PHContentEditingInputRequestOptions()
-            options.isNetworkAccessAllowed = true
-            options.canHandleAdjustmentData = { _ in false }
-            asset.requestContentEditingInput(with: options) { input, info in
-                if let input {
-                    continuation.resume(returning: input)
-                } else {
-                    let cancelled = (info[PHContentEditingInputCancelledKey] as? Bool) ?? false
-                    continuation.resume(throwing: cancelled
-                                        ? CancellationError() as Error
-                                        : RotationError.assetUnavailable)
+        let box = CancellableRequestBox<PHContentEditingInputRequestID>()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let options = PHContentEditingInputRequestOptions()
+                options.isNetworkAccessAllowed = true
+                options.canHandleAdjustmentData = { _ in false }
+                let requestID = asset.requestContentEditingInput(with: options) { input, info in
+                    if let input {
+                        continuation.resume(returning: input)
+                    } else {
+                        let cancelled = (info[PHContentEditingInputCancelledKey] as? Bool) ?? false
+                        continuation.resume(throwing: cancelled
+                                            ? CancellationError() as Error
+                                            : RotationError.assetUnavailable)
+                    }
                 }
+                box.store(requestID) { asset.cancelContentEditingInputRequest($0) }
             }
+        } onCancel: {
+            box.cancel { asset.cancelContentEditingInputRequest($0) }
         }
     }
 

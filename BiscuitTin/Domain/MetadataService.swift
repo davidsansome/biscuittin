@@ -12,7 +12,6 @@ import CoreLocation
 /// stub-derived subset first and swaps this in when it arrives.
 final class MetadataService: @unchecked Sendable {
     private let resolver: PHAssetResolver
-    private let geocoder = CLGeocoder()
 
     init(resolver: PHAssetResolver) {
         self.resolver = resolver
@@ -46,11 +45,10 @@ final class MetadataService: @unchecked Sendable {
             metadata.coordinate = location.coordinate
         }
 
-        let resources = PHAssetResource.assetResources(for: phAsset)
-        let primary = resources.first { $0.type == .photo || $0.type == .video }
-            ?? resources.first
+        let primary = LocalAssetExporter.primaryResource(for: phAsset)
         metadata.fileName = primary?.originalFilename
-        if let primary, let size = primary.value(forKey: "fileSize") as? Int64 {
+        let size = LocalAssetExporter.estimatedByteCount(for: phAsset)
+        if size > 0 {
             metadata.fileSizeBytes = size
         }
 
@@ -82,9 +80,20 @@ final class MetadataService: @unchecked Sendable {
             metadata.cameraMake = tiff[kCGImagePropertyTIFFMake] as? String
             metadata.cameraModel = tiff[kCGImagePropertyTIFFModel] as? String
         }
-        if let width = properties[kCGImagePropertyPixelWidth] as? Int,
+        // `PHAsset.pixelWidth`/`pixelHeight` are already display-oriented; only fall back to raw
+        // container dimensions when we don't have oriented dimensions yet.
+        if metadata.pixelSize == nil,
+           let width = properties[kCGImagePropertyPixelWidth] as? Int,
            let height = properties[kCGImagePropertyPixelHeight] as? Int {
-            metadata.pixelSize = CGSize(width: width, height: height)
+            let orientation = (properties[kCGImagePropertyOrientation] as? UInt32)
+                .flatMap(CGImagePropertyOrientation.init(rawValue:))
+            let swapped: Bool = switch orientation {
+            case .left, .right, .leftMirrored, .rightMirrored: true
+            default: false
+            }
+            metadata.pixelSize = swapped
+                ? CGSize(width: height, height: width)
+                : CGSize(width: width, height: height)
         }
     }
 
@@ -95,8 +104,14 @@ final class MetadataService: @unchecked Sendable {
             metadata.durationSeconds = CMTimeGetSeconds(duration)
         }
         if let track = try? await avAsset.loadTracks(withMediaType: .video).first,
-           let size = try? await track.load(.naturalSize) {
-            metadata.pixelSize = size
+           let size = try? await track.load(.naturalSize),
+           let transform = try? await track.load(.preferredTransform) {
+            let oriented = size.applying(transform)
+            let width = abs(oriented.width)
+            let height = abs(oriented.height)
+            if width > 0 && height > 0 {
+                metadata.pixelSize = CGSize(width: width, height: height)
+            }
         }
         if let common = try? await avAsset.load(.commonMetadata) {
             for item in common where item.commonKey == .commonKeyModel {
@@ -111,23 +126,35 @@ final class MetadataService: @unchecked Sendable {
     // MARK: - PhotoKit async bridges
 
     private func fullSizeImageURL(for phAsset: PHAsset) async -> URL? {
-        await withCheckedContinuation { continuation in
-            let options = PHContentEditingInputRequestOptions()
-            options.isNetworkAccessAllowed = true
-            phAsset.requestContentEditingInput(with: options) { input, _ in
-                continuation.resume(returning: input?.fullSizeImageURL)
+        let box = CancellableRequestBox<PHContentEditingInputRequestID>()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let options = PHContentEditingInputRequestOptions()
+                options.isNetworkAccessAllowed = true
+                let requestID = phAsset.requestContentEditingInput(with: options) { input, _ in
+                    continuation.resume(returning: input?.fullSizeImageURL)
+                }
+                box.store(requestID) { phAsset.cancelContentEditingInputRequest($0) }
             }
+        } onCancel: {
+            box.cancel { phAsset.cancelContentEditingInputRequest($0) }
         }
     }
 
     private func avAsset(for phAsset: PHAsset) async -> AVAsset? {
-        await withCheckedContinuation { continuation in
-            let options = PHVideoRequestOptions()
-            options.isNetworkAccessAllowed = true
-            options.deliveryMode = .fastFormat
-            PHImageManager.default().requestAVAsset(forVideo: phAsset, options: options) { asset, _, _ in
-                continuation.resume(returning: asset)
+        let box = CancellableRequestBox<PHImageRequestID>()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let options = PHVideoRequestOptions()
+                options.isNetworkAccessAllowed = true
+                options.deliveryMode = .fastFormat
+                let requestID = PHImageManager.default().requestAVAsset(forVideo: phAsset, options: options) { asset, _, _ in
+                    continuation.resume(returning: asset)
+                }
+                box.store(requestID) { PHImageManager.default().cancelImageRequest($0) }
             }
+        } onCancel: {
+            box.cancel { PHImageManager.default().cancelImageRequest($0) }
         }
     }
 
@@ -135,6 +162,7 @@ final class MetadataService: @unchecked Sendable {
 
     private func placeName(for coordinate: CLLocationCoordinate2D) async -> String? {
         let location = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
+        let geocoder = CLGeocoder()
         guard let placemark = try? await geocoder.reverseGeocodeLocation(location).first else {
             return nil
         }

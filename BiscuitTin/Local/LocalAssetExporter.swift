@@ -45,34 +45,60 @@ final class LocalAssetExporter: @unchecked Sendable {
 
         FileManager.default.createFile(atPath: destination.path, contents: nil)
         guard let handle = try? FileHandle(forWritingTo: destination) else {
+            try? FileManager.default.removeItem(at: destination)
             throw ExportError.unavailable
         }
 
+        let box = CancellableRequestBox<PHAssetResourceDataRequestID>()
+        let writeErrorLock = NSLock()
+        var writeError: Error?
+
         do {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                PHAssetResourceManager.default().requestData(
-                    for: resource,
-                    options: options,
-                    dataReceivedHandler: { chunk in
-                        hasher.update(data: chunk)
-                        byteCount += Int64(chunk.count)
-                        try? handle.write(contentsOf: chunk)
-                    },
-                    completionHandler: { error in
-                        if let error {
-                            continuation.resume(throwing: error)
-                        } else {
-                            continuation.resume()
-                        }
-                    })
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    let requestID = PHAssetResourceManager.default().requestData(
+                        for: resource,
+                        options: options,
+                        dataReceivedHandler: { chunk in
+                            writeErrorLock.lock()
+                            let alreadyFailed = writeError != nil
+                            writeErrorLock.unlock()
+                            guard !alreadyFailed else { return }
+
+                            do {
+                                try handle.write(contentsOf: chunk)
+                                hasher.update(data: chunk)
+                                byteCount += Int64(chunk.count)
+                            } catch {
+                                writeErrorLock.lock()
+                                if writeError == nil { writeError = error }
+                                writeErrorLock.unlock()
+                                box.cancel { PHAssetResourceManager.default().cancelDataRequest($0) }
+                            }
+                        },
+                        completionHandler: { error in
+                            writeErrorLock.lock()
+                            let capturedWriteError = writeError
+                            writeErrorLock.unlock()
+                            if let capturedWriteError {
+                                continuation.resume(throwing: capturedWriteError)
+                            } else if let error {
+                                continuation.resume(throwing: error)
+                            } else {
+                                continuation.resume()
+                            }
+                        })
+                    box.store(requestID) { PHAssetResourceManager.default().cancelDataRequest($0) }
+                }
+            } onCancel: {
+                box.cancel { PHAssetResourceManager.default().cancelDataRequest($0) }
             }
+            try handle.close()
         } catch {
             try? handle.close()
             try? FileManager.default.removeItem(at: destination)
             throw error
         }
-
-        try? handle.close()
 
         let digest = hasher.finalize()
         return Export(fileURL: destination,
@@ -91,16 +117,22 @@ final class LocalAssetExporter: @unchecked Sendable {
         let options = PHAssetResourceRequestOptions()
         options.isNetworkAccessAllowed = true
         var hasher = Insecure.SHA1()
+        let box = CancellableRequestBox<PHAssetResourceDataRequestID>()
 
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            PHAssetResourceManager.default().requestData(
-                for: resource,
-                options: options,
-                dataReceivedHandler: { hasher.update(data: $0) },
-                completionHandler: { error in
-                    if let error { continuation.resume(throwing: error) }
-                    else { continuation.resume() }
-                })
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let requestID = PHAssetResourceManager.default().requestData(
+                    for: resource,
+                    options: options,
+                    dataReceivedHandler: { hasher.update(data: $0) },
+                    completionHandler: { error in
+                        if let error { continuation.resume(throwing: error) }
+                        else { continuation.resume() }
+                    })
+                box.store(requestID) { PHAssetResourceManager.default().cancelDataRequest($0) }
+            }
+        } onCancel: {
+            box.cancel { PHAssetResourceManager.default().cancelDataRequest($0) }
         }
 
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()

@@ -84,6 +84,10 @@ final class BootCache {
             default: return nil
             }
 
+            // Reject corrupt headers before reserving memory: an untrusted UInt32 count could
+            // otherwise trigger an immediate OOM allocation on a tiny file.
+            guard Int(count) <= (raw.count - offset) / Format.recordFixedSize else { return nil }
+
             var stubs = [AssetStub]()
             stubs.reserveCapacity(Int(count))
 
@@ -130,9 +134,11 @@ final class BootCache {
     // MARK: - Writing
 
     /// Serializes and writes asynchronously at utility QoS (§14 P6) so the caller never waits.
-    func save(stubs: [AssetStub], grouping: Grouping, changeToken: Data? = nil) {
-        let data = Self.encode(stubs: stubs, grouping: grouping, changeToken: changeToken)
+    func save(stubs: [AssetStub], grouping: Grouping, changeToken: Data? = nil,
+              completion: (@Sendable () -> Void)? = nil) {
         queue.async { [fileURL] in
+            defer { completion?() }
+            let data = Self.encode(stubs: stubs, grouping: grouping, changeToken: changeToken)
             do {
                 try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(),
                                                         withIntermediateDirectories: true)
@@ -163,8 +169,10 @@ final class BootCache {
         append(groupingRaw)
         append(UInt8(0))            // reserved
         append(UInt16(0))           // reserved
-        append(UInt32(stubs.count))
+        let countOffset = data.count
+        append(UInt32(0))           // patched below with the actual written count
 
+        var writtenCount: UInt32 = 0
         for stub in stubs {
             let idBytes = Array(stub.id.raw.utf8)
             guard idBytes.count <= Int(UInt16.max) else { continue }
@@ -178,6 +186,12 @@ final class BootCache {
             append(stub.kind.rawValue)
             append(UInt16(idBytes.count))
             data.append(contentsOf: idBytes)
+            writtenCount += 1
+        }
+
+        var finalCount = writtenCount
+        withUnsafeBytes(of: &finalCount) { bytes in
+            data.replaceSubrange(countOffset..<(countOffset + MemoryLayout<UInt32>.size), with: bytes)
         }
 
         let token = changeToken ?? Data()

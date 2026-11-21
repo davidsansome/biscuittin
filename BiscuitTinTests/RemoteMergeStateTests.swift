@@ -100,14 +100,33 @@ final class RemoteMergeStateTests: XCTestCase {
                                       linksFor: ["R1", "R2"], links: server.links)
         let dates = ["L1": local.captureDate]
 
-        XCTAssertTrue(state.patch(&index, for: transition, localCaptureDates: dates))
+        let first = state.patch(&index, for: transition, localCaptureDates: dates)
+        XCTAssertTrue(first.changed)
+        XCTAssertTrue(first.reconfiguredIDs.contains(.local("L1")))
+        XCTAssertTrue(first.reconfiguredIDs.contains(.remote("R2")))
         let once = index
-        XCTAssertFalse(state.patch(&index, for: transition, localCaptureDates: dates))
+        let second = state.patch(&index, for: transition, localCaptureDates: dates)
+        XCTAssertFalse(second.changed)
+        XCTAssertTrue(second.reconfiguredIDs.isEmpty)
         XCTAssertEqual(index, once)
 
         var rebuilt = server.state.mergeData.merged(withLocal: [local])
-        XCTAssertFalse(state.patch(&rebuilt, for: transition, localCaptureDates: dates))
+        XCTAssertFalse(state.patch(&rebuilt, for: transition, localCaptureDates: dates).changed)
         XCTAssertEqual(rebuilt, once)
+    }
+
+    func testRemoteStubsLinkedToLocalIdentifier() {
+        let r1 = stub(.remote("R1"))
+        let r2 = stub(.remote("R2"))
+        var state = RemoteMergeState(stubs: [r1, r2], links: ["R1": "L1"])
+
+        XCTAssertEqual(state.remoteStubs(linkedTo: "L1"), [r1])
+        XCTAssertTrue(state.remoteStubs(linkedTo: "L2").isEmpty)
+        XCTAssertEqual(state.linkedImmichIDs(for: "L1"), ["R1"])
+
+        _ = state.update(stubsFor: [], stubs: [], linksFor: ["R1"], links: [:])
+        XCTAssertTrue(state.remoteStubs(linkedTo: "L1").isEmpty)
+        XCTAssertFalse(state.isLinked("L1"))
     }
 
     /// Past the splice threshold the state switches to the bulk index operations, which must

@@ -65,6 +65,12 @@ final class TimelineIndexTests: XCTestCase {
         XCTAssertEqual(index.stubs.map(\.id.raw), ["a", "b"])
     }
 
+    func testInsertDeduplicatesWithinIncoming() {
+        var index = TimelineIndex([stub("a", 1)])
+        index.insert([stub("b", 2), stub("b", 3), stub("c", 4), stub("c", 5)])
+        XCTAssertEqual(index.stubs.map(\.id.raw), ["a", "b", "c"])
+    }
+
     func testBulkInsertTakesMergePathAndStaysSorted() {
         // Over the 64-item threshold the implementation switches to a linear merge.
         var index = TimelineIndex((0..<200).map { stub("existing-\($0)", Double($0) * 2) })

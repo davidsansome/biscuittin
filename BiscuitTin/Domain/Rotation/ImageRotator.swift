@@ -23,6 +23,10 @@ import UniformTypeIdentifiers
 struct ImageRotator: AssetRotator {
     let supportedKind: MediaKind = .image
 
+    /// Shared across rotations: creating a GPU `CIContext` allocates shader caches and Metal
+    /// state, and `CIContext` is documented thread-safe for concurrent `createCGImage` calls.
+    private static let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+
     func rotateLocal(input: PHContentEditingInput,
                      clockwise: Bool,
                      outputType: UTType) async throws -> URL {
@@ -56,8 +60,7 @@ struct ImageRotator: AssetRotator {
             by: CGAffineTransform(translationX: -rotated.extent.origin.x,
                                   y: -rotated.extent.origin.y))
 
-        let context = CIContext(options: [.useSoftwareRenderer: false])
-        guard let cgImage = context.createCGImage(normalized, from: normalized.extent) else {
+        guard let cgImage = Self.ciContext.createCGImage(normalized, from: normalized.extent) else {
             throw RotationError.renderFailed
         }
 
@@ -80,7 +83,10 @@ struct ImageRotator: AssetRotator {
         properties[kCGImageDestinationLossyCompressionQuality] = 0.92
 
         CGImageDestinationAddImage(destination, cgImage, properties as CFDictionary)
-        guard CGImageDestinationFinalize(destination) else { throw RotationError.renderFailed }
+        guard CGImageDestinationFinalize(destination) else {
+            try? FileManager.default.removeItem(at: outputURL)
+            throw RotationError.renderFailed
+        }
         return outputURL
     }
 

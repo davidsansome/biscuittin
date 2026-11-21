@@ -58,6 +58,7 @@ struct AssetMetadata: Equatable {
         if stub.kind == .video, stub.durationSeconds > 0 {
             durationSeconds = Double(stub.durationSeconds)
         }
+        coordinate = stub.coordinate
         if stub.hasLocal { sources.append(.device) }
         if stub.hasRemote { sources.append(.immich) }
     }
@@ -79,7 +80,7 @@ struct AssetMetadata: Equatable {
     }
 
     static func formattedDuration(_ seconds: Double) -> String {
-        AssetCell.durationText(Float(seconds))
+        DurationFormatting.text(for: seconds)
     }
 }
 

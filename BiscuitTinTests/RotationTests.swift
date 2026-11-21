@@ -231,6 +231,51 @@ final class RenditionContainerTests: XCTestCase {
         XCTAssertEqual(UTType(filenameExtension: "mov"), .quickTimeMovie)
     }
 
+    func testVideoRotatorNormalizedTransformKeepsOriginAtZero() {
+        let naturalSize = CGSize(width: 1920, height: 1080)
+        for clockwise in [true, false] {
+            var current = CGAffineTransform.identity
+            for step in 1...4 {
+                current = VideoRotator.normalizedTransform(existing: current,
+                                                           naturalSize: naturalSize,
+                                                           clockwise: clockwise)
+                let rect = CGRect(origin: .zero, size: naturalSize).applying(current)
+                XCTAssertEqual(rect.minX, 0, accuracy: 0.01, "clockwise=\(clockwise) step=\(step)")
+                XCTAssertEqual(rect.minY, 0, accuracy: 0.01, "clockwise=\(clockwise) step=\(step)")
+                if step % 2 == 1 {
+                    XCTAssertEqual(rect.width, 1080, accuracy: 0.01)
+                    XCTAssertEqual(rect.height, 1920, accuracy: 0.01)
+                } else {
+                    XCTAssertEqual(rect.width, 1920, accuracy: 0.01)
+                    XCTAssertEqual(rect.height, 1080, accuracy: 0.01)
+                }
+            }
+        }
+    }
+
+    func testVideoRotatorHonorsOutputType() {
+        XCTAssertEqual(VideoRotator.exportContainer(for: .mpeg4Movie).fileType, .mp4)
+        XCTAssertEqual(VideoRotator.exportContainer(for: .mpeg4Movie).ext, "mp4")
+        XCTAssertEqual(VideoRotator.exportContainer(for: .quickTimeMovie).fileType, .mov)
+        XCTAssertEqual(VideoRotator.exportContainer(for: .quickTimeMovie).ext, "mov")
+    }
+
+    func testLocalAssetEditorMoveOrCopyReplacesExistingDestination() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("editor-move-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let src = dir.appendingPathComponent("src.bin")
+        let dst = dir.appendingPathComponent("dst.bin")
+        try Data("new-payload".utf8).write(to: src)
+        try Data("old-payload".utf8).write(to: dst)
+
+        try LocalAssetEditor.moveOrCopy(from: src, to: dst)
+        XCTAssertEqual(try Data(contentsOf: dst), Data("new-payload".utf8))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: src.path))
+    }
+
     /// A PNG stands in for HEIC: the point is that the *source* type differs from the requested
     /// one, and PNG encodes identically on every platform this test runs on.
     private func makeHEICLikeSource() throws -> URL {

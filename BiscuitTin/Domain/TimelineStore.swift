@@ -123,26 +123,36 @@ actor TimelineStore {
     }
 
     /// Builds the real index from PhotoKit and starts observing changes. Called by
-    /// `StartupSequencer` only after the first frame is on screen.
+    /// `StartupSequencer` only after the first frame is on screen, and again if the user
+    /// grants Photos access later from Settings.
     func startLive() async {
-        guard !isLive else { return }
+        let firstStart = !isLive
         isLive = true
 
         guard localLibrary.hasAnyAccess else {
-            // Without local access the timeline is whatever the server gave us — which may be
-            // nothing. Publish authoritatively so a stale boot cache stops showing photos we
-            // can no longer read.
-            await rebuildIndex()
+            if firstStart {
+                // Without local access the timeline is whatever the server gave us — which may be
+                // nothing. Publish authoritatively so a stale boot cache stops showing photos we
+                // can no longer read.
+                await rebuildIndex()
+            }
             return
         }
 
         // Observing starts before the rebuild's enumeration so nothing that happens during it
-        // is missed. A change handled before `fetchResult` exists is dropped, but the
-        // enumeration that follows already includes it.
-        localLibrary.startObserving()
-        startObservingChanges()
-        applyLocalChangesSinceBootCache()
-        await rebuildIndex()
+        // is missed. Guarded on `observationTask == nil` (not `isLive`) so granting access after
+        // launching denied still registers PhotoKit observation.
+        let startedObserving = (observationTask == nil)
+        if startedObserving {
+            localLibrary.startObserving()
+            startObservingChanges()
+        }
+        if firstStart {
+            applyLocalChangesSinceBootCache()
+        }
+        if firstStart || startedObserving || fetchResult == nil {
+            await rebuildIndex()
+        }
     }
 
     /// Brings the boot-cache index up to date with local changes made while the app was not
@@ -347,7 +357,9 @@ actor TimelineStore {
             guard provenance == .live,
                   transition.immichIDs.count <= Self.maxPatchedRemoteChanges else { return false }
             let dates = localCaptureDates(for: transition.localIdentifiers)
-            if state.patch(&index, for: transition, localCaptureDates: dates) {
+            let patchResult = state.patch(&index, for: transition, localCaptureDates: dates)
+            if patchResult.changed {
+                pendingReconfiguredIDs.formUnion(patchResult.reconfiguredIDs)
                 scheduleEmit()
                 scheduleBootCacheSave()
             }
@@ -387,13 +399,48 @@ actor TimelineStore {
         }
 
         if let removed = details.removedObjects as [PHAsset]?, !removed.isEmpty {
-            applyChange(.remove(removed.map { AssetID.local($0.localIdentifier) }))
+            let removedLocalIDs = removed.map(\.localIdentifier)
+            let removedAssetIDs = removedLocalIDs.map(AssetID.local)
+            let needsFallbackRefresh = remoteState == nil && remoteLibrary != nil
+                && assets(for: removedAssetIDs).values.contains { $0.stub.hasRemote }
+
+            applyChange(.remove(removedAssetIDs))
+
+            if let remoteState {
+                let promoted = removedLocalIDs.flatMap { remoteState.remoteStubs(linkedTo: $0) }
+                if !promoted.isEmpty {
+                    applyChange(.insert(promoted))
+                }
+            } else if needsFallbackRefresh {
+                scheduleRemoteRefresh()
+            }
         }
         if let inserted = details.insertedObjects as [PHAsset]?, !inserted.isEmpty {
-            applyChange(.insert(inserted.map { AssetStub($0) }))
+            var hiddenRemoteIDs = [AssetID]()
+            let stubs = inserted.map { asset -> AssetStub in
+                let stub = AssetStub(asset)
+                if let remoteState, remoteState.isLinked(asset.localIdentifier) {
+                    hiddenRemoteIDs.append(contentsOf: remoteState.linkedImmichIDs(for: asset.localIdentifier).map(AssetID.remote))
+                    return stub.withFacets(hasLocal: true, hasRemote: true)
+                }
+                return stub
+            }
+            if !hiddenRemoteIDs.isEmpty {
+                applyChange(.remove(hiddenRemoteIDs))
+            }
+            applyChange(.insert(stubs))
         }
         if let changed = details.changedObjects as [PHAsset]?, !changed.isEmpty {
-            applyChange(.update(changed.map { AssetStub($0) }))
+            let existingByID = remoteState == nil
+                ? assets(for: changed.map { AssetID.local($0.localIdentifier) })
+                : [:]
+            let stubs = changed.map { asset -> AssetStub in
+                let stub = AssetStub(asset)
+                let hasRemote = remoteState?.isLinked(asset.localIdentifier)
+                    ?? (existingByID[.local(asset.localIdentifier)]?.stub.hasRemote ?? false)
+                return hasRemote ? stub.withFacets(hasLocal: true, hasRemote: true) : stub
+            }
+            applyChange(.update(stubs))
         }
     }
 
@@ -433,20 +480,52 @@ actor TimelineStore {
 
     func asset(for id: AssetID) -> Asset? {
         guard let stub = index.stub(for: id) else { return nil }
+        return makeAsset(from: stub)
+    }
+
+    /// Resolves a batch of IDs in a single pass over the index instead of scanning once per ID.
+    func assets(for ids: [AssetID]) -> [AssetID: Asset] {
+        guard !ids.isEmpty else { return [:] }
+        let wanted = Set(ids)
+        var found = [AssetID: Asset]()
+        found.reserveCapacity(wanted.count)
+        for stub in index.stubs where wanted.contains(stub.id) {
+            found[stub.id] = makeAsset(from: stub)
+            if found.count == wanted.count { break }
+        }
+        return found
+    }
+
+    private func makeAsset(from stub: AssetStub) -> Asset {
         var facets = [AssetFacet]()
-        if let localIdentifier = id.localIdentifier, stub.hasLocal {
+        if let localIdentifier = stub.id.localIdentifier, stub.hasLocal {
             facets.append(.local(phLocalIdentifier: localIdentifier))
         }
-        if let immichID = id.immichID, stub.hasRemote {
+        if let immichID = stub.id.immichID, stub.hasRemote {
             facets.append(.remote(immichID: immichID))
         }
-        return Asset(id: id, facets: facets, stub: stub)
+        return Asset(id: stub.id, facets: facets, stub: stub)
     }
 
     /// Resolves the *other* facet for a linked asset, which requires a database lookup and so
     /// is kept off the hot path — callers ask only when they need to act on the server copy.
     func fullyResolvedAsset(for id: AssetID) async -> Asset? {
         guard let asset = asset(for: id) else { return nil }
+        return await resolveRemoteFacet(for: asset)
+    }
+
+    /// Batch version of `fullyResolvedAsset(for:)` using a single pass over the index.
+    func fullyResolvedAssets(for ids: [AssetID]) async -> [AssetID: Asset] {
+        let base = assets(for: ids)
+        var resolved = [AssetID: Asset]()
+        resolved.reserveCapacity(base.count)
+        for (id, asset) in base {
+            resolved[id] = await resolveRemoteFacet(for: asset)
+        }
+        return resolved
+    }
+
+    private func resolveRemoteFacet(for asset: Asset) async -> Asset {
         guard asset.stub.hasLocal, asset.stub.hasRemote, asset.immichID == nil,
               let localIdentifier = asset.localIdentifier,
               let remoteLibrary else { return asset }
@@ -481,11 +560,12 @@ actor TimelineStore {
     }
 
     private func flushEmit() {
-        emitPending = false
+        guard emitPending else { return }
         emitNow()
     }
 
     private func emitNow() {
+        emitPending = false
         continuation.yield(makeSnapshot())
         pendingReconfiguredIDs.removeAll()
     }
@@ -512,7 +592,7 @@ actor TimelineStore {
     }
 
     /// Also called directly on scene background so a fresh index is never lost.
-    func writeBootCache() {
+    func writeBootCache() async {
         guard provenance == .live else { return }
         // Replaying from this token next launch also repeats changes already applied here
         // incrementally, which is harmless: inserts and updates are upserts, removals of absent
@@ -520,6 +600,12 @@ actor TimelineStore {
         let token = indexChangeToken.flatMap {
             try? NSKeyedArchiver.archivedData(withRootObject: $0, requiringSecureCoding: true)
         }
-        bootCache.save(stubs: index.stubs, grouping: grouping, changeToken: token)
+        let stubs = index.stubs
+        let currentGrouping = grouping
+        await withCheckedContinuation { continuation in
+            bootCache.save(stubs: stubs, grouping: currentGrouping, changeToken: token) {
+                continuation.resume()
+            }
+        }
     }
 }

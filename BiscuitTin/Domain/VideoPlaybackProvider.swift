@@ -66,21 +66,27 @@ final class VideoPlaybackProvider: @unchecked Sendable {
     }
 
     private func playerItem(for phAsset: PHAsset) async throws -> AVPlayerItem {
-        try await withCheckedThrowingContinuation { continuation in
-            let options = PHVideoRequestOptions()
-            options.isNetworkAccessAllowed = true   // allow iCloud originals
-            options.deliveryMode = .automatic
-            PHImageManager.default().requestPlayerItem(forVideo: phAsset,
-                                                       options: options) { item, info in
-                if let item {
-                    continuation.resume(returning: item)
-                } else {
-                    let cancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
-                    continuation.resume(throwing: cancelled
-                                        ? CancellationError() as Error
-                                        : PlaybackError.requestFailed)
+        let box = CancellableRequestBox<PHImageRequestID>()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let options = PHVideoRequestOptions()
+                options.isNetworkAccessAllowed = true   // allow iCloud originals
+                options.deliveryMode = .automatic
+                let requestID = PHImageManager.default().requestPlayerItem(forVideo: phAsset,
+                                                                           options: options) { item, info in
+                    if let item {
+                        continuation.resume(returning: item)
+                    } else {
+                        let cancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
+                        continuation.resume(throwing: cancelled
+                                            ? CancellationError() as Error
+                                            : PlaybackError.requestFailed)
+                    }
                 }
+                box.store(requestID) { PHImageManager.default().cancelImageRequest($0) }
             }
+        } onCancel: {
+            box.cancel { PHImageManager.default().cancelImageRequest($0) }
         }
     }
 

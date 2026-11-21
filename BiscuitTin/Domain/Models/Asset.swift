@@ -31,8 +31,6 @@ enum MediaKind: UInt8, Codable, Hashable {
     case image = 0
     case livePhoto = 1
     case video = 2
-
-    var isRotatableInV1: Bool { self == .image }
 }
 
 /// Where a given asset physically lives.
