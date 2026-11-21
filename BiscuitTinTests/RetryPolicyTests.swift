@@ -1,4 +1,5 @@
 import XCTest
+import Photos
 @testable import BiscuitTin
 
 final class RetryPolicyTests: XCTestCase {
@@ -40,6 +41,21 @@ final class RetryPolicyTests: XCTestCase {
         XCTAssertEqual(RetryPolicy.kind(of: ImmichError.http(status: 400)), .item)
         XCTAssertEqual(RetryPolicy.kind(of: ImmichError.rejected("bad")), .item)
         XCTAssertEqual(RetryPolicy.kind(of: RotationError.renderFailed), .item)
+        XCTAssertFalse(RetryPolicy.isPhotoKitError(ImmichError.http(status: 400)))
+    }
+
+    func testPhotoKitErrorsClassifyNetworkVsItem() {
+        let networkRequired = NSError(domain: PHPhotosErrorDomain,
+                                      code: PHPhotosError.networkAccessRequired.rawValue)
+        XCTAssertEqual(RetryPolicy.kind(of: networkRequired), .transient)
+
+        let underlyingOffline = NSError(domain: PHPhotosErrorDomain, code: -1,
+                                        userInfo: [NSUnderlyingErrorKey: URLError(.notConnectedToInternet)])
+        XCTAssertEqual(RetryPolicy.kind(of: underlyingOffline), .transient)
+
+        let internalError = NSError(domain: PHPhotosErrorDomain, code: -1)
+        XCTAssertEqual(RetryPolicy.kind(of: internalError), .item)
+        XCTAssertTrue(RetryPolicy.isPhotoKitError(internalError))
     }
 }
 

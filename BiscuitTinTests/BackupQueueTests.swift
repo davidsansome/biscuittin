@@ -68,6 +68,51 @@ final class BackupQueueTests: XCTestCase {
         XCTAssertEqual(record.nextAttemptAt - now.timeIntervalSince1970, 120)
     }
 
+    func testRecordFailureMarksIneligibleAtThreshold() throws {
+        try insert("A", .pending)
+        let threshold = BackupQueue.persistentFailureThreshold
+        for attempt in 1..<threshold {
+            try database.writer().write { db in
+                try BackupQueue.recordFailure(db, identifier: "A", error: "PHPhotosErrorDomain -1",
+                                              now: self.now, ineligibleAfter: threshold)
+            }
+            let record = try XCTUnwrap(try row("A"))
+            XCTAssertEqual(record.backupState, .failed, "attempt \(attempt)")
+            XCTAssertEqual(record.retryCount, attempt)
+        }
+
+        try database.writer().write { db in
+            try BackupQueue.recordFailure(db, identifier: "A", error: "PHPhotosErrorDomain -1",
+                                          now: self.now, ineligibleAfter: threshold)
+        }
+        let record = try XCTUnwrap(try row("A"))
+        XCTAssertEqual(record.backupState, .ineligible)
+        XCTAssertEqual(record.retryCount, threshold)
+        XCTAssertEqual(record.lastError, "PHPhotosErrorDomain -1")
+        XCTAssertEqual(record.nextAttemptAt, 0)
+
+        let (counts, candidates) = try database.writer().read { db in
+            (try BackupQueue.counts(db),
+             try BackupQueue.uploadCandidates(db, now: self.now.addingTimeInterval(100_000), limit: 10))
+        }
+        XCTAssertEqual(counts.remaining, 0)
+        XCTAssertEqual(counts.failed, 0)
+        XCTAssertEqual(counts.retrying, 0)
+        XCTAssertEqual(candidates, [])
+    }
+
+    func testRecordFailureImmediatelyMarksHighRetryRowIneligible() throws {
+        try insert("A", .failed, retries: 21, nextAttemptAt: now.timeIntervalSince1970 - 1)
+        try database.writer().write { db in
+            try BackupQueue.recordFailure(db, identifier: "A", error: "PHPhotosErrorDomain -1",
+                                          now: self.now,
+                                          ineligibleAfter: BackupQueue.persistentFailureThreshold)
+        }
+        let record = try XCTUnwrap(try row("A"))
+        XCTAssertEqual(record.backupState, .ineligible)
+        XCTAssertEqual(record.retryCount, 22)
+    }
+
     func testResetFailuresGivesACleanSlate() throws {
         try insert("F", .failed, retries: 7, nextAttemptAt: 99)
         try insert("I", .ineligible)

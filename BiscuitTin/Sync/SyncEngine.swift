@@ -418,8 +418,9 @@ actor SyncEngine {
                 if case LocalAssetExporter.ExportError.noResource = error {
                     // Genuinely nothing to upload.
                     try await mark(identifier, state: .ineligible, error: error.localizedDescription)
-                } else if RetryPolicy.kind(of: error) == .item {
-                    try await bumpFailure(identifier, error: error.localizedDescription)
+                } else if networkWait == nil, RetryPolicy.kind(of: error) == .item {
+                    let cap = RetryPolicy.isPhotoKitError(error) ? BackupQueue.persistentFailureThreshold : nil
+                    try await bumpFailure(identifier, error: error.localizedDescription, ineligibleAfter: cap)
                 }
                 // Otherwise the row stays pending, and the next run tries again.
             }
@@ -785,10 +786,12 @@ actor SyncEngine {
         }
     }
 
-    private func bumpFailure(_ identifier: String, error: String) async throws {
+    private func bumpFailure(_ identifier: String, error: String,
+                             ineligibleAfter: Int? = nil) async throws {
         let writer = try database.writer()
         try await writer.write { db in
-            try BackupQueue.recordFailure(db, identifier: identifier, error: error, now: Date())
+            try BackupQueue.recordFailure(db, identifier: identifier, error: error, now: Date(),
+                                          ineligibleAfter: ineligibleAfter)
         }
     }
 
@@ -806,7 +809,8 @@ actor SyncEngine {
             try? await mark(identifier, state: .pending, error: nil)
             session.markExpired()
         case .item:
-            try? await bumpFailure(identifier, error: error.localizedDescription)
+            let cap = RetryPolicy.isPhotoKitError(error) ? BackupQueue.persistentFailureThreshold : nil
+            try? await bumpFailure(identifier, error: error.localizedDescription, ineligibleAfter: cap)
         }
         return kind
     }

@@ -30,10 +30,19 @@ enum BackupQueue {
             """, arguments: [pending, uploading, failed, now.timeIntervalSince1970]) ?? 0
     }
 
-    static func recordFailure(_ db: Database, identifier: String, error: String, now: Date) throws {
+    static func recordFailure(_ db: Database, identifier: String, error: String, now: Date,
+                              ineligibleAfter: Int? = nil) throws {
         let failures = (try Int.fetchOne(db, sql: "SELECT retry_count FROM backup_state WHERE local_identifier = ?",
                                          arguments: [identifier]) ?? 0) + 1
         let at = now.timeIntervalSince1970
+        if let threshold = ineligibleAfter, failures >= threshold {
+            try db.execute(sql: """
+                UPDATE backup_state
+                SET state = ?, retry_count = ?, last_error = ?, updated_at = ?, next_attempt_at = 0
+                WHERE local_identifier = ?
+                """, arguments: [ineligible, failures, error, at, identifier])
+            return
+        }
         try db.execute(sql: """
             UPDATE backup_state
             SET state = ?, retry_count = ?, last_error = ?, updated_at = ?, next_attempt_at = ?

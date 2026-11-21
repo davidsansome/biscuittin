@@ -1,4 +1,5 @@
 import Foundation
+import Photos
 
 /// How failed uploads and pending edits are retried (DESIGN.md §12, D22). Nothing is abandoned:
 /// a failure that is the item's fault waits longer each time, and one that is not (no network,
@@ -21,6 +22,14 @@ enum RetryPolicy {
         if error is CancellationError { return .transient }
         if let urlError = error as? URLError, urlError.code == .cancelled { return .transient }
         if NetworkMonitor.isConnectivityError(error) { return .transient }
+        let nsError = error as NSError
+        if nsError.domain == PHPhotosErrorDomain {
+            if nsError.code == PHPhotosError.networkAccessRequired.rawValue { return .transient }
+            if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? Error,
+               NetworkMonitor.isConnectivityError(underlying) {
+                return .transient
+            }
+        }
         if let immich = error as? ImmichError {
             switch immich {
             case .unreachable:
@@ -34,6 +43,13 @@ enum RetryPolicy {
             }
         }
         return .item
+    }
+
+    /// PhotoKit itself refused to read the asset's bytes (e.g. an orphaned iCloud asset whose
+    /// original is missing and unplayable even in Apple Photos). After repeated failures while
+    /// online, these are marked `.ineligible` rather than staying "failed" forever.
+    static func isPhotoKitError(_ error: Error) -> Bool {
+        (error as NSError).domain == PHPhotosErrorDomain
     }
 }
 
