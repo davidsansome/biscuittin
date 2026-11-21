@@ -128,6 +128,17 @@ struct TimelineSnapshot {
         }
         return nil
     }
+
+    /// Builds a single-section snapshot for filtered views (search results, map region).
+    static func singleBucket(id: String, title: String, grouping: Grouping = .day, stubs: [AssetStub]) -> TimelineSnapshot {
+        let buckets: [Bucket] = stubs.isEmpty ? [] : [
+            Bucket(id: id, title: title, items: stubs)
+        ]
+        return TimelineSnapshot(grouping: grouping,
+                                buckets: buckets,
+                                totalCount: stubs.count,
+                                provenance: .live)
+    }
 }
 
 /// Incremental mutations applied to the timeline index (DESIGN.md D20).
