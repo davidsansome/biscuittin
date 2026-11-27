@@ -20,6 +20,9 @@ final class ZoomablePhotoView: UIScrollView {
     /// Lives on the zooming view so highlights and selection track the photo through a pinch.
     /// Nil where the device cannot run text recognition.
     private let liveTextInteraction: ImageAnalysisInteraction?
+    private let doubleTapGesture = UITapGestureRecognizer()
+    private let singleTapGesture = UITapGestureRecognizer()
+    private var tapGestureDelegate: TapGestureDelegate?
 
     private var hasRequestedFullResolution = false
     private var lastLayoutSize: CGSize = .zero
@@ -52,14 +55,19 @@ final class ZoomablePhotoView: UIScrollView {
         imageView.isUserInteractionEnabled = true
         addSubview(imageView)
 
-        let doubleTap = UITapGestureRecognizer(target: self, action: #selector(handleDoubleTap(_:)))
-        doubleTap.numberOfTapsRequired = 2
-        addGestureRecognizer(doubleTap)
+        let gestureDelegate = TapGestureDelegate(owner: self)
+        tapGestureDelegate = gestureDelegate
 
-        let singleTap = UITapGestureRecognizer(target: self, action: #selector(handleSingleTap(_:)))
-        singleTap.numberOfTapsRequired = 1
-        singleTap.require(toFail: doubleTap)
-        addGestureRecognizer(singleTap)
+        doubleTapGesture.addTarget(self, action: #selector(handleDoubleTap(_:)))
+        doubleTapGesture.numberOfTapsRequired = 2
+        doubleTapGesture.delegate = gestureDelegate
+        addGestureRecognizer(doubleTapGesture)
+
+        singleTapGesture.addTarget(self, action: #selector(handleSingleTap))
+        singleTapGesture.numberOfTapsRequired = 1
+        singleTapGesture.delegate = gestureDelegate
+        singleTapGesture.require(toFail: doubleTapGesture)
+        addGestureRecognizer(singleTapGesture)
 
         if let liveTextInteraction {
             liveTextInteraction.preferredInteractionTypes = .automatic
@@ -265,17 +273,18 @@ final class ZoomablePhotoView: UIScrollView {
 
     // MARK: - Gestures
 
-    @objc private func handleSingleTap(_ gesture: UITapGestureRecognizer) {
-        // A tap Live Text acts on — clearing a selection, or picking text or a link while items
-        // are highlighted — must not also flip the chrome.
-        if let liveTextInteraction, liveTextInteraction.analysis != nil {
-            let point = gesture.location(in: imageView)
-            if liveTextInteraction.hasActiveTextSelection
-                || (liveTextInteraction.selectableItemsHighlighted
-                    && liveTextInteraction.hasInteractiveItem(at: point)) {
-                return
-            }
-        }
+    /// True when a single tap at `point` (in `imageView`'s coordinate space) belongs to Live Text
+    /// rather than toggling the viewer chrome — clearing an active selection, activating a data
+    /// detector / QR code, or tapping a highlighted text item.
+    private func shouldYieldSingleTapToLiveText(at point: CGPoint) -> Bool {
+        guard let liveTextInteraction, liveTextInteraction.analysis != nil else { return false }
+        return liveTextInteraction.hasActiveTextSelection
+            || liveTextInteraction.hasDataDetector(at: point)
+            || (liveTextInteraction.selectableItemsHighlighted
+                && liveTextInteraction.hasInteractiveItem(at: point))
+    }
+
+    @objc private func handleSingleTap() {
         onSingleTap?()
     }
 
@@ -290,6 +299,44 @@ final class ZoomablePhotoView: UIScrollView {
                  animated: true)
         } else {
             setZoomScale(minimumZoomScale, animated: true)
+        }
+    }
+
+    /// Keeps double-tap zoom ahead of Live Text's tap recognizers (so double-tapping on text
+    /// always zooms rather than selecting text) while leaving long-press text selection and
+    /// selection-handle drags untouched.
+    ///
+    /// Kept on a dedicated object rather than `ZoomablePhotoView` itself: `UIScrollView` is the
+    /// delegate of its own internal pan/pinch/delay gesture recognizers, so conforming a
+    /// subclass directly to `UIGestureRecognizerDelegate` risks shadowing UIKit's own methods.
+    private final class TapGestureDelegate: NSObject, UIGestureRecognizerDelegate {
+        private weak var owner: ZoomablePhotoView?
+
+        init(owner: ZoomablePhotoView) {
+            self.owner = owner
+        }
+
+        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            guard let owner else { return true }
+            if gestureRecognizer === owner.singleTapGesture {
+                return !owner.shouldYieldSingleTapToLiveText(
+                    at: gestureRecognizer.location(in: owner.imageView))
+            }
+            return true
+        }
+
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer,
+            shouldBeRequiredToFailBy otherGestureRecognizer: UIGestureRecognizer
+        ) -> Bool {
+            guard let owner,
+                  gestureRecognizer === owner.doubleTapGesture
+                    || gestureRecognizer === owner.singleTapGesture,
+                  let otherView = otherGestureRecognizer.view,
+                  otherView.isDescendant(of: owner.imageView) else {
+                return false
+            }
+            return otherGestureRecognizer is UITapGestureRecognizer
         }
     }
 }
